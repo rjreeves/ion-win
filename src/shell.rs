@@ -46,7 +46,7 @@ use crate::editor::{self, EditorOutcome, LineEditor};
 use crate::fs_builtins;
 use crate::functions::{self, FunctionDef};
 use crate::history;
-use crate::interp::{Interpreter, Token};
+use crate::interp::{Interpreter, Quoting, Token};
 use crate::jobctl;
 use crate::jobs;
 use crate::pipeline;
@@ -603,6 +603,23 @@ async fn exec_for(
     Flow::Normal
 }
 
+/// Finds the first unquoted `&&`/`||` token in `tokens`, splitting into
+/// (before, operator, after) as token slices. Unlike
+/// `split_at_top_level_chain_op`'s raw-string scan (used by `dispatch`,
+/// which needs real substrings to re-tokenize each half faithfully),
+/// this can search the token list directly and slice it, with no
+/// nesting-depth tracking needed — `Interpreter::tokenize` has already
+/// collapsed every quote/bracket/expansion into one atomic token by the
+/// time this runs, confirmed empirically: `&&` between two `test`
+/// invocations tokenizes as its own standalone `Quoting::None` token.
+fn split_chain_op_tokens(tokens: &[Token]) -> Option<(&[Token], ChainOp, &[Token])> {
+    let i = tokens
+        .iter()
+        .position(|t| t.quoting == Quoting::None && (t.text == "&&" || t.text == "||"))?;
+    let op = if tokens[i].text == "&&" { ChainOp::And } else { ChainOp::Or };
+    Some((&tokens[..i], op, &tokens[i + 1..]))
+}
+
 /// Evaluates a condition line's tokens (used by `if`/`while`), reusing the
 /// same builtins and external-process exit-status rules as top-level
 /// statement dispatch, per the manual's rule that `if`'s exit status of 0
@@ -613,6 +630,20 @@ fn eval_condition_tokens<'a>(
     state: &'a StateHandle,
 ) -> Pin<Box<dyn Future<Output = bool> + 'a>> {
     Box::pin(async move {
+        // ion-manual page 51: `if test $foo = "foo" && test $bar = "bar"`
+        // — `&&`/`||` inside a condition short-circuit exactly like Rust's
+        // own `&&`/`||` already do, so this reads as plainly as it looks:
+        // the right side is only ever evaluated (and only ever spawns
+        // whatever external process it names) when the left side's
+        // result doesn't already decide the answer.
+        if let Some((before, op, after)) = split_chain_op_tokens(tokens) {
+            let left = eval_condition_tokens(before, interp, state).await;
+            return match op {
+                ChainOp::And => left && eval_condition_tokens(after, interp, state).await,
+                ChainOp::Or => left || eval_condition_tokens(after, interp, state).await,
+            };
+        }
+
         let Some(head) = tokens.first() else {
             return false;
         };
@@ -658,10 +689,75 @@ fn eval_condition_tokens<'a>(
     })
 }
 
+/// `&&`/`||` (ion-manual page 51): confirmed against upstream Ion's real
+/// parser (`Linux/ion-master/src/lib/parser/statement/splitter.rs`) that
+/// `cmd1 && cmd2` is *exactly* equivalent to `cmd1` on one line followed
+/// by `and cmd2` on the next — upstream's splitter literally rewrites one
+/// into the other. So neither of `&&`/`||`'s two call sites (`dispatch`,
+/// `eval_condition_tokens`) need new runtime semantics, only a way to find
+/// the split point; `and`/`or`'s existing `previous_status` logic does
+/// the rest.
+enum ChainOp {
+    And,
+    Or,
+}
+
+/// Finds the first top-level (unquoted, unbracketed) `&&`/`||` in `line`,
+/// splitting it into (everything before, the operator, everything after)
+/// as real substring slices — not reconstructed/rejoined text — so
+/// `dispatch`'s recursive re-tokenization of each half sees exactly the
+/// same quoting/spacing the user typed. A raw-string scan rather than
+/// `Interpreter::tokenize` + a token search (which `eval_condition_tokens`
+/// below uses instead, since it never needs to go back to a string).
+fn split_at_top_level_chain_op(line: &str) -> Option<(&str, ChainOp, &str)> {
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut chars = line.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' => quote = Some(c),
+            '[' | '(' | '{' => depth += 1,
+            ']' | ')' | '}' => depth -= 1,
+            '&' if depth == 0 && chars.peek().map(|&(_, c2)| c2) == Some('&') => {
+                let (j, _) = chars.next().unwrap();
+                return Some((&line[..i], ChainOp::And, &line[j + 1..]));
+            }
+            '|' if depth == 0 && chars.peek().map(|&(_, c2)| c2) == Some('|') => {
+                let (j, _) = chars.next().unwrap();
+                return Some((&line[..i], ChainOp::Or, &line[j + 1..]));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Handles one simple (non-block) line of input. Returns the `Flow` signal
 /// to propagate outward (`ShellExit` for `exit`/`quit`, `Break`/
 /// `LoopContinue` for `break`/`continue`, `Normal` otherwise).
 async fn dispatch(line: &str, interp: &mut Interpreter, state: &StateHandle) -> Flow {
+    if let Some((before, op, after)) = split_at_top_level_chain_op(line) {
+        let flow = Box::pin(dispatch(before, interp, state)).await;
+        if flow != Flow::Normal {
+            return flow;
+        }
+        let should_run = match op {
+            ChainOp::And => interp.previous_status(),
+            ChainOp::Or => !interp.previous_status(),
+        };
+        return if should_run {
+            Box::pin(dispatch(after, interp, state)).await
+        } else {
+            Flow::Normal
+        };
+    }
+
     let raw_tokens = Interpreter::tokenize(line);
 
     let parsed = pipeline::parse(&raw_tokens);
@@ -678,27 +774,38 @@ async fn dispatch(line: &str, interp: &mut Interpreter, state: &StateHandle) -> 
     };
     let raw_args = &raw_tokens[1..];
 
+    // `and`/`or` (confirmed against upstream Ion's real source,
+    // `shell/flow.rs`) are statement-level keywords, not simple builtins:
+    // `and STMT` runs STMT only if the *previous* statement succeeded (its
+    // result becomes the new status; otherwise the prior failure stands
+    // untouched); `or STMT` is the mirror image. Recurses on whatever text
+    // follows the keyword in the original line, so `and`/`or` can
+    // themselves be chained or precede any other statement, including
+    // another `and`/`or`. Handled *before* the default-status reset below
+    // — it must read whatever status the previous statement left behind,
+    // not a freshly-reset one.
+    if cmd == "and" || cmd == "or" {
+        let rest = line.trim_start()[cmd.len()..].trim_start();
+        let run = if cmd == "and" { interp.previous_status() } else { !interp.previous_status() };
+        return if run {
+            Box::pin(dispatch(rest, interp, state)).await
+        } else {
+            Flow::Normal
+        };
+    }
+
+    // Default every other statement to "succeeded" before it runs, so
+    // `&&`/`||` chaining sees a sensible status even for builtins with no
+    // natural failure mode of their own (`echo`, `let`, `pvar`, ...)
+    // instead of a stale leftover from whatever ran two statements ago.
+    // Specific arms below (`test`, `cd`, external processes, ...) still
+    // override this with their real result.
+    interp.set_previous_status(true);
+
     match cmd.as_str() {
         "exit" | "quit" => return Flow::ShellExit,
         "break" => return Flow::Break,
         "continue" => return Flow::LoopContinue,
-
-        // `and`/`or` (confirmed against upstream Ion's real source,
-        // `shell/flow.rs`) are statement-level keywords, not simple
-        // builtins: `and STMT` runs STMT only if the *previous* statement
-        // succeeded (its result becomes the new status; otherwise the
-        // prior failure stands untouched); `or STMT` is the mirror image.
-        // Recurses on whatever text follows the keyword in the original
-        // line, so `and`/`or` can themselves be chained or precede any
-        // other statement, including another `and`/`or`.
-        "and" | "or" => {
-            let rest = line.trim_start()[cmd.len()..].trim_start();
-            let run = if cmd == "and" { interp.previous_status() } else { !interp.previous_status() };
-            if run {
-                return Box::pin(dispatch(rest, interp, state)).await;
-            }
-            return Flow::Normal;
-        }
 
         "help" => println!("{}", builtin_names::help_text()),
 
