@@ -7,7 +7,7 @@ Native Windows port of the [Ion shell](docs/ion-manual.pdf) (originally built fo
 ```
 cd ion-win
 cargo build              # debug build
-cargo test                # 116 tests, all passing
+cargo test                # 128 tests, all passing
 cargo run                 # interactive REPL
 cargo run -- script.ion arg1 arg2   # run a script file
 ```
@@ -18,25 +18,30 @@ No special setup needed — it's a standard Cargo binary crate. `.gitignore`/`.g
 
 A working, reasonably faithful interpreter for Ion's language (variables, control flow, functions, expansions, pipelines) plus a real interactive line editor — not a toy. It's driven entirely from the [ion-manual.pdf](docs/ion-manual.pdf) spec: nearly every feature below was implemented by reading the manual's own worked examples and writing tests that reproduce their exact output, byte-for-byte. Where the manual was ambiguous or silent, that's called out explicitly rather than guessed at.
 
-## Module map (4,768 lines across 16 files)
+## Module map (7,730 lines across 20 files)
 
 | File | Lines | Purpose |
 |---|---|---|
-| `main.rs` | 55 | Entry point; branches to script-file mode (argv) or interactive `shell::run` |
-| `interp.rs` | 1365 | The core: tokenizer, `$`/`@` expansion, variables, `let`/`export`/`drop`, method-call and process-expansion dispatch. The biggest and most load-bearing file. |
-| `shell.rs` | 738 | REPL loop, block/control-flow execution (`if`/`while`/`for`/`fn`), `cd`, dispatch of all builtins |
-| `methods.rs` | 424 | All 26 string/array methods (`$len`, `@split`, etc.) |
-| `arith.rs` | 390 | `$(( expr ))` arithmetic expansion (recursive-descent parser) |
-| `ranges.rs` | 310 | Slice parsing (`[start..end]`) + brace range expansion (`{1..10}`) |
-| `pipeline_exec.rs` | 300 | Real OS pipeline execution (`Command`/`Stdio` chaining) |
-| `history.rs` | 241 | Persistent command history (load/save/filter) |
-| `editor.rs` | 233 | Crossterm raw-mode line editor with fallback to plain stdin |
-| `pipeline.rs` | 179 | Pipeline/redirect *parsing* (pure data, no execution) |
-| `state.rs` | 193 | `redb`-backed key/value store for `pvar`/`dmark` |
-| `builtins.rs` | 100 | `test`/`matches` condition evaluators |
-| `functions.rs` | 69 | `fn` parameter parsing (typed params, docstrings) |
-| `types.rs` | 63 | Shared `str`/`bool`/`int`/`float` type-tag validation |
-| `procexpand.rs` | 33 | `$(cmd)`/`@(cmd)` process-expansion process spawning |
+| `interp.rs` | 1734 | The core: tokenizer, `$`/`@` expansion, variable scope stack, `let`/`export`/`drop`, method-call and process-expansion dispatch. The biggest and most load-bearing file. |
+| `shell.rs` | 1475 | REPL loop, block/control-flow execution (`if`/`while`/`for`/`fn`/`match`/`case`), `cd`, `&&`/`||`/`and`/`or` chaining, dispatch of all builtins |
+| `editor.rs` | 680 | Crossterm raw-mode line editor (arrow keys, history, Tab-completion, word-editing shortcuts, live syntax highlighting) with fallback to plain stdin |
+| `ranges.rs` | 647 | Slice parsing (`[start..end]`) + brace expansion: ranges (`{1..10}`) and permutation lists (`{ext1,ext2}`, nested) |
+| `methods.rs` | 491 | All 26 string/array methods (`$len`, `@split`, etc.) |
+| `arith.rs` | 430 | `$(( expr ))` arithmetic expansion (recursive-descent parser) |
+| `pipeline_exec.rs` | 365 | Real OS pipeline execution (`Command`/`Stdio` chaining), background-job registration |
+| `state.rs` | 302 | `redb`-backed key/value store for `pvar`/`dmark` |
+| `history.rs` | 278 | Persistent command history (load/save/filter) |
+| `builtins.rs` | 262 | `test`/`matches`/`bool`/`contains`/`starts-with`/`ends-with`/`eq`/`is`/`isatty` condition evaluators |
+| `pipeline.rs` | 199 | Pipeline/redirect *parsing* (pure data, no execution) |
+| `jobctl.rs` | 160 | Ctrl+C interrupt plumbing: foreground-PID registry, `CTRL_BREAK_EVENT` forwarding, cooperative interrupt flag |
+| `builtin_names.rs` | 141 | Single source of truth for builtin names/keywords, feeding `help`, Tab-completion, and syntax highlighting |
+| `main.rs` | 119 | Entry point; branches to script-file mode (argv) or interactive `shell::run` |
+| `fs_builtins.rs` | 100 | `pwd`/`dirs`/`folders`/`files` |
+| `functions.rs` | 83 | `fn` parameter parsing (typed params, docstrings) |
+| `colorout.rs` | 82 | `err_println!`/`err_eprintln!` — red-on-terminal error output, `NO_COLOR`-aware |
+| `jobs.rs` | 78 | Background-job registry for `jobs`/`wait`/`disown` |
+| `types.rs` | 68 | Shared `str`/`bool`/`int`/`float` type-tag validation |
+| `procexpand.rs` | 36 | `$(cmd)`/`@(cmd)` process-expansion process spawning |
 
 ## Implemented, verified against the manual
 
@@ -64,6 +69,7 @@ A working, reasonably faithful interpreter for Ion's language (variables, contro
 - **`commandx` removed** (`ARCHITECTURE.md` §4): the Cartesian-product macro-expansion builtin never gained the ability to run what it generated (see the removed "commandx doesn't execute what it generates" gap that used to be here) and was dropped by product decision rather than finished. `src/commandx.rs` deleted; all dispatch/pipeline/completion wiring removed.
 - **`jobs`/`wait`/`disown`** (pp.69,75,83; `ARCHITECTURE.md` §13): the bookkeeping half of job control — `&` (background) now registers into a real registry (`src/jobs.rs`) instead of the spawned `Child` being dropped immediately. `fg`/`bg` deliberately skipped — see §13 for why. `&!` (disown) still never gets tracked at all, matching real shell semantics. Verified via a real-binary test: start a background job, list it, disown it, confirm `&!` jobs never appear, and confirm `wait` genuinely blocks (via a marker-file race, not just "didn't error").
 - **`&&`/`||` as literal symbols** (p.51; `ARCHITECTURE.md` §14): `cmd1 && cmd2` now works inline, not just the word-form `and`/`or`. Confirmed against upstream's real parser that this is exactly the same mechanism as `and`/`or` with a different spelling, so no new runtime logic was needed, only two small splitters (a raw-string one for `dispatch`, a token one for `eval_condition_tokens`/`if`/`while` headers — reproducing the manual's own `if test ... && test ...` example exactly). Along the way, found and fixed a real bug in the *existing* `and`/`or`/`previous_status` design: statements with no tracked failure mode (`echo`, `let`, etc.) left `$?` stale instead of resetting it, so `false || echo "recovered" && echo "also this"` silently dropped the second half. Fixed by defaulting every statement to "succeeded" up front instead of only setting status for a curated allowlist.
+- **Brace *permutation* expansion** (pp.29-30; `ARCHITECTURE.md` §15): `{ext1,ext2}`-style comma lists, multiple groups per word (`job_{01,02}.{ext1,ext2}`), and nesting (`job_{01_{out,err},02_{out,err}}.txt`) — the general case brace *ranges* were always a subset of. Previously only bare whole-token `{range}` worked; brace expansion is now general, working as an infix attached to surrounding literal text (the manual's primary documented form) with any number of groups per word, each cross-producted together. Verified against both the manual's own examples and, since the manual has no worked example beyond simple cases, upstream Ion's actual brace-expansion test suite (`Linux/ion-master/tests/braces.ion`/`.out`) for deeper nesting and empty-branch edge cases (`It{{em,alic}iz,erat}e{d,}` → `Itemized Itemize Italicized Italicize Iterated Iterate`), reproduced exactly. Required guarding against a real collision: `${name}`/`@{name}` (existing variable-name disambiguation syntax) would otherwise be misparsed as a single-element permutation group, silently dropping the braces and merging the name with any following suffix (`${name}suffix` → wrongly `$namesuffix` instead of `${name}` + `suffix`) — fixed by never opening a group on a `{` immediately preceded by `$`/`@`.
 
 ## Known gaps (deliberately not built — not oversights)
 
@@ -71,11 +77,10 @@ Ranked roughly by how much a real user would notice:
 
 1. **No `fg`/`bg`** — `jobs`/`wait`/`disown` are implemented (see "Implemented, verified" above and `ARCHITECTURE.md` §13), but `fg`/`bg` are deliberately skipped: their real value ("resume a job I stopped with Ctrl+Z") has no clean Windows equivalent, since there's no POSIX-style `SIGTSTP`/`SIGCONT` and ion-win doesn't implement job-stopping at all (matches the manual's own Unix-only "Suspending the Shell" section) — shipping a half-faithful `fg`/`bg` that doesn't really do what the name implies was judged worse than not having them.
 2. **The five Polish-notation comparison operators** (`<`, `<=`, `>`, `>=`, `=`) on the manual's "Complete List of Conditional Builtins" checklist (p.51) are unchecked in upstream Ion too, i.e. not even real Ion has them — don't implement those. (`isatty`/`intersects` — also on that checklist — are now implemented; see "Implemented, verified" above.)
-3. **General brace *permutation* expansion** (`{ext1,ext2}`, nested `{01_{out,err}}`) isn't built — only brace *ranges* (`{1..10}`) are.
-4. **No custom `PROMPT` function or Vi keybindings.** Both ARE genuinely documented with worked examples (pp.5-6) — `PROMPT` in particular needs a way to capture a function's `echo` output as a string (real Ion forks a subprocess for this; ion-win would need an in-process output-capture mechanism instead, since it doesn't fork). By contrast, `alias` and `${c::color}` — previously listed here too — turned out NOT to be verifiably documented Ion features at all after a full read-through of the manual's 87 pages: `alias` is mentioned only twice in passing (an initrc use-case, and in `which`'s description) with no dedicated syntax section or worked example anywhere, and `${c::color}` doesn't appear anywhere. Both were carried over from generic shell assumptions rather than manual verification and were wrongly listed as "not yet built" — don't implement guessed syntax for either without a concrete documented spec to check against. (`initrc`, `which`/`type`, and standalone `true`/`false`/`bool` — also previously listed here — are now implemented; see "Implemented, verified" above.)
-5. **History has no `+shared`/live cross-process sync** and doesn't implement the `no_such_command` ignore rule (accepted but inert — would need execution-outcome plumbing).
-6. **Quoted-array edge case**: `"@array"` (double-quoted) correctly coerces to a joined string in most contexts, but the manual's "quoted vs. unquoted" distinction isn't tracked with full fidelity through every nested context (documented in `interp.rs`'s `Token`/`Quoting` doc comments).
-7. Indexing/counting is by Unicode `char`, not grapheme cluster (no graphemes crate dependency) — `graphemes()` method is currently an alias for `chars()`.
+3. **No custom `PROMPT` function or Vi keybindings.** Both ARE genuinely documented with worked examples (pp.5-6) — `PROMPT` in particular needs a way to capture a function's `echo` output as a string (real Ion forks a subprocess for this; ion-win would need an in-process output-capture mechanism instead, since it doesn't fork). By contrast, `alias` and `${c::color}` — previously listed here too — turned out NOT to be verifiably documented Ion features at all after a full read-through of the manual's 87 pages: `alias` is mentioned only twice in passing (an initrc use-case, and in `which`'s description) with no dedicated syntax section or worked example anywhere, and `${c::color}` doesn't appear anywhere. Both were carried over from generic shell assumptions rather than manual verification and were wrongly listed as "not yet built" — don't implement guessed syntax for either without a concrete documented spec to check against. (`initrc`, `which`/`type`, and standalone `true`/`false`/`bool` — also previously listed here — are now implemented; see "Implemented, verified" above.)
+4. **History has no `+shared`/live cross-process sync** and doesn't implement the `no_such_command` ignore rule (accepted but inert — would need execution-outcome plumbing).
+5. **Quoted-array edge case**: `"@array"` (double-quoted) correctly coerces to a joined string in most contexts, but the manual's "quoted vs. unquoted" distinction isn't tracked with full fidelity through every nested context (documented in `interp.rs`'s `Token`/`Quoting` doc comments).
+6. Indexing/counting is by Unicode `char`, not grapheme cluster (no graphemes crate dependency) — `graphemes()` method is currently an alias for `chars()`.
 
 ## Testing philosophy (worth preserving)
 

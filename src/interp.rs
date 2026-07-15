@@ -309,10 +309,12 @@ impl Interpreter {
     ///   space-joined string.
     /// - bare (None): a token that is *exactly* `@name`/`@(cmd)`/`@method(args)`
     ///   (each optionally followed by a `[slice]`) fans out into multiple
-    ///   shell words (ion-manual pages 26, 28, 32-43, 45-48); a bare
-    ///   `{range}` brace range fans out the same way (pages 29-30);
-    ///   everything else interpolates in place, joining any embedded
-    ///   arrays with spaces.
+    ///   shell words (ion-manual pages 26, 28, 32-43, 45-48); any brace
+    ///   group(s) elsewhere in the token — ranges, permutation lists, or
+    ///   nesting, standalone or as an infix like `job_{01,02}.{ext1,ext2}`
+    ///   — fan out the same way (pages 29-30), with `$`/`@` interpolation
+    ///   applied to each resulting word; everything else interpolates in
+    ///   place, joining any embedded arrays with spaces.
     fn expand_token(&self, token: &Token) -> Expanded {
         match token.quoting {
             Quoting::Single => Expanded::One(token.text.clone()),
@@ -352,14 +354,10 @@ impl Interpreter {
                     }
                 }
 
-                if let Some(inner) = token
-                    .text
-                    .strip_prefix('{')
-                    .and_then(|s| s.strip_suffix('}'))
-                {
-                    if let Some(items) = crate::ranges::expand_brace_range(inner) {
-                        return Expanded::Many(items);
-                    }
+                if let Some(items) = crate::ranges::expand_braces(&token.text) {
+                    return Expanded::Many(
+                        items.iter().map(|s| self.interpolate(s)).collect(),
+                    );
                 }
 
                 Expanded::One(self.interpolate(&token.text))
@@ -1300,6 +1298,51 @@ mod tests {
             expanded,
             vec!["a".to_string(), "b".to_string(), "c".to_string()]
         );
+    }
+
+    /// ion-manual pages 29-30: brace permutation as an infix, attached to
+    /// surrounding literal text (the manual's primary documented form,
+    /// unlike the bare whole-token range above), including multiple
+    /// groups in one token and `$var` interpolation applied afterward to
+    /// each resulting permutation.
+    #[test]
+    fn brace_permutation_expands_as_infix_with_interpolation() {
+        let interp = Interpreter::new();
+        let expanded = interp.expand_all(&["filename.{ext1,ext2}".into()]);
+        assert_eq!(
+            expanded,
+            vec!["filename.ext1".to_string(), "filename.ext2".to_string()]
+        );
+
+        let expanded = interp.expand_all(&["job_{01,02}.{ext1,ext2}".into()]);
+        assert_eq!(
+            expanded,
+            vec![
+                "job_01.ext1".to_string(),
+                "job_01.ext2".to_string(),
+                "job_02.ext1".to_string(),
+                "job_02.ext2".to_string(),
+            ]
+        );
+
+        let mut interp = interp;
+        interp.set_scalar("name".to_string(), "report".to_string());
+        let expanded = interp.expand_all(&["$name.{a,b}".into()]);
+        assert_eq!(
+            expanded,
+            vec!["report.a".to_string(), "report.b".to_string()]
+        );
+    }
+
+    /// `${name}` disambiguation braces must survive brace-permutation
+    /// expansion untouched, still resolving the intended variable rather
+    /// than colliding with permutation-group parsing.
+    #[test]
+    fn dollar_brace_disambiguation_survives_permutation_pass() {
+        let mut interp = Interpreter::new();
+        interp.set_scalar("name".to_string(), "val".to_string());
+        let expanded = interp.expand_all(&["${name}suffix".into()]);
+        assert_eq!(expanded, vec!["valsuffix".to_string()]);
     }
 
     /// ion-manual page 48: process expansions also support slicing —
