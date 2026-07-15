@@ -71,6 +71,46 @@ fn is_block_opener(line: &str) -> bool {
     }
 }
 
+const DEFAULT_PROMPT: &str = "ion> ";
+
+/// Keeps `$PWD` current before every prompt render, so a `PROMPT` function
+/// (or any other script) can rely on it reflecting the shell's actual
+/// current directory (ion-manual page 6's own example: `echo -n
+/// "${PWD}# "`). Refreshed here rather than at each individual
+/// directory-changing call site (`cd`, implicit cd, `dmark jump`) since
+/// that would mean re-finding and updating every one of them instead of
+/// one place that's always correct regardless of how the directory changed.
+fn sync_pwd(interp: &mut Interpreter) {
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    interp.set_scalar("PWD".to_string(), cwd);
+}
+
+/// Renders the interactive prompt: the manual's `PROMPT` function
+/// (ion-manual page 6) if the user has defined one via `fn PROMPT ... end`,
+/// else the plain default. `PROMPT`'s `echo` output is captured in-process
+/// rather than printed (`Interpreter::echo_output`/`begin_echo_capture`) —
+/// real Ion forks a subprocess and captures its stdout, but ion-win doesn't
+/// fork, so this is the pragmatic equivalent for the one documented use
+/// case. Falls back to the default if `PROMPT` is missing, mis-defined
+/// (e.g. declared with parameters, which `call_function` rejects with a
+/// printed error), or simply produces no output.
+async fn render_prompt(interp: &mut Interpreter, state: &StateHandle) -> String {
+    sync_pwd(interp);
+    let Some(def) = interp.get_function("PROMPT") else {
+        return DEFAULT_PROMPT.to_string();
+    };
+    interp.begin_echo_capture();
+    let _ = call_function("PROMPT", &def, &[], interp, state).await;
+    let captured = interp.end_echo_capture();
+    if captured.is_empty() {
+        DEFAULT_PROMPT.to_string()
+    } else {
+        captured
+    }
+}
+
 pub async fn run(state: StateHandle) {
     println!("ion-win 0.8.0 Beta -- type 'exit' to quit, 'help' for builtins");
 
@@ -80,7 +120,8 @@ pub async fn run(state: StateHandle) {
     load_initrc(&mut interp, &state).await;
 
     loop {
-        let Some(line) = editor.read_line("ion> ") else {
+        let prompt = render_prompt(&mut interp, &state).await;
+        let Some(line) = editor.read_line(&prompt) else {
             break;
         }; // EOF (Ctrl+Z / Ctrl+D)
         editor.add_history(&line);
@@ -671,7 +712,8 @@ fn eval_condition_tokens<'a>(
                 let args = interp.expand_all(&tokens[1..]);
                 match head.text.as_str() {
                     "echo" => {
-                        println!("{}", args.join(" "));
+                        let (rest, no_newline) = crate::interp::split_echo_no_newline_flag(&args);
+                        interp.echo_output(&rest.join(" "), !no_newline);
                         true
                     }
                     "pvar" => {
@@ -875,7 +917,10 @@ async fn dispatch(line: &str, interp: &mut Interpreter, state: &StateHandle) -> 
 
             let args = interp.expand_all(raw_args);
             match cmd.as_str() {
-                "echo" => println!("{}", args.join(" ")),
+                "echo" => {
+                    let (rest, no_newline) = crate::interp::split_echo_no_newline_flag(&args);
+                    interp.echo_output(&rest.join(" "), !no_newline);
+                }
                 "cd" => {
                     let ok = handle_cd(&args);
                     interp.set_previous_status(ok);

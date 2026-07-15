@@ -32,7 +32,8 @@ use std::process::{Child, ChildStderr, ChildStdout, Stdio};
 use std::sync::{Arc, Mutex};
 
 enum Kind {
-    Echo(Vec<String>),
+    /// Args plus whether the trailing newline is suppressed (`echo -n`).
+    Echo(Vec<String>, bool),
     External(Vec<String>),
     /// A builtin/function name that isn't yet supported as a pipeline
     /// stage. Empty string means the stage had no command at all (e.g. a
@@ -129,8 +130,11 @@ pub async fn run(pipeline: &Pipeline, interp: &mut Interpreter, _state: &StateHa
         let incoming = std::mem::replace(&mut carry, Carry::None);
 
         match kind {
-            Kind::Echo(args) => {
-                let text = args.join(" ") + "\n";
+            Kind::Echo(args, no_newline) => {
+                let mut text = args.join(" ");
+                if !no_newline {
+                    text.push('\n');
+                }
                 drop(incoming); // echo never reads stdin; drop whatever fed it
                 if let Some(mut f) = stdout_file {
                     let _ = f.write_all(text.as_bytes());
@@ -295,7 +299,8 @@ fn classify_stages(pipeline: &Pipeline, interp: &Interpreter) -> Vec<Kind> {
             let args = interp.expand_all(&stage.tokens);
             let cmd = args[0].clone();
             if cmd == "echo" {
-                Kind::Echo(args[1..].to_vec())
+                let (rest, no_newline) = crate::interp::split_echo_no_newline_flag(&args[1..]);
+                Kind::Echo(rest.to_vec(), no_newline)
             } else if interp.get_function(&cmd).is_some()
                 || matches!(
                     cmd.as_str(),

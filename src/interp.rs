@@ -25,11 +25,21 @@ pub struct Interpreter {
     /// The previous statement's success/failure — Ion's `$?` equivalent
     /// (confirmed against upstream Ion's real source, `shell/flow.rs`:
     /// `self.previous_status`), which `and`/`or` (`shell.rs`) read to
-    /// decide whether to run. Set after condition builtins, external
-    /// processes, and pipelines; left unchanged by statements with no
-    /// natural success/failure of their own (`let`, `echo`, etc.) rather
-    /// than guessing a status for them.
+    /// decide whether to run. `dispatch` (`shell.rs`) resets this to
+    /// `true` at the start of every statement except `and`/`or`, and the
+    /// specific arms with a real failure mode (`test`, `cd`, external
+    /// processes, ...) override that default with their actual result.
     previous_status: bool,
+    /// When `Some`, `echo`'s output is appended here instead of going to
+    /// real stdout — used to capture a `PROMPT` function's output as the
+    /// prompt string rather than printing it (ion-manual page 6, "Prompt
+    /// Function"). `None` (the normal case) means `echo` prints as usual.
+    /// Only `echo` is capture-aware, matching the single documented use
+    /// case (real Ion captures a forked process's entire stdout; ion-win
+    /// doesn't fork, so this narrower in-process capture — same approach
+    /// already used for `$(cmd)`/`@(cmd)` process expansion's `echo`
+    /// shortcut — is the pragmatic equivalent).
+    echo_capture: Option<String>,
 }
 
 impl Default for Interpreter {
@@ -39,6 +49,7 @@ impl Default for Interpreter {
             arrays: vec![HashMap::new()],
             functions: HashMap::new(),
             previous_status: true,
+            echo_capture: None,
         }
     }
 }
@@ -383,7 +394,8 @@ impl Interpreter {
             return Err("empty command in process expansion".to_string());
         }
         if args[0] == "echo" {
-            return Ok(args[1..].join(" "));
+            let (rest, _no_newline) = split_echo_no_newline_flag(&args[1..]);
+            return Ok(rest.join(" "));
         }
         if let Some(result) = crate::fs_builtins::capture(&args[0], &args[1..]) {
             return result;
@@ -854,6 +866,47 @@ impl Interpreter {
         self.previous_status = ok;
     }
 
+    /// Starts capturing `echo`'s output instead of printing it (ion-manual
+    /// page 6's `PROMPT` function). Any capture already in progress is
+    /// discarded — capture sessions don't nest.
+    pub fn begin_echo_capture(&mut self) {
+        self.echo_capture = Some(String::new());
+    }
+
+    /// Stops capturing and returns whatever `echo` wrote during the
+    /// session (empty if capture was never started, or nothing was
+    /// echoed).
+    pub fn end_echo_capture(&mut self) -> String {
+        self.echo_capture.take().unwrap_or_default()
+    }
+
+    /// `echo`'s actual output routine: appends to the active capture
+    /// buffer if one exists, otherwise prints to real stdout. `newline`
+    /// is `echo`'s `-n` flag, inverted (suppress it to omit the trailing
+    /// newline — needed for the manual's own `PROMPT` example, `echo -n
+    /// "${PWD}# "`, since a prompt with a forced trailing newline would
+    /// push the cursor to its own line).
+    pub fn echo_output(&mut self, text: &str, newline: bool) {
+        match &mut self.echo_capture {
+            Some(buf) => {
+                buf.push_str(text);
+                if newline {
+                    buf.push('\n');
+                }
+            }
+            None if newline => println!("{text}"),
+            None => {
+                use std::io::Write;
+                print!("{text}");
+                // Rust's stdout is line-buffered; without a newline to
+                // trigger a flush, `-n` output could sit in the buffer
+                // instead of appearing before the next prompt read blocks
+                // on stdin.
+                let _ = std::io::stdout().flush();
+            }
+        }
+    }
+
     /// Pushes a fresh scope frame — called once per block *execution*
     /// (`exec_block` in `shell.rs`), so each loop iteration, each `if`
     /// branch taken, and each function call gets its own frame.
@@ -1105,6 +1158,25 @@ fn consume_slice_spec(chars: &mut std::iter::Peekable<std::str::Chars>) -> Optio
 /// fan-out rather than in-place string interpolation.
 fn is_plain_name(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// Splits a leading run of `echo -n` flags off `args`, returning the
+/// remaining words and whether the trailing newline should be suppressed.
+/// Only `-n` is recognized — real Ion's `echo` also has `-e`/`-s`, but
+/// neither is documented anywhere in the manual (only `-n` is, via the
+/// `PROMPT` function example on page 6), so they're out of scope here.
+/// Shared by every `echo` call site (`shell.rs`'s two dispatch arms,
+/// `pipeline_exec.rs`'s pipeline producer, and this module's `$(cmd)`
+/// capture shortcut below) so `-n` behaves consistently everywhere instead
+/// of only where it happened to be added first.
+pub fn split_echo_no_newline_flag(args: &[String]) -> (&[String], bool) {
+    let mut rest = args;
+    let mut no_newline = false;
+    while rest.first().map(String::as_str) == Some("-n") {
+        no_newline = true;
+        rest = &rest[1..];
+    }
+    (rest, no_newline)
 }
 
 /// If `s` is exactly a parenthesized body (`(...)`, nothing else attached),
@@ -1639,6 +1711,46 @@ mod tests {
         assert!(!interp.previous_status());
         interp.set_previous_status(true);
         assert!(interp.previous_status());
+    }
+
+    /// ion-manual page 6: `echo -n` suppresses the trailing newline — the
+    /// `PROMPT` function's own worked example (`echo -n "${PWD}# "`) relies
+    /// on this so the prompt doesn't push the cursor to its own line.
+    #[test]
+    fn echo_no_newline_flag_is_stripped() {
+        let args: Vec<String> = vec!["hello".into(), "world".into()];
+        let (rest, no_newline) = split_echo_no_newline_flag(&args);
+        assert_eq!(rest, &args[..]);
+        assert!(!no_newline);
+
+        let args: Vec<String> = vec!["-n".into(), "hello".into()];
+        let (rest, no_newline) = split_echo_no_newline_flag(&args);
+        assert_eq!(rest, &["hello".to_string()]);
+        assert!(no_newline);
+
+        // A repeated -n is harmless (mirrors real `echo -n -n x`).
+        let args: Vec<String> = vec!["-n".into(), "-n".into(), "x".into()];
+        let (rest, no_newline) = split_echo_no_newline_flag(&args);
+        assert_eq!(rest, &["x".to_string()]);
+        assert!(no_newline);
+    }
+
+    /// `Interpreter::echo_output`'s capture mode (`PROMPT`'s implementation
+    /// mechanism, ion-manual page 6): while a capture session is active,
+    /// `echo`'s output is appended to a buffer instead of printed, honoring
+    /// the same `-n`-controlled newline suppression it would use for real
+    /// stdout.
+    #[test]
+    fn echo_capture_collects_output_instead_of_printing() {
+        let mut interp = Interpreter::new();
+        interp.begin_echo_capture();
+        interp.echo_output("hello ", true);
+        interp.echo_output("world", false);
+        assert_eq!(interp.end_echo_capture(), "hello \nworld");
+
+        // A fresh session starts clean, and ending without ever starting
+        // one returns empty rather than panicking.
+        assert_eq!(interp.end_echo_capture(), "");
     }
 
     /// ion-manual page 20: "Functions have the scope they were defined
