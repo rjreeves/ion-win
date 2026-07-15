@@ -1,0 +1,18 @@
+# Exercises arithmetic expansion, compound assignment, brace ranges, and array literal expansion.
+echo CASE 03 arithmetic and ranges
+let value = 5
+let value += 5
+let value -= 2
+let value *= 2
+let value //= 2
+let value **= 2
+let value /= 2
+echo compound=$value
+let pi = 3.0
+let r = 2
+echo area $((4 * (pi * (r ** 2))))
+echo bitwise $(((8 >> 1) | 2))
+echo numeric-range {1..5}
+echo alpha-range {a..e}
+let ranged = [{2...7}]
+echo ranged @ranged

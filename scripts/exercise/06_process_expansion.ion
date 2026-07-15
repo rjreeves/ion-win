@@ -1,0 +1,9 @@
+# Exercises scalar and array process expansion, echo's in-process expansion path, and slicing process output.
+echo CASE 06 process expansion
+let scalar = $(echo captured scalar text)
+echo scalar=$scalar
+echo array @(echo one two three)
+echo scalar-slice $(echo abcdefghij)[..4]
+echo array-slice @(echo alpha beta gamma delta)[1..=2]
+let proc = $(echo one two one)
+echo nested $replace(proc one 1)

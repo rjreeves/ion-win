@@ -1,0 +1,4 @@
+echo start > ctrlc_pure_loop.out
+while true
+end
+echo unreachable >> ctrlc_pure_loop.out

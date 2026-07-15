@@ -1,0 +1,19 @@
+# Exercises function definitions, docstrings, scalar params, array params, typed params, and function listing.
+echo CASE 05 functions and types
+fn greet name:str
+    echo hello-$name
+end
+fn sum_pair left:int right:int
+    echo sum $((left + right))
+end
+fn list_items items:[str] -- prints every supplied item
+    for item in @items
+        echo item=$item
+    end
+end
+greet shell
+sum_pair 7 11
+let colors = [ cyan magenta yellow ]
+list_items @colors
+fn
+sum_pair nope 1

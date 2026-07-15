@@ -1,0 +1,3 @@
+echo start > ctrlc_external.out
+ping -t 127.0.0.1
+echo unreachable >> ctrlc_external.out

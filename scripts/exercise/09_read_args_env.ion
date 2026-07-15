@@ -1,0 +1,9 @@
+# Exercises script arguments, read, export, and child-process environment inheritance.
+echo CASE 09 read args env
+echo args @args
+read first rest
+echo read-first=$first
+echo read-rest=$rest
+export ION_WIN_EXERCISE_ENV = child-visible
+echo export-local=${env::ION_WIN_EXERCISE_ENV}
+cmd /c echo %ION_WIN_EXERCISE_ENV%

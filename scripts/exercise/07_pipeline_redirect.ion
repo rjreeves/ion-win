@@ -1,0 +1,10 @@
+# Exercises pipeline parsing/execution plus stdout, append, stderr, and combined redirection.
+echo CASE 07 pipelines and redirects
+echo alpha beta gamma | cmd /c findstr beta
+echo first > target/exercise_stdout.txt
+echo second >> target/exercise_stdout.txt
+cmd /c type target\exercise_stdout.txt
+cmd /c echo error-message 1>&2 ^> target/exercise_stderr.txt
+cmd /c type target\exercise_stderr.txt
+cmd /c echo combined-out &> target/exercise_combined.txt
+cmd /c type target\exercise_combined.txt

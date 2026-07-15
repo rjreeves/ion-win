@@ -1,0 +1,10 @@
+# Exercises persistent variables and directory bookmarks backed by redb.
+echo CASE 08 persistent state
+pvar set exercise_key = exercise_value
+pvar get exercise_key
+pvar list
+pvar delete exercise_key
+pvar get exercise_key
+dmark add exercise_here
+dmark list
+dmark jump exercise_here

@@ -1,0 +1,6 @@
+# Exercises background/disown markers, unsupported pipeline diagnostics, and clear missing-command handling.
+echo CASE 10 background diagnostics
+cmd /c echo background-ok &
+cmd /c echo disown-ok &!
+let x = value | cmd /c more
+definitely_missing_ion_win_command

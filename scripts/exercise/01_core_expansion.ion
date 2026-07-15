@@ -1,0 +1,13 @@
+# Exercises comments, scalar/array variables, quoting, interpolation, drop, and env namespace.
+echo CASE 01 core expansion
+let name = ion-win
+let words = [ alpha beta "two words" gamma ]
+echo scalar=$name
+echo braced=${name}:ok
+echo array-fanout @words
+echo double-array "@words"
+echo single-literal '$name @words'
+echo env-user=${env::USERNAME}
+drop name
+let empty = ""
+echo fallback $or(empty fallback-name)

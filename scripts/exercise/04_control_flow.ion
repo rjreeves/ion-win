@@ -1,0 +1,25 @@
+# Exercises if/else-if/else, test, matches, while, for, break, continue, and not.
+echo CASE 04 control flow
+let total = 0
+for n in {1..8}
+    if test $n -eq 3
+        continue
+    end
+    if test $n -gt 5
+        break
+    end
+    let total += $n
+    echo for-step=$n total=$total
+end
+let guard = 0
+while test $guard -lt 3
+    let guard += 1
+    echo while-step=$guard
+end
+if matches apple "^[a-z]+$"
+    echo regex-branch=lowercase
+else if not test -n apple
+    echo regex-branch=empty
+else
+    echo regex-branch=other
+end
