@@ -12,9 +12,9 @@
 //! block execution gets its own scope frame via `exec_block`).
 //!
 //! Not yet implemented: user-defined functions as condition commands or
-//! pipeline stages, and job control (`jobs`/`fg`/`bg` — `&`/`&!` just spawn
-//! without waiting) — see ARCHITECTURE.md section 6 for the upgrade
-//! roadmap.
+//! pipeline stages, and `fg`/`bg` job control (`jobs`/`wait`/`disown` are
+//! implemented — see `jobs.rs`) — see ARCHITECTURE.md section 6 for the
+//! upgrade roadmap.
 
 /// Execution-flow signal threaded through statement/block execution so
 /// `break`/`continue`/`exit` can propagate from wherever they're invoked up
@@ -48,6 +48,7 @@ use crate::functions::{self, FunctionDef};
 use crate::history;
 use crate::interp::{Interpreter, Token};
 use crate::jobctl;
+use crate::jobs;
 use crate::pipeline;
 use crate::{err_eprintln, err_println};
 use crate::pipeline_exec;
@@ -775,6 +776,9 @@ async fn dispatch(line: &str, interp: &mut Interpreter, state: &StateHandle) -> 
                 "pwd" | "dirs" | "folders" | "files" => handle_fs_builtin(cmd.as_str(), &args),
                 "pvar" => handle_pvar(&args, state).await,
                 "dmark" => handle_dmark(&args, state).await,
+                "jobs" => handle_jobs(),
+                "wait" => jobs::wait_all(),
+                "disown" => handle_disown(&args),
                 "source" => return handle_source(&args, interp, state).await,
                 "test" => {
                     let ok = builtins::eval_test(&args);
@@ -1318,5 +1322,47 @@ async fn handle_dmark(args: &[String], state: &StateHandle) {
         },
         _ => println!("dmark: usage: dmark add|list|jump ..."),
     }
+}
+
+/// `jobs` (ion-manual page 75): lists all tracked background jobs.
+fn handle_jobs() {
+    let jobs = jobs::list();
+    if jobs.is_empty() {
+        println!("ion-win: no background jobs");
+        return;
+    }
+    for (pid, command) in jobs {
+        println!("{pid}\t{command}");
+    }
+}
+
+/// `disown [--help | -r | -h | -a] [PID...]` (ion-manual page 69). `-a`/
+/// `-r` and a bare `disown` with no PIDs all disown *every* tracked job —
+/// the manual's own wording for `-a` ("if no job IDs were supplied,
+/// remove all jobs") is extended to the no-flag case too, rather than
+/// inventing bash's unrelated "most recent job" default the manual never
+/// mentions. `-h` ("don't forward SIGHUP") is accepted but a no-op:
+/// Windows console apps have no real SIGHUP equivalent for ion-win to
+/// forward in the first place.
+fn handle_disown(args: &[String]) {
+    let mut pids: Vec<u32> = Vec::new();
+    for arg in args {
+        match arg.as_str() {
+            "-a" | "-r" | "-h" => {}
+            "--help" => {
+                println!("disown [--help | -r | -h | -a] [PID...]");
+                return;
+            }
+            other => match other.parse::<u32>() {
+                Ok(pid) => pids.push(pid),
+                Err(_) => {
+                    err_println!("ion-win: disown: '{other}': not a valid PID");
+                    return;
+                }
+            },
+        }
+    }
+    let count = jobs::disown(&pids);
+    println!("ion-win: disowned {count} job(s)");
 }
 

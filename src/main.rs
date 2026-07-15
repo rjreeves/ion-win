@@ -8,6 +8,7 @@ mod functions;
 mod history;
 mod interp;
 mod jobctl;
+mod jobs;
 mod methods;
 mod pipeline;
 mod pipeline_exec;

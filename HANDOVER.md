@@ -62,12 +62,13 @@ A working, reasonably faithful interpreter for Ion's language (variables, contro
 - **`match`/`case` pattern matching** (pp.56-57; `ARCHITECTURE.md` §12): the last big control-flow gap, now closed — `match EXPR / case PATTERN [if GUARD]; STMT|BLOCK / case _ / end`. All three of the manual's worked examples reproduced exactly (string-vs-string equality, string-subject-vs-array-case, array-subject-vs-string-case), plus match guards (`case PATTERN if CONDITION`) and the single-line inline form (`case _; echo ...`). Array-vs-array case matching has no worked example in the manual, so it's an inferred (documented as such) extension of the same "shared element" rule. Caught a real, separate bug along the way: array literals (`[ ... ]`) were being silently mishandled by plain `expand_all` — needed `array_from_token` instead.
 - **`intersects ARRAY1 ARRAY2`**: ion-win extension (unchecked/unimplemented even in upstream Ion — no real behavior to verify against, same situation as bitwise NOT). Product decision: exit status 0 if the two named arrays share at least one element.
 - **`commandx` removed** (`ARCHITECTURE.md` §4): the Cartesian-product macro-expansion builtin never gained the ability to run what it generated (see the removed "commandx doesn't execute what it generates" gap that used to be here) and was dropped by product decision rather than finished. `src/commandx.rs` deleted; all dispatch/pipeline/completion wiring removed.
+- **`jobs`/`wait`/`disown`** (pp.69,75,83; `ARCHITECTURE.md` §13): the bookkeeping half of job control — `&` (background) now registers into a real registry (`src/jobs.rs`) instead of the spawned `Child` being dropped immediately. `fg`/`bg` deliberately skipped — see §13 for why. `&!` (disown) still never gets tracked at all, matching real shell semantics. Verified via a real-binary test: start a background job, list it, disown it, confirm `&!` jobs never appear, and confirm `wait` genuinely blocks (via a marker-file race, not just "didn't error").
 
 ## Known gaps (deliberately not built — not oversights)
 
 Ranked roughly by how much a real user would notice:
 
-1. **No `jobs`/`fg`/`bg`/`wait`/`disown` job control** — `&`/`&!` spawn processes without waiting, and there's no way to list/wait-for/disown them afterward; today the spawned `Child` handle is dropped immediately with no PID tracked anywhere, so there's no registry to build these against yet. (Ctrl+C *interrupting* the current foreground job is implemented — see "Implemented, verified" above and `ARCHITECTURE.md` §9 — this gap is specifically about managing background jobs after the fact.) Deliberately deferred: the manual's `fg`/`bg` semantics ("resuming it if it has stopped") assume POSIX job control — `SIGTSTP`/`SIGCONT`, stopped background jobs — which Windows has no equivalent for, and ion-win doesn't implement job-stopping at all (matches the manual's own Unix-only "Suspending the Shell" section). `jobs`/`wait`/`disown` would map cleanly to Windows; `fg`/`bg` would need a scoped-down, honestly-documented approximation rather than true parity.
+1. **No `fg`/`bg`** — `jobs`/`wait`/`disown` are implemented (see "Implemented, verified" above and `ARCHITECTURE.md` §13), but `fg`/`bg` are deliberately skipped: their real value ("resume a job I stopped with Ctrl+Z") has no clean Windows equivalent, since there's no POSIX-style `SIGTSTP`/`SIGCONT` and ion-win doesn't implement job-stopping at all (matches the manual's own Unix-only "Suspending the Shell" section) — shipping a half-faithful `fg`/`bg` that doesn't really do what the name implies was judged worse than not having them.
 2. **No literal `&&`/`||` symbol operators for top-level command chaining** (ion-manual p.51, "Using the && and || Operators") — the word-form equivalents `and`/`or` are now implemented (see "Implemented, verified" above; confirmed against upstream's real source since the manual itself never documents `and`/`or`'s syntax), but `cmd1 && cmd2`/`cmd1 || cmd2` as literal symbolic operators on one line still isn't wired into `pipeline`'s parsing.
 3. **The five Polish-notation comparison operators** (`<`, `<=`, `>`, `>=`, `=`) on the manual's "Complete List of Conditional Builtins" checklist (p.51) are unchecked in upstream Ion too, i.e. not even real Ion has them — don't implement those. (`isatty`/`intersects` — also on that checklist — are now implemented; see "Implemented, verified" above.)
 4. **General brace *permutation* expansion** (`{ext1,ext2}`, nested `{01_{out,err}}`) isn't built — only brace *ranges* (`{1..10}`) are.
@@ -87,9 +88,7 @@ Every feature in this codebase was verified two ways, and both matter:
 
 ## Suggested next steps
 
-In rough priority order if continuing:
-1. **Job control** (`jobs`/`fg`/`bg`) — now the biggest remaining fidelity gap; moderate size, meaningfully improves interactive usability given backgrounding already exists.
-2. Everything in the "known gaps" list above, roughly in the order listed.
+In rough priority order if continuing: everything in the "known gaps" list above, roughly in the order listed.
 
 ## A note on the interactive line editor
 

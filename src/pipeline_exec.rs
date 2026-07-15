@@ -3,7 +3,8 @@
 //! Supported: `|`/`^|`/`&|` piping between external commands, `>`/`>>`/
 //! `^>`/`&>` redirection to files, `echo` as a producer (writing into the
 //! next stage's stdin or a redirect target), and `&`/`&!` (spawn without
-//! waiting — no `jobs`/`bg`/`fg` job-control tracking yet).
+//! waiting — `&` registers with `jobs.rs` for `jobs`/`wait`/`disown`;
+//! `&!` never does, no `fg`/`bg` — see `jobs.rs`'s module doc for why).
 //!
 //! Not supported as a pipeline stage: any other builtin (`pvar`, `dmark`,
 //! `test`, `matches`, `read`, ...) or a user-defined `fn` —
@@ -23,6 +24,7 @@
 use crate::err_println;
 use crate::interp::Interpreter;
 use crate::jobctl;
+use crate::jobs;
 use crate::pipeline::{PipeKind, Pipeline, Redirect, Stream};
 use crate::state::StateHandle;
 use std::io::{self, Write};
@@ -95,6 +97,9 @@ pub async fn run(pipeline: &Pipeline, interp: &mut Interpreter, _state: &StateHa
     let is_foreground = !pipeline.background && !pipeline.disown;
 
     let mut children: Vec<Child> = Vec::new();
+    // Parallel to `children` (same index), for `jobs::register`'s display
+    // text if this pipeline turns out to be backgrounded.
+    let mut command_texts: Vec<String> = Vec::new();
     let mut merge_threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
     let mut carry = Carry::None;
 
@@ -244,6 +249,7 @@ pub async fn run(pipeline: &Pipeline, interp: &mut Interpreter, _state: &StateHa
                     },
                 };
 
+                command_texts.push(args.join(" "));
                 children.push(child);
             }
             Kind::Unsupported(_) => unreachable!("checked above"),
@@ -251,7 +257,18 @@ pub async fn run(pipeline: &Pipeline, interp: &mut Interpreter, _state: &StateHa
     }
 
     if pipeline.background || pipeline.disown {
-        println!("ion-win: [bg] started {} process(es)", children.len());
+        let job_count = children.len();
+        // `&` (background) keeps tracking the job for `jobs`/`wait`/
+        // `disown`; `&!` (disown) never tracks it at all — matching real
+        // shell semantics of "disowned" meaning the shell doesn't manage
+        // its lifecycle from the moment it's spawned.
+        if pipeline.background {
+            for (child, command) in children.into_iter().zip(command_texts) {
+                let pid = child.id();
+                jobs::register(pid, command, child);
+            }
+        }
+        println!("ion-win: [bg] started {job_count} process(es)");
         return true;
     }
 

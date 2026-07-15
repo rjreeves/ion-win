@@ -72,6 +72,9 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin { name: "eval", is_keyword: false, help_display: Some("eval") },
     Builtin { name: "pvar", is_keyword: false, help_display: Some("pvar set|get|list|delete") },
     Builtin { name: "dmark", is_keyword: false, help_display: Some("dmark add|list|jump") },
+    Builtin { name: "jobs", is_keyword: false, help_display: Some("jobs") },
+    Builtin { name: "wait", is_keyword: false, help_display: Some("wait") },
+    Builtin { name: "disown", is_keyword: false, help_display: Some("disown [-a|PID...]") },
     Builtin { name: "source", is_keyword: false, help_display: Some("source") },
     Builtin { name: "highlight", is_keyword: false, help_display: Some("highlight on|off") },
 ];
@@ -109,7 +112,7 @@ mod tests {
     fn help_text_matches_current_builtin_list() {
         assert_eq!(
             help_text(),
-            "builtins: exit, help, let, export, drop, read, echo, cd, pwd, dirs, folders, files, if/else if/else, while, for/in, fn, match/case, break, continue, test, matches, not, true, false, bool, contains, starts-with, ends-with, eq/is, exists, intersects, isatty, and, or, which/type, eval, pvar set|get|list|delete, dmark add|list|jump, source, highlight on|off\n\
+            "builtins: exit, help, let, export, drop, read, echo, cd, pwd, dirs, folders, files, if/else if/else, while, for/in, fn, match/case, break, continue, test, matches, not, true, false, bool, contains, starts-with, ends-with, eq/is, exists, intersects, isatty, and, or, which/type, eval, pvar set|get|list|delete, dmark add|list|jump, jobs, wait, disown [-a|PID...], source, highlight on|off\n\
              pipes: | ^| &|   redirect: > >> ^> &>   background: & &!\n\
              implicit cd: bare ~/path, .., .config, examples/\n\
              namespaces: ${env::VAR}"
