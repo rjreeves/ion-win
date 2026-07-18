@@ -780,6 +780,61 @@ fn split_at_top_level_chain_op(line: &str) -> Option<(&str, ChainOp, &str)> {
     None
 }
 
+/// Whether `cmd` is a pipeline stage that produces a `Table`
+/// (`ARCHITECTURE.md` §18): one of the structured pipeline builtins that
+/// yields a table (not `to-json`, which deliberately converts *out* of
+/// table form into text — a `let` right-hand side ending in `to-json`
+/// intentionally isn't captured this way), or an existing table variable
+/// (so `let derived = mytable | where ...` re-derives from a previously
+/// stored table).
+fn is_table_producing_command(cmd: &str, interp: &Interpreter) -> bool {
+    matches!(cmd, "from-json" | "select" | "where" | "filter") || interp.get_table(cmd).is_some()
+}
+
+/// Intercepts `let NAME = PIPELINE` — where `PIPELINE`'s *last* stage
+/// produces a `Table` — before the ordinary pipeline-vs-simple-statement
+/// gate below, since a line like `let procs = tool --json | from-json |
+/// where cpu -gt 5` would otherwise be handed whole to `pipeline::parse`,
+/// which has no idea `let NAME =` is meant to capture the result rather
+/// than being the pipeline's own (unsupported) first stage. Checking the
+/// *last* stage (not the first) matters: `echo '[...]' | from-json` is a
+/// table-producing pipeline even though its first word, `echo`, isn't a
+/// table-producing command by itself. Runs the right-hand side through
+/// `pipeline_exec::run_capturing_table` and stores whatever `Table` it
+/// produces under `NAME`, rather than `builtin_let`'s ordinary
+/// scalar/array/arithmetic handling. Returns `None` (falling through to
+/// normal dispatch) when the line isn't of this shape at all, so ordinary
+/// `let x = 5` and `let arr = [ ... ]` are completely unaffected.
+async fn try_dispatch_let_table(
+    raw_tokens: &[Token],
+    interp: &mut Interpreter,
+    state: &StateHandle,
+) -> Option<Flow> {
+    if raw_tokens.first().map(|t| t.text.as_str()) != Some("let") {
+        return None;
+    }
+    let name = raw_tokens.get(1)?.text.clone();
+    if raw_tokens.get(2).map(|t| t.text.as_str()) != Some("=") {
+        return None;
+    }
+
+    let rhs_pipeline = pipeline::parse(&raw_tokens[3..]);
+    let last_stage_cmd = rhs_pipeline.stages.last()?.tokens.first()?.text.as_str();
+    if !is_table_producing_command(last_stage_cmd, interp) {
+        return None;
+    }
+
+    let (ok, captured) = pipeline_exec::run_capturing_table(&rhs_pipeline, interp, state).await;
+    interp.set_previous_status(ok);
+    match captured {
+        Some(table) => {
+            interp.set_table(name, table);
+        }
+        None => err_println!("ion-win: let: right-hand side did not produce a table"),
+    }
+    Some(Flow::Normal)
+}
+
 /// Handles one simple (non-block) line of input. Returns the `Flow` signal
 /// to propagate outward (`ShellExit` for `exit`/`quit`, `Break`/
 /// `LoopContinue` for `break`/`continue`, `Normal` otherwise).
@@ -801,6 +856,10 @@ async fn dispatch(line: &str, interp: &mut Interpreter, state: &StateHandle) -> 
     }
 
     let raw_tokens = Interpreter::tokenize(line);
+
+    if let Some(flow) = try_dispatch_let_table(&raw_tokens, interp, state).await {
+        return flow;
+    }
 
     let parsed = pipeline::parse(&raw_tokens);
     if !parsed.is_trivial() {

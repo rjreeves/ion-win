@@ -47,6 +47,12 @@ enum Kind {
     /// validates JSON-parseability during execution rather than
     /// classification.
     Where(Vec<String>),
+    /// A bare reference to a `Table` variable (`ARCHITECTURE.md` §18),
+    /// used as an independent pipeline source — like `Echo`, it ignores
+    /// whatever fed it rather than trying to merge the two. Resolved once
+    /// at classification time (the table is cloned in), not re-looked-up
+    /// at execution time.
+    TableSource(Table),
     /// A builtin/function name that isn't yet supported as a pipeline
     /// stage. Empty string means the stage had no command at all (e.g. a
     /// stray `|`).
@@ -106,7 +112,32 @@ impl Write for LockedWriter {
 /// Runs `pipeline` to completion (unless backgrounded/disowned), returning
 /// whether it succeeded — the last stage's exit status for a foreground
 /// run, or `true` immediately for a backgrounded one.
-pub async fn run(pipeline: &Pipeline, interp: &mut Interpreter, _state: &StateHandle) -> bool {
+pub async fn run(pipeline: &Pipeline, interp: &mut Interpreter, state: &StateHandle) -> bool {
+    run_impl(pipeline, interp, state, None).await
+}
+
+/// Same as `run`, but if the pipeline's *last* stage produces a `Table`
+/// (rather than printing/writing one out — `finish_table_stage`'s
+/// terminal-stage behavior), it's captured and returned instead of shown,
+/// for `let NAME = PIPELINE` (`ARCHITECTURE.md` §18) to store. `None` if
+/// the pipeline never reached a table-producing terminal stage (e.g. it
+/// ended in `to-json`, an external command, or failed outright).
+pub async fn run_capturing_table(
+    pipeline: &Pipeline,
+    interp: &mut Interpreter,
+    state: &StateHandle,
+) -> (bool, Option<Table>) {
+    let mut captured = None;
+    let ok = run_impl(pipeline, interp, state, Some(&mut captured)).await;
+    (ok, captured)
+}
+
+async fn run_impl(
+    pipeline: &Pipeline,
+    interp: &mut Interpreter,
+    _state: &StateHandle,
+    mut capture: Option<&mut Option<Table>>,
+) -> bool {
     if pipeline.stages.is_empty() || pipeline.stages.iter().all(|s| s.tokens.is_empty()) {
         return true;
     }
@@ -301,6 +332,15 @@ pub async fn run(pipeline: &Pipeline, interp: &mut Interpreter, _state: &StateHa
                 command_texts.push(args.join(" "));
                 children.push(child);
             }
+            Kind::TableSource(table) => {
+                drop(incoming); // an independent producer, like echo
+                carry = finish_table_stage(
+                    table.clone(),
+                    is_last,
+                    stdout_file,
+                    capture.as_mut().map(|s| &mut **s),
+                );
+            }
             Kind::FromJson => {
                 let bytes = match incoming {
                     Carry::Bytes(b) => b,
@@ -324,7 +364,14 @@ pub async fn run(pipeline: &Pipeline, interp: &mut Interpreter, _state: &StateHa
                     }
                 };
                 match Table::from_json(&String::from_utf8_lossy(&bytes)) {
-                    Ok(table) => carry = finish_table_stage(table, is_last, stdout_file),
+                    Ok(table) => {
+                        carry = finish_table_stage(
+                            table,
+                            is_last,
+                            stdout_file,
+                            capture.as_mut().map(|s| &mut **s),
+                        )
+                    }
                     Err(e) => {
                         err_println!("ion-win: from-json: {e}");
                         unregister_spawned!();
@@ -350,7 +397,12 @@ pub async fn run(pipeline: &Pipeline, interp: &mut Interpreter, _state: &StateHa
                         return false;
                     }
                 };
-                carry = finish_table_stage(table.select(columns), is_last, stdout_file);
+                carry = finish_table_stage(
+                    table.select(columns),
+                    is_last,
+                    stdout_file,
+                    capture.as_mut().map(|s| &mut **s),
+                );
             }
             Kind::Where(where_args) => {
                 let table = match incoming {
@@ -385,7 +437,12 @@ pub async fn run(pipeline: &Pipeline, interp: &mut Interpreter, _state: &StateHa
                     unregister_spawned!();
                     return false;
                 }
-                carry = finish_table_stage(table.filter(column, op, value), is_last, stdout_file);
+                carry = finish_table_stage(
+                    table.filter(column, op, value),
+                    is_last,
+                    stdout_file,
+                    capture.as_mut().map(|s| &mut **s),
+                );
             }
             Kind::ToJson => {
                 let table = match incoming {
@@ -468,6 +525,8 @@ fn classify_stages(pipeline: &Pipeline, interp: &Interpreter) -> Vec<Kind> {
                 Kind::Select(args[1..].to_vec())
             } else if cmd == "where" || cmd == "filter" {
                 Kind::Where(args[1..].to_vec())
+            } else if let Some(table) = interp.get_table(&cmd) {
+                Kind::TableSource(table.clone())
             } else if interp.get_function(&cmd).is_some()
                 || matches!(
                     cmd.as_str(),
@@ -501,14 +560,24 @@ fn classify_stages(pipeline: &Pipeline, interp: &Interpreter) -> Vec<Kind> {
 /// next stage (`select`, `to-json`, or an external process, which
 /// implicitly textifies it — see `Carry::Table`'s arm in the `External`
 /// incoming-carry match) can consume it.
-fn finish_table_stage(table: Table, is_last: bool, stdout_file: Option<std::fs::File>) -> Carry {
+fn finish_table_stage(
+    table: Table,
+    is_last: bool,
+    stdout_file: Option<std::fs::File>,
+    capture: Option<&mut Option<Table>>,
+) -> Carry {
     if let Some(mut f) = stdout_file {
         let mut text = table.to_json();
         text.push('\n');
         let _ = f.write_all(text.as_bytes());
         Carry::None
     } else if is_last {
-        println!("{}", table.to_json());
+        match capture {
+            // `let NAME = ...` (ARCHITECTURE.md §18): store the table
+            // instead of printing it.
+            Some(slot) => *slot = Some(table),
+            None => println!("{}", table.to_json()),
+        }
         Carry::None
     } else {
         Carry::Table(table)

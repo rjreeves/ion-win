@@ -7,6 +7,7 @@
 //! `@name` sigils) before layering the rest of the language on top.
 
 use crate::functions::FunctionDef;
+use crate::table::Table;
 use crate::{err_eprintln, err_println};
 use std::collections::HashMap;
 
@@ -40,6 +41,14 @@ pub struct Interpreter {
     /// already used for `$(cmd)`/`@(cmd)` process expansion's `echo`
     /// shortcut — is the pragmatic equivalent).
     echo_capture: Option<String>,
+    /// Structured `Table` variables (`ARCHITECTURE.md` §18), e.g. `let
+    /// procs = tool --json | from-json | where cpu -gt 5`. Same scope-stack
+    /// shape and "first `let` owns it" ownership rule as `scalars`/`arrays`
+    /// — kept as a separate map rather than folded into `scalars` since a
+    /// `Table` isn't a `String` and this project doesn't have (or want,
+    /// for this slice) a single tagged-union value type spanning all three
+    /// kinds.
+    tables: Vec<HashMap<String, Table>>,
 }
 
 impl Default for Interpreter {
@@ -50,6 +59,7 @@ impl Default for Interpreter {
             functions: HashMap::new(),
             previous_status: true,
             echo_capture: None,
+            tables: vec![HashMap::new()],
         }
     }
 }
@@ -807,6 +817,10 @@ impl Interpreter {
         self.arrays.iter().rev().find_map(|frame| frame.get(name))
     }
 
+    pub fn get_table(&self, name: &str) -> Option<&Table> {
+        self.tables.iter().rev().find_map(|frame| frame.get(name))
+    }
+
     /// `let`'s core ownership rule (ion-manual page 20): if `name` already
     /// exists in any visible frame, updates it there in place — the frame
     /// that first defined it keeps "owning" it, so a nested block's `let`
@@ -834,6 +848,16 @@ impl Interpreter {
         self.current_array_frame().insert(name, value)
     }
 
+    /// Same ownership rule as `set_scalar`, for `Table` variables.
+    pub fn set_table(&mut self, name: String, value: Table) -> Option<Table> {
+        for frame in self.tables.iter_mut().rev() {
+            if let Some(slot) = frame.get_mut(&name) {
+                return Some(std::mem::replace(slot, value));
+            }
+        }
+        self.current_table_frame().insert(name, value)
+    }
+
     /// Defines a *new* binding directly in the current (innermost) frame,
     /// shadowing rather than updating any same-named variable in an outer
     /// frame. Used only for function-parameter binding (ion-manual page
@@ -855,6 +879,10 @@ impl Interpreter {
 
     fn current_array_frame(&mut self) -> &mut HashMap<String, Vec<String>> {
         self.arrays.last_mut().expect("global scope frame is never popped")
+    }
+
+    fn current_table_frame(&mut self) -> &mut HashMap<String, Table> {
+        self.tables.last_mut().expect("global scope frame is never popped")
     }
 
     /// The previous statement's success/failure, i.e. `$?`.
@@ -913,6 +941,7 @@ impl Interpreter {
     pub fn push_scope(&mut self) {
         self.scalars.push(HashMap::new());
         self.arrays.push(HashMap::new());
+        self.tables.push(HashMap::new());
     }
 
     /// Pops the innermost scope frame, deleting whatever it newly defined
@@ -926,6 +955,9 @@ impl Interpreter {
         if self.arrays.len() > 1 {
             self.arrays.pop();
         }
+        if self.tables.len() > 1 {
+            self.tables.pop();
+        }
     }
 
     /// Hides every scope above the global one, returning them so the
@@ -936,17 +968,31 @@ impl Interpreter {
     #[allow(clippy::type_complexity)]
     pub fn isolate_global_scope(
         &mut self,
-    ) -> (Vec<HashMap<String, String>>, Vec<HashMap<String, Vec<String>>>) {
-        (self.scalars.split_off(1), self.arrays.split_off(1))
+    ) -> (
+        Vec<HashMap<String, String>>,
+        Vec<HashMap<String, Vec<String>>>,
+        Vec<HashMap<String, Table>>,
+    ) {
+        (
+            self.scalars.split_off(1),
+            self.arrays.split_off(1),
+            self.tables.split_off(1),
+        )
     }
 
     /// Restores scope frames previously hidden by `isolate_global_scope`.
+    #[allow(clippy::type_complexity)]
     pub fn restore_scope(
         &mut self,
-        saved: (Vec<HashMap<String, String>>, Vec<HashMap<String, Vec<String>>>),
+        saved: (
+            Vec<HashMap<String, String>>,
+            Vec<HashMap<String, Vec<String>>>,
+            Vec<HashMap<String, Table>>,
+        ),
     ) {
         self.scalars.extend(saved.0);
         self.arrays.extend(saved.1);
+        self.tables.extend(saved.2);
     }
 
     /// Expands a single raw token as a scalar value: `$var`/`@var`
@@ -998,6 +1044,11 @@ impl Interpreter {
                 }
             }
             for frame in self.arrays.iter_mut().rev() {
+                if frame.remove(&token.text).is_some() {
+                    break;
+                }
+            }
+            for frame in self.tables.iter_mut().rev() {
                 if frame.remove(&token.text).is_some() {
                     break;
                 }
@@ -1769,6 +1820,34 @@ mod tests {
         interp.restore_scope(saved);
 
         assert_eq!(interp.get_scalar("l"), Some(&"local".to_string()));
+    }
+
+    /// `Table` variables (`ARCHITECTURE.md` §18) follow the exact same
+    /// scope-stack rules as scalars/arrays: teardown on `pop_scope`,
+    /// hidden-but-not-destroyed by `isolate_global_scope`, and "first
+    /// `let` owns it" via `set_table`.
+    #[test]
+    fn table_variables_follow_the_same_scoping_rules_as_scalars() {
+        let mut interp = Interpreter::new();
+        let one_row = || crate::table::Table {
+            rows: vec![vec![("a".to_string(), "1".to_string())]],
+        };
+
+        interp.set_table("g".to_string(), one_row());
+        interp.push_scope();
+        interp.set_table("l".to_string(), one_row());
+        assert_eq!(interp.get_table("g"), Some(&one_row()));
+        assert_eq!(interp.get_table("l"), Some(&one_row()));
+
+        let saved = interp.isolate_global_scope();
+        assert_eq!(interp.get_table("g"), Some(&one_row()));
+        assert_eq!(interp.get_table("l"), None);
+        interp.restore_scope(saved);
+        assert_eq!(interp.get_table("l"), Some(&one_row()));
+
+        interp.pop_scope();
+        assert_eq!(interp.get_table("l"), None);
+        assert_eq!(interp.get_table("g"), Some(&one_row()));
     }
 
     #[test]
