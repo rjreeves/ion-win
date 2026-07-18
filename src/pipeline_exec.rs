@@ -37,16 +37,27 @@ enum Kind {
     Echo(Vec<String>, bool),
     External(Vec<String>),
     /// Structured-data pipeline stages (`ARCHITECTURE.md` §17) — an
-    /// in-process object bridge, since external
-    /// processes only ever see JSON text, never a `Table` value directly.
+    /// in-process object bridge, since external processes only ever see
+    /// JSON text, never a `Table` value directly.
     FromJson,
     ToJson,
     Select(Vec<String>),
+    /// `where`/`filter COLUMN OP VALUE` — validated at execution time
+    /// (arg count and operator), not here, matching how `FromJson`
+    /// validates JSON-parseability during execution rather than
+    /// classification.
+    Where(Vec<String>),
     /// A builtin/function name that isn't yet supported as a pipeline
     /// stage. Empty string means the stage had no command at all (e.g. a
     /// stray `|`).
     Unsupported(String),
 }
+
+/// `where`/`filter`'s recognized comparison operators — the exact same set
+/// `test`/`if` accept (`src/builtins.rs`'s `eval_binary`), checked upfront
+/// so an unrecognized operator gets a clearly-attributed `where:` error
+/// instead of `eval_test`'s own `test:`-prefixed one.
+const SUPPORTED_WHERE_OPS: &[&str] = &["=", "==", "!=", "-eq", "-ne", "-lt", "-le", "-gt", "-ge"];
 
 /// What feeds the *next* stage's stdin.
 enum Carry {
@@ -72,7 +83,10 @@ enum Carry {
 /// to the *next* spawned process), it can no longer be read directly —
 /// there's no going back to get the readable handle out again.
 fn next_stage_needs_materialized_input(kind: Option<&Kind>) -> bool {
-    matches!(kind, Some(Kind::FromJson) | Some(Kind::Select(_)) | Some(Kind::ToJson))
+    matches!(
+        kind,
+        Some(Kind::FromJson) | Some(Kind::Select(_)) | Some(Kind::ToJson) | Some(Kind::Where(_))
+    )
 }
 
 /// A `Write` impl that locks a shared `ChildStdin` per call, letting two
@@ -338,6 +352,41 @@ pub async fn run(pipeline: &Pipeline, interp: &mut Interpreter, _state: &StateHa
                 };
                 carry = finish_table_stage(table.select(columns), is_last, stdout_file);
             }
+            Kind::Where(where_args) => {
+                let table = match incoming {
+                    Carry::Table(t) => t,
+                    Carry::None => {
+                        err_println!(
+                            "ion-win: where: no table piped in (pipe through 'from-json' first)"
+                        );
+                        unregister_spawned!();
+                        return false;
+                    }
+                    _ => {
+                        err_println!(
+                            "ion-win: where: expected a table (pipe through 'from-json' first)"
+                        );
+                        unregister_spawned!();
+                        return false;
+                    }
+                };
+                let [column, op, value] = &where_args[..] else {
+                    err_println!(
+                        "ion-win: where: usage: where COLUMN OP VALUE (e.g. 'where pid -gt 1000')"
+                    );
+                    unregister_spawned!();
+                    return false;
+                };
+                if !SUPPORTED_WHERE_OPS.contains(&op.as_str()) {
+                    err_println!(
+                        "ion-win: where: unsupported operator '{op}' (expected one of {})",
+                        SUPPORTED_WHERE_OPS.join(" ")
+                    );
+                    unregister_spawned!();
+                    return false;
+                }
+                carry = finish_table_stage(table.filter(column, op, value), is_last, stdout_file);
+            }
             Kind::ToJson => {
                 let table = match incoming {
                     Carry::Table(t) => t,
@@ -417,6 +466,8 @@ fn classify_stages(pipeline: &Pipeline, interp: &Interpreter) -> Vec<Kind> {
                 Kind::ToJson
             } else if cmd == "select" {
                 Kind::Select(args[1..].to_vec())
+            } else if cmd == "where" || cmd == "filter" {
+                Kind::Where(args[1..].to_vec())
             } else if interp.get_function(&cmd).is_some()
                 || matches!(
                     cmd.as_str(),

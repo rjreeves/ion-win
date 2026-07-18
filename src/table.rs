@@ -114,6 +114,28 @@ impl Table {
             .collect();
         Table { rows }
     }
+
+    /// Keeps only rows where `column`'s value satisfies `op value`, using
+    /// the exact same comparison operators as `test`/`if` (`=`, `==`,
+    /// `!=`, `-eq`, `-ne`, `-lt`, `-le`, `-gt`, `-ge`) — reused directly
+    /// via `builtins::eval_test` rather than reimplemented, so `where pid
+    /// -gt 1000` behaves exactly like `test $pid -gt 1000` would (same
+    /// numeric-parse-failure handling included). A row missing `column`
+    /// entirely never matches — there's no value to compare — rather than
+    /// being treated as an error.
+    pub fn filter(&self, column: &str, op: &str, value: &str) -> Table {
+        let rows = self
+            .rows
+            .iter()
+            .filter(|row| {
+                row.iter().find(|(k, _)| k == column).is_some_and(|(_, v)| {
+                    crate::builtins::eval_test(&[v.clone(), op.to_string(), value.to_string()])
+                })
+            })
+            .cloned()
+            .collect();
+        Table { rows }
+    }
 }
 
 /// A JSON value's cell text: scalars render as their natural display form;
@@ -228,5 +250,35 @@ mod tests {
         };
         let reparsed = Table::from_json(&original.to_json()).unwrap();
         assert_eq!(original, reparsed);
+    }
+
+    #[test]
+    fn filter_keeps_only_rows_matching_numeric_comparison() {
+        let table = Table {
+            rows: vec![
+                row(&[("name", "svchost.exe"), ("pid", "412")]),
+                row(&[("name", "chrome.exe"), ("pid", "8891")]),
+            ],
+        };
+        let filtered = table.filter("pid", "-gt", "1000");
+        assert_eq!(filtered.rows, vec![row(&[("name", "chrome.exe"), ("pid", "8891")])]);
+    }
+
+    #[test]
+    fn filter_supports_string_equality() {
+        let table = Table {
+            rows: vec![row(&[("name", "a")]), row(&[("name", "b")])],
+        };
+        assert_eq!(table.filter("name", "=", "a").rows, vec![row(&[("name", "a")])]);
+        assert_eq!(table.filter("name", "!=", "a").rows, vec![row(&[("name", "b")])]);
+    }
+
+    #[test]
+    fn filter_excludes_rows_missing_the_column_rather_than_erroring() {
+        let table = Table {
+            rows: vec![row(&[("name", "a"), ("pid", "1")]), row(&[("name", "b")])],
+        };
+        let filtered = table.filter("pid", "-eq", "1");
+        assert_eq!(filtered.rows, vec![row(&[("name", "a"), ("pid", "1")])]);
     }
 }
