@@ -77,6 +77,9 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin { name: "disown", is_keyword: false, help_display: Some("disown [-a|PID...]") },
     Builtin { name: "source", is_keyword: false, help_display: Some("source") },
     Builtin { name: "highlight", is_keyword: false, help_display: Some("highlight on|off") },
+    Builtin { name: "from-json", is_keyword: false, help_display: Some("from-json") },
+    Builtin { name: "select", is_keyword: false, help_display: Some("select COL...") },
+    Builtin { name: "to-json", is_keyword: false, help_display: Some("to-json") },
 ];
 
 /// All literal builtin words, for Tab-completion.
@@ -99,7 +102,8 @@ pub fn help_text() -> String {
         "builtins: {}\n\
          pipes: | ^| &|   redirect: > >> ^> &>   background: & &!\n\
          implicit cd: bare ~/path, .., .config, examples/\n\
-         namespaces: ${{env::VAR}}",
+         namespaces: ${{env::VAR}}\n\
+         structured pipelines (pipe-only, not standalone): from-json | select COL... | to-json",
         names.join(", ")
     )
 }
@@ -112,10 +116,11 @@ mod tests {
     fn help_text_matches_current_builtin_list() {
         assert_eq!(
             help_text(),
-            "builtins: exit, help, let, export, drop, read, echo, cd, pwd, dirs, folders, files, if/else if/else, while, for/in, fn, match/case, break, continue, test, matches, not, true, false, bool, contains, starts-with, ends-with, eq/is, exists, intersects, isatty, and, or, which/type, eval, pvar set|get|list|delete, dmark add|list|jump, jobs, wait, disown [-a|PID...], source, highlight on|off\n\
+            "builtins: exit, help, let, export, drop, read, echo, cd, pwd, dirs, folders, files, if/else if/else, while, for/in, fn, match/case, break, continue, test, matches, not, true, false, bool, contains, starts-with, ends-with, eq/is, exists, intersects, isatty, and, or, which/type, eval, pvar set|get|list|delete, dmark add|list|jump, jobs, wait, disown [-a|PID...], source, highlight on|off, from-json, select COL..., to-json\n\
              pipes: | ^| &|   redirect: > >> ^> &>   background: & &!\n\
              implicit cd: bare ~/path, .., .config, examples/\n\
-             namespaces: ${env::VAR}"
+             namespaces: ${env::VAR}\n\
+             structured pipelines (pipe-only, not standalone): from-json | select COL... | to-json"
         );
     }
 
@@ -137,5 +142,8 @@ mod tests {
         assert!(all.contains(&"which"));
         assert!(all.contains(&"type"));
         assert!(all.contains(&"eval"));
+        assert!(all.contains(&"from-json"));
+        assert!(all.contains(&"select"));
+        assert!(all.contains(&"to-json"));
     }
 }

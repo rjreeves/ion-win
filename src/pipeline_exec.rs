@@ -27,7 +27,8 @@ use crate::jobctl;
 use crate::jobs;
 use crate::pipeline::{PipeKind, Pipeline, Redirect, Stream};
 use crate::state::StateHandle;
-use std::io::{self, Write};
+use crate::table::Table;
+use std::io::{self, Read, Write};
 use std::process::{Child, ChildStderr, ChildStdout, Stdio};
 use std::sync::{Arc, Mutex};
 
@@ -35,6 +36,12 @@ enum Kind {
     /// Args plus whether the trailing newline is suppressed (`echo -n`).
     Echo(Vec<String>, bool),
     External(Vec<String>),
+    /// Structured-data pipeline stages (`ARCHITECTURE.md` §17) — an
+    /// in-process object bridge, since external
+    /// processes only ever see JSON text, never a `Table` value directly.
+    FromJson,
+    ToJson,
+    Select(Vec<String>),
     /// A builtin/function name that isn't yet supported as a pipeline
     /// stage. Empty string means the stage had no command at all (e.g. a
     /// stray `|`).
@@ -52,6 +59,20 @@ enum Carry {
     /// Both streams of the previous external stage (for `&|`), forwarded
     /// by background threads once the next stage is spawned.
     Merge(ChildStdout, ChildStderr),
+    /// A structured table from a previous `from-json`/`select` stage.
+    Table(Table),
+}
+
+/// Whether `kind` needs to read its input in-process (a `Table`, or raw
+/// text it'll parse itself) rather than just being handed a raw OS pipe
+/// handle to pass along unread — used to decide, right when an `External`
+/// stage's stdout is claimed, whether to keep the zero-copy `Carry::Stdio`
+/// fast path or read it into memory instead. This has to happen at that
+/// exact point: once a `ChildStdout` is wrapped as a `Stdio` (for handing
+/// to the *next* spawned process), it can no longer be read directly —
+/// there's no going back to get the readable handle out again.
+fn next_stage_needs_materialized_input(kind: Option<&Kind>) -> bool {
+    matches!(kind, Some(Kind::FromJson) | Some(Kind::Select(_)) | Some(Kind::ToJson))
 }
 
 /// A `Write` impl that locks a shared `ChildStdin` per call, letting two
@@ -169,6 +190,12 @@ pub async fn run(pipeline: &Pipeline, interp: &mut Interpreter, _state: &StateHa
                         command.stdin(Stdio::piped());
                         post_spawn_merge = Some((out, err));
                     }
+                    Carry::Table(table) => {
+                        // An external process only ever sees JSON text,
+                        // never a `Table` value directly.
+                        command.stdin(Stdio::piped());
+                        post_spawn_bytes = Some(table.to_json().into_bytes());
+                    }
                 }
 
                 let next_pipe_kind = pipeline.pipes.get(i).copied();
@@ -233,14 +260,18 @@ pub async fn run(pipeline: &Pipeline, interp: &mut Interpreter, _state: &StateHa
                     }
                 }
 
+                let next_needs_materialized = next_stage_needs_materialized_input(kinds.get(i + 1));
                 carry = match next_pipe_kind {
                     None => Carry::None,
-                    Some(PipeKind::Stdout) => child
-                        .stdout
-                        .take()
-                        .map(Stdio::from)
-                        .map(Carry::Stdio)
-                        .unwrap_or(Carry::None),
+                    Some(PipeKind::Stdout) => match child.stdout.take() {
+                        Some(mut out) if next_needs_materialized => {
+                            let mut buf = Vec::new();
+                            let _ = out.read_to_end(&mut buf);
+                            Carry::Bytes(buf)
+                        }
+                        Some(out) => Carry::Stdio(Stdio::from(out)),
+                        None => Carry::None,
+                    },
                     Some(PipeKind::Stderr) => child
                         .stderr
                         .take()
@@ -255,6 +286,85 @@ pub async fn run(pipeline: &Pipeline, interp: &mut Interpreter, _state: &StateHa
 
                 command_texts.push(args.join(" "));
                 children.push(child);
+            }
+            Kind::FromJson => {
+                let bytes = match incoming {
+                    Carry::Bytes(b) => b,
+                    Carry::None => {
+                        err_println!("ion-win: from-json: no input piped in");
+                        unregister_spawned!();
+                        return false;
+                    }
+                    Carry::Table(_) => {
+                        err_println!("ion-win: from-json: input is already a table");
+                        unregister_spawned!();
+                        return false;
+                    }
+                    Carry::Stdio(_) | Carry::Merge(_, _) => {
+                        err_println!(
+                            "ion-win: from-json: only supported right after 'echo' or a plain \
+                             '|' pipe, not '^|'/'&|' yet"
+                        );
+                        unregister_spawned!();
+                        return false;
+                    }
+                };
+                match Table::from_json(&String::from_utf8_lossy(&bytes)) {
+                    Ok(table) => carry = finish_table_stage(table, is_last, stdout_file),
+                    Err(e) => {
+                        err_println!("ion-win: from-json: {e}");
+                        unregister_spawned!();
+                        return false;
+                    }
+                }
+            }
+            Kind::Select(columns) => {
+                let table = match incoming {
+                    Carry::Table(t) => t,
+                    Carry::None => {
+                        err_println!(
+                            "ion-win: select: no table piped in (pipe through 'from-json' first)"
+                        );
+                        unregister_spawned!();
+                        return false;
+                    }
+                    _ => {
+                        err_println!(
+                            "ion-win: select: expected a table (pipe through 'from-json' first)"
+                        );
+                        unregister_spawned!();
+                        return false;
+                    }
+                };
+                carry = finish_table_stage(table.select(columns), is_last, stdout_file);
+            }
+            Kind::ToJson => {
+                let table = match incoming {
+                    Carry::Table(t) => t,
+                    Carry::None => {
+                        err_println!(
+                            "ion-win: to-json: no table piped in (pipe through 'from-json' first)"
+                        );
+                        unregister_spawned!();
+                        return false;
+                    }
+                    _ => {
+                        err_println!(
+                            "ion-win: to-json: expected a table (pipe through 'from-json'/'select' first)"
+                        );
+                        unregister_spawned!();
+                        return false;
+                    }
+                };
+                let mut text = table.to_json();
+                text.push('\n');
+                if let Some(mut f) = stdout_file {
+                    let _ = f.write_all(text.as_bytes());
+                } else if is_last {
+                    print!("{text}");
+                } else {
+                    carry = Carry::Bytes(text.into_bytes());
+                }
             }
             Kind::Unsupported(_) => unreachable!("checked above"),
         }
@@ -301,6 +411,12 @@ fn classify_stages(pipeline: &Pipeline, interp: &Interpreter) -> Vec<Kind> {
             if cmd == "echo" {
                 let (rest, no_newline) = crate::interp::split_echo_no_newline_flag(&args[1..]);
                 Kind::Echo(rest.to_vec(), no_newline)
+            } else if cmd == "from-json" {
+                Kind::FromJson
+            } else if cmd == "to-json" {
+                Kind::ToJson
+            } else if cmd == "select" {
+                Kind::Select(args[1..].to_vec())
             } else if interp.get_function(&cmd).is_some()
                 || matches!(
                     cmd.as_str(),
@@ -325,6 +441,27 @@ fn classify_stages(pipeline: &Pipeline, interp: &Interpreter) -> Vec<Kind> {
             }
         })
         .collect()
+}
+
+/// Shared terminal-vs-pass-through logic for `from-json`/`select`: if
+/// nothing structured-aware follows (this is the last stage, or output is
+/// redirected to a file), the table is the final answer — printed/written
+/// as pretty JSON. Otherwise it's handed forward as `Carry::Table` so the
+/// next stage (`select`, `to-json`, or an external process, which
+/// implicitly textifies it — see `Carry::Table`'s arm in the `External`
+/// incoming-carry match) can consume it.
+fn finish_table_stage(table: Table, is_last: bool, stdout_file: Option<std::fs::File>) -> Carry {
+    if let Some(mut f) = stdout_file {
+        let mut text = table.to_json();
+        text.push('\n');
+        let _ = f.write_all(text.as_bytes());
+        Carry::None
+    } else if is_last {
+        println!("{}", table.to_json());
+        Carry::None
+    } else {
+        Carry::Table(table)
+    }
 }
 
 /// Resolves the file each stream should redirect to, if any: the *last*

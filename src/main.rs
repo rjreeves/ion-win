@@ -16,6 +16,7 @@ mod procexpand;
 mod ranges;
 mod shell;
 mod state;
+mod table;
 mod types;
 
 use std::path::PathBuf;
