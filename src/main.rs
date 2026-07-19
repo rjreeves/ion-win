@@ -2,6 +2,7 @@ mod arith;
 mod builtin_names;
 mod builtins;
 mod colorout;
+mod copy;
 mod editor;
 mod fs_builtins;
 mod functions;

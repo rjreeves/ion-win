@@ -48,6 +48,13 @@ enum Kind {
     /// exactly one trailing newline added when printed/written rather
     /// than `Cat`'s transparent passthrough.
     Find(Vec<String>),
+    /// `copy`/`cp [--force] ...` (ion-win extension, `ARCHITECTURE.md`
+    /// §24) — raw args, resolved at execution time into one of two forms
+    /// depending on how many positional arguments remain after stripping
+    /// flags: `SRC... DEST` (explicit files, ignores whatever was piped
+    /// in, matching `Cat`'s "explicit args win" precedent) or just `DEST`
+    /// (sources come from the incoming `Table`'s `path` column instead).
+    Copy(Vec<String>),
     External(Vec<String>),
     /// Structured-data pipeline stages (`ARCHITECTURE.md` §17) — an
     /// in-process object bridge, since external processes only ever see
@@ -285,6 +292,62 @@ async fn run_impl(
                         return false;
                     }
                     None => unreachable!("fs_builtins::capture always recognizes \"find\""),
+                }
+            }
+            Kind::Copy(copy_args) => {
+                let (force, mut positional) = match crate::copy::parse_flags(copy_args) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        drop(incoming);
+                        err_println!("ion-win: {e}");
+                        unregister_spawned!();
+                        return false;
+                    }
+                };
+
+                let mut text = if positional.len() >= 2 {
+                    // Explicit files: SRC... DEST. Ignores whatever was
+                    // piped in, matching Cat's "explicit args win"
+                    // precedent.
+                    drop(incoming);
+                    let dest = positional.pop().expect("checked len >= 2 above");
+                    crate::copy::copy_files(&positional, &dest, force)
+                } else if positional.len() == 1 {
+                    // Just DEST: sources come from the incoming table's
+                    // "path" column.
+                    let dest = &positional[0];
+                    match incoming {
+                        Carry::Table(t) => crate::copy::copy_table(&t, dest, force),
+                        Carry::None => {
+                            err_println!(
+                                "ion-win: copy: no table piped in (pipe through 'stat' first) \
+                                 and no source files given"
+                            );
+                            unregister_spawned!();
+                            return false;
+                        }
+                        _ => {
+                            err_println!("ion-win: copy: expected a table (pipe through 'stat' first)");
+                            unregister_spawned!();
+                            return false;
+                        }
+                    }
+                } else {
+                    drop(incoming);
+                    err_println!(
+                        "ion-win: copy: usage: copy [--force] SRC... DEST  |  TABLE | copy [--force] DEST"
+                    );
+                    unregister_spawned!();
+                    return false;
+                };
+
+                text.push('\n');
+                if let Some(mut f) = stdout_file {
+                    let _ = f.write_all(text.as_bytes());
+                } else if is_last {
+                    print!("{text}");
+                } else {
+                    carry = Carry::Bytes(text.into_bytes());
                 }
             }
             Kind::External(args) => {
@@ -699,6 +762,8 @@ fn classify_stages(pipeline: &Pipeline, interp: &Interpreter) -> Vec<Kind> {
                 Kind::Cat(args[1..].to_vec())
             } else if cmd == "find" {
                 Kind::Find(args[1..].to_vec())
+            } else if cmd == "copy" || cmd == "cp" {
+                Kind::Copy(args[1..].to_vec())
             } else if cmd == "from-json" {
                 Kind::FromJson
             } else if cmd == "to-json" {

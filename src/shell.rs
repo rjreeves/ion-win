@@ -1020,6 +1020,7 @@ async fn dispatch(line: &str, interp: &mut Interpreter, state: &StateHandle) -> 
                     handle_fs_builtin(cmd.as_str(), &args)
                 }
                 "cat" => handle_cat(&args),
+                "copy" | "cp" => handle_copy(&args),
                 "stat" => handle_stat(&args).await,
                 "pvar" => handle_pvar(&args, state).await,
                 "dmark" => handle_dmark(&args, state).await,
@@ -1138,6 +1139,17 @@ fn handle_cat(args: &[String]) {
         }
         Some(Err(e)) => err_println!("ion-win: {e}"),
         None => unreachable!("fs_builtins::capture always recognizes \"cat\""),
+    }
+}
+
+/// `copy`/`cp SRC... DEST` (`ARCHITECTURE.md` §24) used standalone (no
+/// pipe): the explicit-file-arguments form only — the `Table`-consuming
+/// pipeline form (`TABLE | copy DEST`) only makes sense with an actual
+/// pipe, so it's handled entirely in `pipeline_exec.rs`'s `Kind::Copy`.
+fn handle_copy(args: &[String]) {
+    match crate::copy::parse_and_copy_files(args) {
+        Ok(summary) => println!("{summary}"),
+        Err(e) => err_println!("ion-win: {e}"),
     }
 }
 
