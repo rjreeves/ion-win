@@ -7,7 +7,7 @@ Native Windows port of the [Ion shell](docs/ion-manual.pdf) (originally built fo
 ```
 cd ion-win
 cargo build              # debug build
-cargo test                # 156 tests, all passing
+cargo test                # 170 tests, all passing
 cargo run                 # interactive REPL
 cargo run -- script.ion arg1 arg2   # run a script file
 ```
@@ -18,13 +18,13 @@ No special setup needed — it's a standard Cargo binary crate. `.gitignore`/`.g
 
 A working, reasonably faithful interpreter for Ion's language (variables, control flow, functions, expansions, pipelines) plus a real interactive line editor — not a toy. It's driven entirely from the [ion-manual.pdf](docs/ion-manual.pdf) spec: nearly every feature below was implemented by reading the manual's own worked examples and writing tests that reproduce their exact output, byte-for-byte. Where the manual was ambiguous or silent, that's called out explicitly rather than guessed at.
 
-## Module map (9,034 lines across 22 files)
+## Module map (9,522 lines across 22 files)
 
 | File | Lines | Purpose |
 |---|---|---|
 | `interp.rs` | 1925 | The core: tokenizer, `$`/`@` expansion, variable scope stack (scalars/arrays/tables), `let`/`export`/`drop`, method-call and process-expansion dispatch, `echo` output/capture. The biggest and most load-bearing file. |
-| `shell.rs` | 1648 | REPL loop and prompt rendering (`PROMPT` function support), block/control-flow execution (`if`/`while`/`for`/`fn`/`match`/`case`), `for VAR in TABLE` row iteration, `cd`, `&&`/`||`/`and`/`or` chaining, `let NAME = PIPELINE` table capture, dispatch of all builtins |
-| `pipeline_exec.rs` | 702 | Real OS pipeline execution (`Command`/`Stdio` chaining), background-job registration, structured-pipeline stages (`from-json`/`select`/`where`/`to-json`/`cat`/`stat`), table-capturing pipeline runner |
+| `shell.rs` | 1650 | REPL loop and prompt rendering (`PROMPT` function support), block/control-flow execution (`if`/`while`/`for`/`fn`/`match`/`case`), `for VAR in TABLE` row iteration, `cd`, `&&`/`||`/`and`/`or` chaining, `let NAME = PIPELINE` table capture, dispatch of all builtins |
+| `pipeline_exec.rs` | 815 | Real OS pipeline execution (`Command`/`Stdio` chaining), background-job registration, structured-pipeline stages (`from-json`/`select`/`where`/`to-json`/`from-csv`/`to-csv`/`cat`/`stat`/`find`), table-capturing pipeline runner |
 | `editor.rs` | 680 | Crossterm raw-mode line editor (arrow keys, history, Tab-completion, word-editing shortcuts, live syntax highlighting) with fallback to plain stdin |
 | `ranges.rs` | 647 | Slice parsing (`[start..end]`) + brace expansion: ranges (`{1..10}`) and permutation lists (`{ext1,ext2}`, nested) |
 | `methods.rs` | 491 | All 26 string/array methods (`$len`, `@split`, etc.) |
@@ -32,13 +32,13 @@ A working, reasonably faithful interpreter for Ion's language (variables, contro
 | `state.rs` | 302 | `redb`-backed key/value store for `pvar`/`dmark` |
 | `history.rs` | 278 | Persistent command history (load/save/filter) |
 | `builtins.rs` | 262 | `test`/`matches`/`bool`/`contains`/`starts-with`/`ends-with`/`eq`/`is`/`isatty` condition evaluators |
-| `table.rs` | 284 | Structured "table" data (`from-json`/`select`/`where`/`to-json`): parsing, projection, filtering, JSON round-tripping |
+| `table.rs` | 500 | Structured "table" data (`from-json`/`select`/`where`/`to-json`/`from-csv`/`to-csv`): parsing, projection, filtering, JSON/CSV round-tripping |
+| `fs_builtins.rs` | 335 | `pwd`/`dirs`/`folders`/`files`/`cat`/`find` |
 | `stat.rs` | 217 | `stat FILE... [--hash sha256]`: file metadata into a `Table`, hashing parallelized across files via `tokio::task::spawn_blocking` |
 | `pipeline.rs` | 199 | Pipeline/redirect *parsing* (pure data, no execution) |
 | `jobctl.rs` | 160 | Ctrl+C interrupt plumbing: foreground-PID registry, `CTRL_BREAK_EVENT` forwarding, cooperative interrupt flag |
 | `builtin_names.rs` | 157 | Single source of truth for builtin names/keywords, feeding `help`, Tab-completion, and syntax highlighting |
 | `main.rs` | 121 | Entry point; branches to script-file mode (argv) or interactive `shell::run` |
-| `fs_builtins.rs` | 184 | `pwd`/`dirs`/`folders`/`files`/`cat` |
 | `functions.rs` | 83 | `fn` parameter parsing (typed params, docstrings) |
 | `colorout.rs` | 82 | `err_println!`/`err_eprintln!` — red-on-terminal error output, `NO_COLOR`-aware |
 | `jobs.rs` | 78 | Background-job registry for `jobs`/`wait`/`disown` |
@@ -78,6 +78,8 @@ A working, reasonably faithful interpreter for Ion's language (variables, contro
 - **`for VAR in TABLE` row iteration** (`ARCHITECTURE.md` §19): closes the practical gap left after §18 — a bare table variable in a `for`'s "in" clause now iterates its rows, one at a time, rather than being flattened as scalar/array text. Each iteration binds `VAR` to a fresh one-row `Table` (not a scalar), so the loop body reuses every mechanism already built for tables with no new primitives: `row | to-json`, `row | select col`, `row | where ...`, or `let derived = row | where ...` to capture a further per-row transformation. Only triggers when the "in" clause is *exactly one token* naming an existing table variable, so ordinary `for x in @arr`/`for x in 1 2 3` are untouched.
 - **`cat FILE...`** (`ARCHITECTURE.md` §20): ion-win extension — real Ion just relies on the system's `/bin/cat` on Unix, but Windows has no equivalent standalone executable (`type` is `cmd.exe`-internal, not spawnable), so before this there was no way at all to get a file's contents into a pipeline. Reuses `fs_builtins::capture` (already shared by `pwd`/`dirs`/`folders`/`files`), so `$(cat file.json)` scalar capture worked with zero changes beyond adding the match arm, and `cat file.json | from-json`/`let procs = cat file.json | from-json`/`for row in procs` all work immediately as a direct payoff of §18/§19's existing "check the last stage, not the first" and "any `Table`, however it was populated" designs. Multi-file `cat a b` concatenates in order, stopping at the first unreadable file (fail-fast, matching every other error path in the structured-pipeline stages) rather than skipping and continuing like GNU `cat`.
 - **`stat FILE... [--hash sha256]`** (`ARCHITECTURE.md` §21): grew out of a "gather file info into a manifest" use case and a design conversation about where ion-win could actually use Windows' native threading. Builds a `Table` (`path`/`size`/`modified`/`is_dir`, plus a `sha256` column when `--hash sha256` is given) from real file metadata — no JSON round-trip involved at all. The one genuinely parallel piece is hashing: `src/stat.rs`'s `build_table` spawns one `tokio::task::spawn_blocking` per file (reusing ion-win's existing tokio runtime rather than a separate thread pool) and joins results back in stable input order, so wall-clock time is bounded by the slowest file rather than the sum. Unlike `cat`'s fail-fast policy, an unreadable file is skipped with a warning rather than aborting the whole scan — a deliberate reversal, since `stat` describes a batch and one vanished file (a real race during a directory walk) shouldn't discard every other file's result. `let`/`for`-in-table integration needed zero new plumbing beyond the same two registration points `cat` uses.
+- **`find [--all] [--recurse] [PATH]`** (`ARCHITECTURE.md` §22): the last deliberately-deferred piece of the original manifest plan — lists files (not directories), recursively when `--recurse` is given, dotfiles skipped unless `--all`. Slotted into the same `fs_builtins::capture` dispatch table `pwd`/`dirs`/`folders`/`files`/`cat` already use, so standalone use and `$(find ...)` scalar capture needed zero new code at all. A real bug was caught by the real-binary smoke test (not the unit tests, which had encoded the bug as correct behavior): an early version's recursive path-building never included the given `PATH` argument itself as a prefix, so `find some_dir` printed bare `top.txt` instead of `some_dir/top.txt` — looked fine standalone, but broke `find | stat` completely, since `stat` then tried to open a path that didn't exist relative to cwd. Fixed by seeding the walk's accumulated prefix with `PATH` itself. This closes the original goal completely: `find . --recurse | stat --hash sha256 | to-json > manifest.json` is now a real, working pipeline, verified end to end.
+- **`to-csv`/`from-csv`** (`ARCHITECTURE.md` §23): a second serialization format for `Table`, alongside JSON — added because JSON was never chosen for being the best fit for `Table`'s own row/column shape, only for interop with JSON-emitting tools (§17); CSV is the more natural "table-native" format (no repeated column names per row, opens directly in Excel/pandas). No new dependency — unlike JSON (`serde_json`) or hashing (`sha2`), correct RFC4180-style CSV quoting is straightforward enough to hand-roll. `to_csv`'s column set is the first-seen union across every row (matching `select`'s existing "rows don't have to share columns" handling); `from_csv` treats a short row as missing trailing columns (not empty-string-present) but a row with *more* fields than the header as a clear error. States plainly, rather than hiding, a real one-way lossiness versus JSON: CSV can't represent "this row never had this column" separately from "this row's value is empty" — round-tripping is lossless only when every row already shares the same columns. Wiring mirrored `from-json`/`to-json` almost exactly (same `Carry`/capture/`is_table_producing_command` rules), so `let manifest = cat file.csv | from-csv`, `where`/`select`, `for row in`, and writing/reloading real `.csv` files all worked immediately.
 
 ## Known gaps (deliberately not built — not oversights)
 

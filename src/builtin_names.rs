@@ -40,6 +40,7 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin { name: "dirs", is_keyword: false, help_display: Some("dirs") },
     Builtin { name: "folders", is_keyword: false, help_display: Some("folders") },
     Builtin { name: "files", is_keyword: false, help_display: Some("files") },
+    Builtin { name: "find", is_keyword: false, help_display: Some("find [--all] [--recurse] [PATH]") },
     Builtin { name: "cat", is_keyword: false, help_display: Some("cat FILE...") },
     Builtin { name: "stat", is_keyword: false, help_display: Some("stat FILE... [--hash sha256]") },
     Builtin { name: "if", is_keyword: true, help_display: Some("if/else if/else") },
@@ -84,6 +85,8 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin { name: "where", is_keyword: false, help_display: Some("where/filter COL OP VAL") },
     Builtin { name: "filter", is_keyword: false, help_display: None },
     Builtin { name: "to-json", is_keyword: false, help_display: Some("to-json") },
+    Builtin { name: "from-csv", is_keyword: false, help_display: Some("from-csv") },
+    Builtin { name: "to-csv", is_keyword: false, help_display: Some("to-csv") },
 ];
 
 /// All literal builtin words, for Tab-completion.
@@ -107,7 +110,7 @@ pub fn help_text() -> String {
          pipes: | ^| &|   redirect: > >> ^> &>   background: & &!\n\
          implicit cd: bare ~/path, .., .config, examples/\n\
          namespaces: ${{env::VAR}}\n\
-         structured pipelines (pipe-only, not standalone): from-json | select COL... | where/filter COL OP VAL | to-json",
+         structured pipelines (pipe-only, not standalone): from-json/from-csv | select COL... | where/filter COL OP VAL | to-json/to-csv",
         names.join(", ")
     )
 }
@@ -120,11 +123,11 @@ mod tests {
     fn help_text_matches_current_builtin_list() {
         assert_eq!(
             help_text(),
-            "builtins: exit, help, let, export, drop, read, echo, cd, pwd, dirs, folders, files, cat FILE..., stat FILE... [--hash sha256], if/else if/else, while, for/in, fn, match/case, break, continue, test, matches, not, true, false, bool, contains, starts-with, ends-with, eq/is, exists, intersects, isatty, and, or, which/type, eval, pvar set|get|list|delete, dmark add|list|jump, jobs, wait, disown [-a|PID...], source, highlight on|off, from-json, select COL..., where/filter COL OP VAL, to-json\n\
+            "builtins: exit, help, let, export, drop, read, echo, cd, pwd, dirs, folders, files, find [--all] [--recurse] [PATH], cat FILE..., stat FILE... [--hash sha256], if/else if/else, while, for/in, fn, match/case, break, continue, test, matches, not, true, false, bool, contains, starts-with, ends-with, eq/is, exists, intersects, isatty, and, or, which/type, eval, pvar set|get|list|delete, dmark add|list|jump, jobs, wait, disown [-a|PID...], source, highlight on|off, from-json, select COL..., where/filter COL OP VAL, to-json, from-csv, to-csv\n\
              pipes: | ^| &|   redirect: > >> ^> &>   background: & &!\n\
              implicit cd: bare ~/path, .., .config, examples/\n\
              namespaces: ${env::VAR}\n\
-             structured pipelines (pipe-only, not standalone): from-json | select COL... | where/filter COL OP VAL | to-json"
+             structured pipelines (pipe-only, not standalone): from-json/from-csv | select COL... | where/filter COL OP VAL | to-json/to-csv"
         );
     }
 
@@ -153,5 +156,8 @@ mod tests {
         assert!(all.contains(&"to-json"));
         assert!(all.contains(&"cat"));
         assert!(all.contains(&"stat"));
+        assert!(all.contains(&"find"));
+        assert!(all.contains(&"from-csv"));
+        assert!(all.contains(&"to-csv"));
     }
 }

@@ -41,12 +41,24 @@ enum Kind {
     /// same in-process routine `shell.rs`'s standalone `cat` and
     /// `interp.rs`'s `$(cat ...)` capture both already go through.
     Cat(Vec<String>),
+    /// `find [--all] [--recurse] [PATH]` (ion-win extension,
+    /// `ARCHITECTURE.md` §22) as a pipeline producer — one path per line,
+    /// meant to feed `stat` (§21). Unlike `Cat`, its output is a
+    /// synthesized list (like `Echo`'s), not raw file bytes, so it gets
+    /// exactly one trailing newline added when printed/written rather
+    /// than `Cat`'s transparent passthrough.
+    Find(Vec<String>),
     External(Vec<String>),
     /// Structured-data pipeline stages (`ARCHITECTURE.md` §17) — an
     /// in-process object bridge, since external processes only ever see
     /// JSON text, never a `Table` value directly.
     FromJson,
     ToJson,
+    /// `from-csv`/`to-csv` (`ARCHITECTURE.md` §23) — the same explicit
+    /// boundary-adapter pattern as `FromJson`/`ToJson`, just CSV text
+    /// instead of JSON text.
+    FromCsv,
+    ToCsv,
     Select(Vec<String>),
     /// `where`/`filter COLUMN OP VALUE` — validated at execution time
     /// (arg count and operator), not here, matching how `FromJson`
@@ -107,6 +119,7 @@ fn next_stage_needs_materialized_input(kind: Option<&Kind>) -> bool {
             | Some(Kind::ToJson)
             | Some(Kind::Where(_))
             | Some(Kind::Stat(_))
+            | Some(Kind::FromCsv)
     )
 }
 
@@ -245,6 +258,33 @@ async fn run_impl(
                         return false;
                     }
                     None => unreachable!("fs_builtins::capture always recognizes \"cat\""),
+                }
+            }
+            Kind::Find(find_args) => {
+                drop(incoming); // lists directories, doesn't read stdin
+                match crate::fs_builtins::capture("find", find_args) {
+                    Some(Ok(mut text)) => {
+                        // Unlike Cat: this is a synthesized list (like
+                        // Echo's), so it gets exactly one trailing
+                        // newline — but only if there's anything to print,
+                        // so an empty result doesn't add a stray blank line.
+                        if !text.is_empty() {
+                            text.push('\n');
+                        }
+                        if let Some(mut f) = stdout_file {
+                            let _ = f.write_all(text.as_bytes());
+                        } else if is_last {
+                            print!("{text}");
+                        } else {
+                            carry = Carry::Bytes(text.into_bytes());
+                        }
+                    }
+                    Some(Err(e)) => {
+                        err_println!("ion-win: {e}");
+                        unregister_spawned!();
+                        return false;
+                    }
+                    None => unreachable!("fs_builtins::capture always recognizes \"find\""),
                 }
             }
             Kind::External(args) => {
@@ -416,6 +456,44 @@ async fn run_impl(
                     }
                 }
             }
+            Kind::FromCsv => {
+                let bytes = match incoming {
+                    Carry::Bytes(b) => b,
+                    Carry::None => {
+                        err_println!("ion-win: from-csv: no input piped in");
+                        unregister_spawned!();
+                        return false;
+                    }
+                    Carry::Table(_) => {
+                        err_println!("ion-win: from-csv: input is already a table");
+                        unregister_spawned!();
+                        return false;
+                    }
+                    Carry::Stdio(_) | Carry::Merge(_, _) => {
+                        err_println!(
+                            "ion-win: from-csv: only supported right after 'echo'/'cat' or a \
+                             plain '|' pipe, not '^|'/'&|' yet"
+                        );
+                        unregister_spawned!();
+                        return false;
+                    }
+                };
+                match Table::from_csv(&String::from_utf8_lossy(&bytes)) {
+                    Ok(table) => {
+                        carry = finish_table_stage(
+                            table,
+                            is_last,
+                            stdout_file,
+                            capture.as_mut().map(|s| &mut **s),
+                        )
+                    }
+                    Err(e) => {
+                        err_println!("ion-win: {e}");
+                        unregister_spawned!();
+                        return false;
+                    }
+                }
+            }
             Kind::Select(columns) => {
                 let table = match incoming {
                     Carry::Table(t) => t,
@@ -543,6 +621,35 @@ async fn run_impl(
                     carry = Carry::Bytes(text.into_bytes());
                 }
             }
+            Kind::ToCsv => {
+                let table = match incoming {
+                    Carry::Table(t) => t,
+                    Carry::None => {
+                        err_println!(
+                            "ion-win: to-csv: no table piped in (pipe through 'from-json'/'from-csv' first)"
+                        );
+                        unregister_spawned!();
+                        return false;
+                    }
+                    _ => {
+                        err_println!(
+                            "ion-win: to-csv: expected a table (pipe through 'from-json'/'select' first)"
+                        );
+                        unregister_spawned!();
+                        return false;
+                    }
+                };
+                // Unlike ToJson: to_csv() already ends every row (including
+                // the last) with its own newline, so no extra one is added.
+                let text = table.to_csv();
+                if let Some(mut f) = stdout_file {
+                    let _ = f.write_all(text.as_bytes());
+                } else if is_last {
+                    print!("{text}");
+                } else {
+                    carry = Carry::Bytes(text.into_bytes());
+                }
+            }
             Kind::Unsupported(_) => unreachable!("checked above"),
         }
     }
@@ -590,10 +697,16 @@ fn classify_stages(pipeline: &Pipeline, interp: &Interpreter) -> Vec<Kind> {
                 Kind::Echo(rest.to_vec(), no_newline)
             } else if cmd == "cat" {
                 Kind::Cat(args[1..].to_vec())
+            } else if cmd == "find" {
+                Kind::Find(args[1..].to_vec())
             } else if cmd == "from-json" {
                 Kind::FromJson
             } else if cmd == "to-json" {
                 Kind::ToJson
+            } else if cmd == "from-csv" {
+                Kind::FromCsv
+            } else if cmd == "to-csv" {
+                Kind::ToCsv
             } else if cmd == "select" {
                 Kind::Select(args[1..].to_vec())
             } else if cmd == "where" || cmd == "filter" {

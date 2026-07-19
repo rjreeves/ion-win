@@ -93,6 +93,79 @@ impl Table {
             .unwrap_or_else(|_| "[]".to_string())
     }
 
+    /// Serializes the table to CSV: a header line of column names, one
+    /// data line per row. Unlike JSON, CSV needs one fixed set of columns
+    /// for the whole table — computed here as the first-seen union across
+    /// every row (not just the first row's keys), since rows aren't
+    /// assumed to share columns. A row missing a given column gets an
+    /// empty cell there, matching CSV's own inability to represent
+    /// "absent" separately from "empty" (a real, one-way lossiness versus
+    /// JSON — see `from_csv`).
+    pub fn to_csv(&self) -> String {
+        let mut columns: Vec<String> = Vec::new();
+        for row in &self.rows {
+            for (k, _) in row {
+                if !columns.contains(k) {
+                    columns.push(k.clone());
+                }
+            }
+        }
+
+        let mut out = String::new();
+        out.push_str(&columns.iter().map(|c| csv_escape(c)).collect::<Vec<_>>().join(","));
+        out.push('\n');
+        for row in &self.rows {
+            let fields: Vec<String> = columns
+                .iter()
+                .map(|col| {
+                    row.iter()
+                        .find(|(k, _)| k == col)
+                        .map(|(_, v)| csv_escape(v))
+                        .unwrap_or_default()
+                })
+                .collect();
+            out.push_str(&fields.join(","));
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Parses CSV text into a table: the first record is the header
+    /// (column names), each following record becomes a row, with fields
+    /// matched to header columns positionally. A row with *fewer* fields
+    /// than the header just leaves those trailing columns absent from
+    /// that row — matching `select`'s existing "missing column" handling,
+    /// not treated as empty-string-present. A row with *more* fields than
+    /// the header is a clear error (`from-csv`), since there's no column
+    /// name to attribute the extra value to, rather than silently
+    /// dropping data. Empty input (or a header with no data rows at all)
+    /// produces an empty table, not an error.
+    pub fn from_csv(text: &str) -> Result<Table, String> {
+        let mut records = parse_csv_records(text).into_iter();
+        let Some(header) = records.next() else {
+            return Ok(Table::default());
+        };
+
+        let mut rows = Vec::new();
+        for (i, record) in records.enumerate() {
+            if record.len() > header.len() {
+                return Err(format!(
+                    "from-csv: row {} has {} field(s), expected at most {} (matching the header)",
+                    i + 2,
+                    record.len(),
+                    header.len()
+                ));
+            }
+            let row: Row = header
+                .iter()
+                .zip(record.iter())
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            rows.push(row);
+        }
+        Ok(Table { rows })
+    }
+
     /// Projects every row down to just the named columns, in the order
     /// requested. A column missing from a given row is simply absent from
     /// that row's projection rather than an error — rows aren't assumed
@@ -160,6 +233,64 @@ fn json_type_name(v: &serde_json::Value) -> &'static str {
         serde_json::Value::Array(_) => "an array",
         serde_json::Value::Object(_) => "an object",
     }
+}
+
+/// RFC4180-style CSV field escaping: a field containing a comma, a double
+/// quote, or a newline gets wrapped in quotes, with any embedded quote
+/// doubled. Left unescaped otherwise, so the common case (plain paths,
+/// numbers, hex digests) stays perfectly readable.
+fn csv_escape(field: &str) -> String {
+    if field.contains(',') || field.contains('"') || field.contains('\n') || field.contains('\r') {
+        format!("\"{}\"", field.replace('"', "\"\""))
+    } else {
+        field.to_string()
+    }
+}
+
+/// Parses CSV text into records (rows of raw field strings, header
+/// included) — a small hand-rolled state machine rather than a naive
+/// `split(',')`/`split('\n')`, since a quoted field may legitimately
+/// contain literal commas and newlines that aren't record/field
+/// separators. An unterminated quote at the end of the input is handled
+/// best-effort (whatever was accumulated becomes the final field) rather
+/// than erroring, matching this project's general tokenizing philosophy
+/// elsewhere (`interp.rs`'s own "unterminated; best-effort" comments).
+fn parse_csv_records(text: &str) -> Vec<Vec<String>> {
+    let mut records = Vec::new();
+    let mut record = Vec::new();
+    let mut field = String::new();
+    let mut in_quotes = false;
+    let mut chars = text.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if in_quotes {
+            match c {
+                '"' if chars.peek() == Some(&'"') => {
+                    field.push('"');
+                    chars.next();
+                }
+                '"' => in_quotes = false,
+                _ => field.push(c),
+            }
+        } else {
+            match c {
+                '"' => in_quotes = true,
+                ',' => record.push(std::mem::take(&mut field)),
+                '\r' => {} // swallowed; \r\n and bare \n both end a record below
+                '\n' => {
+                    record.push(std::mem::take(&mut field));
+                    records.push(std::mem::take(&mut record));
+                }
+                _ => field.push(c),
+            }
+        }
+    }
+    // A final record with no trailing newline still needs flushing.
+    if !field.is_empty() || !record.is_empty() {
+        record.push(field);
+        records.push(record);
+    }
+    records
 }
 
 #[cfg(test)]
@@ -250,6 +381,91 @@ mod tests {
         };
         let reparsed = Table::from_json(&original.to_json()).unwrap();
         assert_eq!(original, reparsed);
+    }
+
+    #[test]
+    fn to_csv_writes_a_header_and_one_line_per_row() {
+        let table = Table {
+            rows: vec![
+                row(&[("name", "svchost.exe"), ("pid", "412")]),
+                row(&[("name", "chrome.exe"), ("pid", "8891")]),
+            ],
+        };
+        assert_eq!(
+            table.to_csv(),
+            "name,pid\nsvchost.exe,412\nchrome.exe,8891\n"
+        );
+    }
+
+    #[test]
+    fn to_csv_quotes_fields_containing_commas_quotes_or_newlines() {
+        let table = Table {
+            rows: vec![row(&[
+                ("note", "has, a comma"),
+                ("quote", "say \"hi\""),
+                ("multiline", "line one\nline two"),
+            ])],
+        };
+        assert_eq!(
+            table.to_csv(),
+            "note,quote,multiline\n\"has, a comma\",\"say \"\"hi\"\"\",\"line one\nline two\"\n"
+        );
+    }
+
+    #[test]
+    fn to_csv_column_order_is_the_first_seen_union_across_all_rows() {
+        // Second row introduces a column ("extra") the first row doesn't
+        // have — the header must still include it, since rows aren't
+        // assumed to share columns (see `Row`'s own doc comment).
+        let table = Table {
+            rows: vec![row(&[("a", "1")]), row(&[("a", "2"), ("extra", "x")])],
+        };
+        assert_eq!(table.to_csv(), "a,extra\n1,\n2,x\n");
+    }
+
+    #[test]
+    fn round_trips_through_to_csv_and_back_when_rows_share_columns() {
+        let original = Table {
+            rows: vec![
+                row(&[("name", "a"), ("pid", "1")]),
+                row(&[("name", "b"), ("pid", "2")]),
+            ],
+        };
+        let reparsed = Table::from_csv(&original.to_csv()).unwrap();
+        assert_eq!(original, reparsed);
+    }
+
+    #[test]
+    fn from_csv_parses_quoted_fields_with_embedded_commas_and_quotes() {
+        let table =
+            Table::from_csv("note,quote\n\"has, a comma\",\"say \"\"hi\"\"\"\n").unwrap();
+        assert_eq!(
+            table.rows,
+            vec![row(&[("note", "has, a comma"), ("quote", "say \"hi\"")])]
+        );
+    }
+
+    #[test]
+    fn from_csv_treats_a_short_row_as_missing_trailing_columns_not_empty_ones() {
+        let table = Table::from_csv("a,b,c\n1\n").unwrap();
+        assert_eq!(table.rows, vec![row(&[("a", "1")])]);
+    }
+
+    #[test]
+    fn from_csv_rejects_a_row_with_more_fields_than_the_header() {
+        let err = Table::from_csv("a,b\n1,2,3\n").unwrap_err();
+        assert!(err.contains("from-csv"), "{err}");
+        assert!(err.contains("3 field"), "{err}");
+    }
+
+    #[test]
+    fn from_csv_on_empty_input_is_an_empty_table_not_an_error() {
+        assert_eq!(Table::from_csv("").unwrap(), Table::default());
+    }
+
+    #[test]
+    fn from_csv_header_only_is_an_empty_table() {
+        assert_eq!(Table::from_csv("a,b,c\n").unwrap(), Table::default());
     }
 
     #[test]

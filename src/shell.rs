@@ -819,7 +819,7 @@ fn split_at_top_level_chain_op(line: &str) -> Option<(&str, ChainOp, &str)> {
 /// (so `let derived = mytable | where ...` re-derives from a previously
 /// stored table).
 fn is_table_producing_command(cmd: &str, interp: &Interpreter) -> bool {
-    matches!(cmd, "from-json" | "select" | "where" | "filter" | "stat")
+    matches!(cmd, "from-json" | "select" | "where" | "filter" | "stat" | "from-csv")
         || interp.get_table(cmd).is_some()
 }
 
@@ -1016,7 +1016,9 @@ async fn dispatch(line: &str, interp: &mut Interpreter, state: &StateHandle) -> 
                     let ok = handle_cd(&args);
                     interp.set_previous_status(ok);
                 }
-                "pwd" | "dirs" | "folders" | "files" => handle_fs_builtin(cmd.as_str(), &args),
+                "pwd" | "dirs" | "folders" | "files" | "find" => {
+                    handle_fs_builtin(cmd.as_str(), &args)
+                }
                 "cat" => handle_cat(&args),
                 "stat" => handle_stat(&args).await,
                 "pvar" => handle_pvar(&args, state).await,
