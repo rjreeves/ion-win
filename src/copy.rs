@@ -14,6 +14,14 @@
 //! source that fails to copy with a printed warning rather than aborting
 //! the whole batch, the same "batch operation, don't let one bad spot
 //! ruin the rest" reasoning `stat`/`find` already use.
+//!
+//! Copying multiple files runs concurrently across ion-win's existing
+//! tokio runtime, the same `spawn_blocking`-per-item pattern `stat.rs`
+//! (§21) established for hashing: one blocking task per file, spawned in
+//! order and awaited in that same order, so wall-clock time for a batch
+//! is bounded by the slowest single copy rather than the sum of all of
+//! them, while the printed copied/skipped tally stays deterministic
+//! regardless of which task actually finishes first.
 
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -42,13 +50,13 @@ pub fn parse_flags(args: &[String]) -> Result<(bool, Vec<String>), String> {
 /// The explicit-arguments form, used standalone (`copy a.txt b.txt`):
 /// parses flags, requires at least one source plus a destination, then
 /// copies.
-pub fn parse_and_copy_files(args: &[String]) -> Result<String, String> {
+pub async fn parse_and_copy_files(args: &[String]) -> Result<String, String> {
     let (force, mut positional) = parse_flags(args)?;
     if positional.len() < 2 {
         return Err(COPY_USAGE.to_string());
     }
     let dest = positional.pop().expect("checked len >= 2 above");
-    Ok(copy_files(&positional, &dest, force))
+    Ok(copy_files(&positional, &dest, force).await)
 }
 
 /// Copies each of `sources` into `dest`. `dest` is treated as a directory
@@ -56,14 +64,14 @@ pub fn parse_and_copy_files(args: &[String]) -> Result<String, String> {
 /// as one, when there's more than one source, or when it ends in a path
 /// separator (an explicit "this is a directory" signal even if it
 /// doesn't exist yet); otherwise `dest` is the exact target file path for
-/// the single source (a rename-style copy).
-pub fn copy_files(sources: &[String], dest: &str, force: bool) -> String {
+/// the single source (a rename-style copy). Each source's copy runs on
+/// its own blocking task, concurrently with the others.
+pub async fn copy_files(sources: &[String], dest: &str, force: bool) -> String {
     let dest_path = Path::new(dest);
     let dest_is_dir =
         dest_path.is_dir() || sources.len() > 1 || dest.ends_with('/') || dest.ends_with('\\');
 
-    let mut copied = 0usize;
-    let mut skipped = 0usize;
+    let mut handles = Vec::with_capacity(sources.len());
     for src in sources {
         let target = if dest_is_dir {
             let name = Path::new(src)
@@ -74,15 +82,10 @@ pub fn copy_files(sources: &[String], dest: &str, force: bool) -> String {
         } else {
             dest_path.to_path_buf()
         };
-        match copy_one(src, &target, force) {
-            Ok(()) => copied += 1,
-            Err(e) => {
-                crate::err_println!("ion-win: copy: {e}");
-                skipped += 1;
-            }
-        }
+        let src = src.clone();
+        handles.push(tokio::task::spawn_blocking(move || copy_one(&src, &target, force)));
     }
-    summary(copied, skipped)
+    await_copies(handles, 0).await
 }
 
 /// The `Table`-consuming pipeline form (`TABLE | copy DEST`): copies
@@ -91,10 +94,12 @@ pub fn copy_files(sources: &[String], dest: &str, force: bool) -> String {
 /// filename — unlike `copy_files`, this is meant for a recursive
 /// manifest (`find --recurse | stat`), where multiple files can share a
 /// basename in different subdirectories; flattening them would silently
-/// collide.
-pub fn copy_table(table: &crate::table::Table, dest: &str, force: bool) -> String {
+/// collide. Like `copy_files`, every row's copy runs on its own blocking
+/// task concurrently — the real payoff case, since a manifest can easily
+/// list thousands of files.
+pub async fn copy_table(table: &crate::table::Table, dest: &str, force: bool) -> String {
     let dest_path = Path::new(dest);
-    let mut copied = 0usize;
+    let mut handles = Vec::with_capacity(table.rows.len());
     let mut skipped = 0usize;
     for row in &table.rows {
         let Some((_, path)) = row.iter().find(|(k, _)| k == "path") else {
@@ -103,10 +108,33 @@ pub fn copy_table(table: &crate::table::Table, dest: &str, force: bool) -> Strin
             continue;
         };
         let target = table_row_target(dest_path, path);
-        match copy_one(path, &target, force) {
-            Ok(()) => copied += 1,
-            Err(e) => {
+        let path = path.clone();
+        handles.push(tokio::task::spawn_blocking(move || copy_one(&path, &target, force)));
+    }
+    // `skipped` seeds the tally with rows that had no `path` column at
+    // all, so they're never spawned as a task in the first place.
+    await_copies(handles, skipped).await
+}
+
+/// Awaits every blocking copy task in the order it was spawned (each
+/// already runs concurrently on tokio's blocking thread pool regardless
+/// of await order) and tallies the result on top of `skipped`, an initial
+/// count of items that never became a task at all — shared by both
+/// `copy_files` and `copy_table`.
+async fn await_copies(
+    handles: Vec<tokio::task::JoinHandle<Result<(), String>>>,
+    mut skipped: usize,
+) -> String {
+    let mut copied = 0usize;
+    for handle in handles {
+        match handle.await {
+            Ok(Ok(())) => copied += 1,
+            Ok(Err(e)) => {
                 crate::err_println!("ion-win: copy: {e}");
+                skipped += 1;
+            }
+            Err(e) => {
+                crate::err_println!("ion-win: copy: task failed: {e}");
                 skipped += 1;
             }
         }
@@ -180,22 +208,23 @@ mod tests {
         f.write_all(contents.as_bytes()).unwrap();
     }
 
-    #[test]
-    fn copy_files_single_source_to_exact_destination_path() {
+    #[tokio::test]
+    async fn copy_files_single_source_to_exact_destination_path() {
         let dir = temp_dir("single");
         let src = dir.join("a.txt");
         write_file(&src, "hello");
         let dest = dir.join("renamed.txt");
 
-        let result = copy_files(&[src.to_string_lossy().into_owned()], &dest.to_string_lossy(), false);
+        let result =
+            copy_files(&[src.to_string_lossy().into_owned()], &dest.to_string_lossy(), false).await;
         assert_eq!(result, "ion-win: copy: copied 1 file(s)");
         assert_eq!(fs::read_to_string(&dest).unwrap(), "hello");
 
         let _ = fs::remove_dir_all(dir);
     }
 
-    #[test]
-    fn copy_files_multiple_sources_go_into_a_directory_by_basename() {
+    #[tokio::test]
+    async fn copy_files_multiple_sources_go_into_a_directory_by_basename() {
         let dir = temp_dir("multi");
         let a = dir.join("a.txt");
         let b = dir.join("b.txt");
@@ -207,7 +236,8 @@ mod tests {
             &[a.to_string_lossy().into_owned(), b.to_string_lossy().into_owned()],
             &out.to_string_lossy(),
             false,
-        );
+        )
+        .await;
         assert_eq!(result, "ion-win: copy: copied 2 file(s)");
         assert_eq!(fs::read_to_string(out.join("a.txt")).unwrap(), "A");
         assert_eq!(fs::read_to_string(out.join("b.txt")).unwrap(), "B");
@@ -215,38 +245,40 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    #[test]
-    fn copy_files_refuses_to_overwrite_without_force() {
+    #[tokio::test]
+    async fn copy_files_refuses_to_overwrite_without_force() {
         let dir = temp_dir("overwrite");
         let src = dir.join("a.txt");
         let dest = dir.join("b.txt");
         write_file(&src, "new");
         write_file(&dest, "old");
 
-        let result = copy_files(&[src.to_string_lossy().into_owned()], &dest.to_string_lossy(), false);
+        let result =
+            copy_files(&[src.to_string_lossy().into_owned()], &dest.to_string_lossy(), false).await;
         assert_eq!(result, "ion-win: copy: copied 0 file(s), skipped 1");
         assert_eq!(fs::read_to_string(&dest).unwrap(), "old", "must not have been overwritten");
 
         let _ = fs::remove_dir_all(dir);
     }
 
-    #[test]
-    fn copy_files_overwrites_when_force_is_given() {
+    #[tokio::test]
+    async fn copy_files_overwrites_when_force_is_given() {
         let dir = temp_dir("force");
         let src = dir.join("a.txt");
         let dest = dir.join("b.txt");
         write_file(&src, "new");
         write_file(&dest, "old");
 
-        let result = copy_files(&[src.to_string_lossy().into_owned()], &dest.to_string_lossy(), true);
+        let result =
+            copy_files(&[src.to_string_lossy().into_owned()], &dest.to_string_lossy(), true).await;
         assert_eq!(result, "ion-win: copy: copied 1 file(s)");
         assert_eq!(fs::read_to_string(&dest).unwrap(), "new");
 
         let _ = fs::remove_dir_all(dir);
     }
 
-    #[test]
-    fn copy_files_skips_a_missing_source_and_continues() {
+    #[tokio::test]
+    async fn copy_files_skips_a_missing_source_and_continues() {
         let dir = temp_dir("missing-source");
         let a = dir.join("a.txt");
         write_file(&a, "A");
@@ -257,7 +289,8 @@ mod tests {
             &[missing.to_string_lossy().into_owned(), a.to_string_lossy().into_owned()],
             &out.to_string_lossy(),
             false,
-        );
+        )
+        .await;
         assert_eq!(result, "ion-win: copy: copied 1 file(s), skipped 1");
         assert_eq!(fs::read_to_string(out.join("a.txt")).unwrap(), "A");
 
@@ -301,8 +334,8 @@ mod tests {
     /// End-to-end confirmation via real file I/O with absolute source
     /// paths (already necessarily absolute, since they're built from a
     /// real temp directory) — the fuller version of the pure test above.
-    #[test]
-    fn copy_table_strips_the_root_from_an_absolute_path_column() {
+    #[tokio::test]
+    async fn copy_table_strips_the_root_from_an_absolute_path_column() {
         let dir = temp_dir("table-absolute");
         let src_root = dir.join("src");
         write_file(&src_root.join("top.txt"), "top");
@@ -318,7 +351,7 @@ mod tests {
                 )],
             ],
         };
-        let result = copy_table(&table, &dest_root.to_string_lossy(), false);
+        let result = copy_table(&table, &dest_root.to_string_lossy(), false).await;
         assert_eq!(result, "ion-win: copy: copied 2 file(s)");
         assert_eq!(
             fs::read_to_string(dest_root.join(src_root.join("top.txt"))).unwrap(),
@@ -332,14 +365,64 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    #[test]
-    fn copy_table_skips_a_row_with_no_path_column() {
+    #[tokio::test]
+    async fn copy_table_skips_a_row_with_no_path_column() {
         let dir = temp_dir("no-path-column");
         let table = Table {
             rows: vec![vec![("name".to_string(), "no-path-here".to_string())]],
         };
-        let result = copy_table(&table, &dir.join("dest").to_string_lossy(), false);
+        let result = copy_table(&table, &dir.join("dest").to_string_lossy(), false).await;
         assert_eq!(result, "ion-win: copy: copied 0 file(s), skipped 1");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A manifest with both a good row and a no-`path`-column row: proves
+    /// the pre-spawn `skipped` count (rows rejected before any task
+    /// exists) and the post-await tally from real copy tasks add up
+    /// together correctly, not just each in isolation.
+    #[tokio::test]
+    async fn copy_table_tallies_pre_spawn_skips_alongside_real_copies() {
+        let dir = temp_dir("mixed-skip");
+        let src_root = dir.join("src");
+        write_file(&src_root.join("ok.txt"), "ok");
+        let dest_root = dir.join("dest");
+
+        let table = Table {
+            rows: vec![
+                vec![("path".to_string(), src_root.join("ok.txt").to_string_lossy().into_owned())],
+                vec![("name".to_string(), "no-path-here".to_string())],
+            ],
+        };
+        let result = copy_table(&table, &dest_root.to_string_lossy(), false).await;
+        assert_eq!(result, "ion-win: copy: copied 1 file(s), skipped 1");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The actual motivation for this change: copying many files at once
+    /// finishes even though each individual copy is spawned as its own
+    /// blocking task, and every file genuinely lands at its destination —
+    /// concurrency doesn't drop or corrupt any of them.
+    #[tokio::test]
+    async fn copy_files_concurrently_copies_many_files_correctly() {
+        let dir = temp_dir("concurrent");
+        let mut sources = Vec::new();
+        for i in 0..32 {
+            let src = dir.join(format!("in-{i}.txt"));
+            write_file(&src, &format!("contents-{i}"));
+            sources.push(src.to_string_lossy().into_owned());
+        }
+        let out = dir.join("out");
+
+        let result = copy_files(&sources, &out.to_string_lossy(), false).await;
+        assert_eq!(result, "ion-win: copy: copied 32 file(s)");
+        for i in 0..32 {
+            assert_eq!(
+                fs::read_to_string(out.join(format!("in-{i}.txt"))).unwrap(),
+                format!("contents-{i}")
+            );
+        }
+
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -349,9 +432,9 @@ mod tests {
         assert!(err.contains("unknown option"), "{err}");
     }
 
-    #[test]
-    fn parse_and_copy_files_requires_at_least_one_source_and_a_destination() {
-        let err = parse_and_copy_files(&["only-one-arg".to_string()]).unwrap_err();
+    #[tokio::test]
+    async fn parse_and_copy_files_requires_at_least_one_source_and_a_destination() {
+        let err = parse_and_copy_files(&["only-one-arg".to_string()]).await.unwrap_err();
         assert!(err.contains("usage"), "{err}");
     }
 }

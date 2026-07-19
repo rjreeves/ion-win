@@ -1,0 +1,14 @@
+# Back up every file under src/ into backup/, preserving each file's
+# relative path, and keep a CSV manifest (path/size/hash) of what got copied.
+
+let manifest = find src --recurse | stat --hash sha256
+
+manifest | to-csv > backup_manifest.csv
+manifest | copy backup
+
+echo "Manifest:"
+manifest | to-csv
+
+for row in manifest
+    row | select path | to-json
+end

@@ -311,13 +311,13 @@ async fn run_impl(
                     // precedent.
                     drop(incoming);
                     let dest = positional.pop().expect("checked len >= 2 above");
-                    crate::copy::copy_files(&positional, &dest, force)
+                    crate::copy::copy_files(&positional, &dest, force).await
                 } else if positional.len() == 1 {
                     // Just DEST: sources come from the incoming table's
                     // "path" column.
                     let dest = &positional[0];
                     match incoming {
-                        Carry::Table(t) => crate::copy::copy_table(&t, dest, force),
+                        Carry::Table(t) => crate::copy::copy_table(&t, dest, force).await,
                         Carry::None => {
                             err_println!(
                                 "ion-win: copy: no table piped in (pipe through 'stat' first) \
