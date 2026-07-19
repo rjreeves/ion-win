@@ -53,6 +53,7 @@ use crate::pipeline;
 use crate::{err_eprintln, err_println};
 use crate::pipeline_exec;
 use crate::state::StateHandle;
+use crate::table::Table;
 use crate::types;
 use std::future::Future;
 use std::io;
@@ -620,6 +621,36 @@ async fn exec_for(
         return Flow::Normal;
     }
     let var = tokens[1].text.clone();
+
+    // `for VAR in TABLE` (ARCHITECTURE.md §19): a bare reference to a
+    // table variable iterates its rows, each bound as its own one-row
+    // `Table` (rather than being flattened into scalar text) — so the
+    // loop body can keep using the same "table variable as a pipeline
+    // source" mechanism (`row | select col`, `row | to-json`, ...)
+    // structured pipelines already rely on elsewhere. Only recognized
+    // when the whole "in" clause is *exactly* one token naming an
+    // existing table variable, so ordinary `for x in @arr`/`for x in 1 2
+    // 3` are completely unaffected — a table and a plain expansion never
+    // look the same.
+    if tokens.len() == 4 {
+        if let Some(table) = interp.get_table(&tokens[3].text) {
+            let rows = table.rows.clone();
+            for row in rows {
+                if jobctl::take_interrupt() {
+                    return Flow::Interrupted;
+                }
+                interp.set_table(var.clone(), Table { rows: vec![row] });
+                match exec_block(body, interp, state).await {
+                    Flow::Normal | Flow::LoopContinue => continue,
+                    Flow::Break => break,
+                    Flow::ShellExit => return Flow::ShellExit,
+                    Flow::Interrupted => return Flow::Interrupted,
+                }
+            }
+            return Flow::Normal;
+        }
+    }
+
     let elements = interp.expand_all(&tokens[3..]);
 
     for element in elements {
