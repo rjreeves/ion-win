@@ -55,6 +55,11 @@ enum Kind {
     /// in, matching `Cat`'s "explicit args win" precedent) or just `DEST`
     /// (sources come from the incoming `Table`'s `path` column instead).
     Copy(Vec<String>),
+    /// `compress [--force] ...` (ion-win extension, `ARCHITECTURE.md`
+    /// §25) — raw args, resolved at execution time exactly like `Copy`:
+    /// `SRC... DEST.zip` (explicit files) or just `DEST.zip` (sources
+    /// come from the incoming `Table`'s `path` column instead).
+    Compress(Vec<String>),
     External(Vec<String>),
     /// Structured-data pipeline stages (`ARCHITECTURE.md` §17) — an
     /// in-process object bridge, since external processes only ever see
@@ -336,6 +341,64 @@ async fn run_impl(
                     drop(incoming);
                     err_println!(
                         "ion-win: copy: usage: copy [--force] SRC... DEST  |  TABLE | copy [--force] DEST"
+                    );
+                    unregister_spawned!();
+                    return false;
+                };
+
+                text.push('\n');
+                if let Some(mut f) = stdout_file {
+                    let _ = f.write_all(text.as_bytes());
+                } else if is_last {
+                    print!("{text}");
+                } else {
+                    carry = Carry::Bytes(text.into_bytes());
+                }
+            }
+            Kind::Compress(compress_args) => {
+                let (force, mut positional) = match crate::compress::parse_flags(compress_args) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        drop(incoming);
+                        err_println!("ion-win: {e}");
+                        unregister_spawned!();
+                        return false;
+                    }
+                };
+
+                let mut text = if positional.len() >= 2 {
+                    // Explicit files: SRC... DEST.zip. Ignores whatever
+                    // was piped in, matching Copy's "explicit args win"
+                    // precedent.
+                    drop(incoming);
+                    let dest = positional.pop().expect("checked len >= 2 above");
+                    crate::compress::compress_files(&positional, &dest, force).await
+                } else if positional.len() == 1 {
+                    // Just DEST.zip: sources come from the incoming
+                    // table's "path" column.
+                    let dest = &positional[0];
+                    match incoming {
+                        Carry::Table(t) => crate::compress::compress_table(&t, dest, force).await,
+                        Carry::None => {
+                            err_println!(
+                                "ion-win: compress: no table piped in (pipe through 'stat' first) \
+                                 and no source files given"
+                            );
+                            unregister_spawned!();
+                            return false;
+                        }
+                        _ => {
+                            err_println!(
+                                "ion-win: compress: expected a table (pipe through 'stat' first)"
+                            );
+                            unregister_spawned!();
+                            return false;
+                        }
+                    }
+                } else {
+                    drop(incoming);
+                    err_println!(
+                        "ion-win: compress: usage: compress [--force] SRC... DEST.zip  |  TABLE | compress [--force] DEST.zip"
                     );
                     unregister_spawned!();
                     return false;
@@ -764,6 +827,8 @@ fn classify_stages(pipeline: &Pipeline, interp: &Interpreter) -> Vec<Kind> {
                 Kind::Find(args[1..].to_vec())
             } else if cmd == "copy" || cmd == "cp" {
                 Kind::Copy(args[1..].to_vec())
+            } else if cmd == "compress" {
+                Kind::Compress(args[1..].to_vec())
             } else if cmd == "from-json" {
                 Kind::FromJson
             } else if cmd == "to-json" {

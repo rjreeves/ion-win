@@ -45,6 +45,7 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin { name: "stat", is_keyword: false, help_display: Some("stat FILE... [--hash sha256]") },
     Builtin { name: "copy", is_keyword: false, help_display: Some("copy/cp [--force] SRC... DEST") },
     Builtin { name: "cp", is_keyword: false, help_display: None },
+    Builtin { name: "compress", is_keyword: false, help_display: Some("compress [--force] SRC... DEST.zip") },
     Builtin { name: "if", is_keyword: true, help_display: Some("if/else if/else") },
     Builtin { name: "else", is_keyword: true, help_display: None },
     Builtin { name: "while", is_keyword: true, help_display: Some("while") },
@@ -125,7 +126,7 @@ mod tests {
     fn help_text_matches_current_builtin_list() {
         assert_eq!(
             help_text(),
-            "builtins: exit, help, let, export, drop, read, echo, cd, pwd, dirs, folders, files, find [--all] [--recurse] [PATH], cat FILE..., stat FILE... [--hash sha256], copy/cp [--force] SRC... DEST, if/else if/else, while, for/in, fn, match/case, break, continue, test, matches, not, true, false, bool, contains, starts-with, ends-with, eq/is, exists, intersects, isatty, and, or, which/type, eval, pvar set|get|list|delete, dmark add|list|jump, jobs, wait, disown [-a|PID...], source, highlight on|off, from-json, select COL..., where/filter COL OP VAL, to-json, from-csv, to-csv\n\
+            "builtins: exit, help, let, export, drop, read, echo, cd, pwd, dirs, folders, files, find [--all] [--recurse] [PATH], cat FILE..., stat FILE... [--hash sha256], copy/cp [--force] SRC... DEST, compress [--force] SRC... DEST.zip, if/else if/else, while, for/in, fn, match/case, break, continue, test, matches, not, true, false, bool, contains, starts-with, ends-with, eq/is, exists, intersects, isatty, and, or, which/type, eval, pvar set|get|list|delete, dmark add|list|jump, jobs, wait, disown [-a|PID...], source, highlight on|off, from-json, select COL..., where/filter COL OP VAL, to-json, from-csv, to-csv\n\
              pipes: | ^| &|   redirect: > >> ^> &>   background: & &!\n\
              implicit cd: bare ~/path, .., .config, examples/\n\
              namespaces: ${env::VAR}\n\
@@ -163,5 +164,6 @@ mod tests {
         assert!(all.contains(&"to-csv"));
         assert!(all.contains(&"copy"));
         assert!(all.contains(&"cp"));
+        assert!(all.contains(&"compress"));
     }
 }

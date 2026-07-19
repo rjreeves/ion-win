@@ -1021,6 +1021,7 @@ async fn dispatch(line: &str, interp: &mut Interpreter, state: &StateHandle) -> 
                 }
                 "cat" => handle_cat(&args),
                 "copy" | "cp" => handle_copy(&args).await,
+                "compress" => handle_compress(&args).await,
                 "stat" => handle_stat(&args).await,
                 "pvar" => handle_pvar(&args, state).await,
                 "dmark" => handle_dmark(&args, state).await,
@@ -1148,6 +1149,18 @@ fn handle_cat(args: &[String]) {
 /// pipe, so it's handled entirely in `pipeline_exec.rs`'s `Kind::Copy`.
 async fn handle_copy(args: &[String]) {
     match crate::copy::parse_and_copy_files(args).await {
+        Ok(summary) => println!("{summary}"),
+        Err(e) => err_println!("ion-win: {e}"),
+    }
+}
+
+/// `compress SRC... DEST.zip` (`ARCHITECTURE.md` §25) used standalone (no
+/// pipe): the explicit-file-arguments form only, exactly mirroring
+/// `handle_copy` — the `Table`-consuming pipeline form (`TABLE | compress
+/// DEST.zip`) only makes sense with an actual pipe, handled entirely in
+/// `pipeline_exec.rs`'s `Kind::Compress`.
+async fn handle_compress(args: &[String]) {
+    match crate::compress::parse_and_compress_files(args).await {
         Ok(summary) => println!("{summary}"),
         Err(e) => err_println!("ion-win: {e}"),
     }
