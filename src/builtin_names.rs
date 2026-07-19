@@ -41,6 +41,7 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin { name: "folders", is_keyword: false, help_display: Some("folders") },
     Builtin { name: "files", is_keyword: false, help_display: Some("files") },
     Builtin { name: "cat", is_keyword: false, help_display: Some("cat FILE...") },
+    Builtin { name: "stat", is_keyword: false, help_display: Some("stat FILE... [--hash sha256]") },
     Builtin { name: "if", is_keyword: true, help_display: Some("if/else if/else") },
     Builtin { name: "else", is_keyword: true, help_display: None },
     Builtin { name: "while", is_keyword: true, help_display: Some("while") },
@@ -119,7 +120,7 @@ mod tests {
     fn help_text_matches_current_builtin_list() {
         assert_eq!(
             help_text(),
-            "builtins: exit, help, let, export, drop, read, echo, cd, pwd, dirs, folders, files, cat FILE..., if/else if/else, while, for/in, fn, match/case, break, continue, test, matches, not, true, false, bool, contains, starts-with, ends-with, eq/is, exists, intersects, isatty, and, or, which/type, eval, pvar set|get|list|delete, dmark add|list|jump, jobs, wait, disown [-a|PID...], source, highlight on|off, from-json, select COL..., where/filter COL OP VAL, to-json\n\
+            "builtins: exit, help, let, export, drop, read, echo, cd, pwd, dirs, folders, files, cat FILE..., stat FILE... [--hash sha256], if/else if/else, while, for/in, fn, match/case, break, continue, test, matches, not, true, false, bool, contains, starts-with, ends-with, eq/is, exists, intersects, isatty, and, or, which/type, eval, pvar set|get|list|delete, dmark add|list|jump, jobs, wait, disown [-a|PID...], source, highlight on|off, from-json, select COL..., where/filter COL OP VAL, to-json\n\
              pipes: | ^| &|   redirect: > >> ^> &>   background: & &!\n\
              implicit cd: bare ~/path, .., .config, examples/\n\
              namespaces: ${env::VAR}\n\
@@ -151,5 +152,6 @@ mod tests {
         assert!(all.contains(&"filter"));
         assert!(all.contains(&"to-json"));
         assert!(all.contains(&"cat"));
+        assert!(all.contains(&"stat"));
     }
 }

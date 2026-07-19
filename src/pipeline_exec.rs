@@ -53,6 +53,11 @@ enum Kind {
     /// validates JSON-parseability during execution rather than
     /// classification.
     Where(Vec<String>),
+    /// `stat FILE... [--hash sha256]` (`ARCHITECTURE.md` §21) — a `Table`
+    /// producer, like `FromJson`, but sourced from real file metadata
+    /// instead of parsed JSON text. Raw args, validated (via
+    /// `crate::stat::parse_args`) at execution time.
+    Stat(Vec<String>),
     /// A bare reference to a `Table` variable (`ARCHITECTURE.md` §18),
     /// used as an independent pipeline source — like `Echo`, it ignores
     /// whatever fed it rather than trying to merge the two. Resolved once
@@ -97,7 +102,11 @@ enum Carry {
 fn next_stage_needs_materialized_input(kind: Option<&Kind>) -> bool {
     matches!(
         kind,
-        Some(Kind::FromJson) | Some(Kind::Select(_)) | Some(Kind::ToJson) | Some(Kind::Where(_))
+        Some(Kind::FromJson)
+            | Some(Kind::Select(_))
+            | Some(Kind::ToJson)
+            | Some(Kind::Where(_))
+            | Some(Kind::Stat(_))
     )
 }
 
@@ -472,6 +481,40 @@ async fn run_impl(
                     capture.as_mut().map(|s| &mut **s),
                 );
             }
+            Kind::Stat(stat_args) => {
+                let (arg_files, hash_algo) = match crate::stat::parse_args(stat_args) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        err_println!("ion-win: {e}");
+                        unregister_spawned!();
+                        return false;
+                    }
+                };
+                // Explicit file arguments always win, matching `cat`'s
+                // convention; only fall back to piped-in paths (one per
+                // line, e.g. from a future `find`) when none were given.
+                let files = if !arg_files.is_empty() {
+                    drop(incoming);
+                    arg_files
+                } else {
+                    match incoming {
+                        Carry::Bytes(bytes) => String::from_utf8_lossy(&bytes)
+                            .lines()
+                            .map(str::trim)
+                            .filter(|line| !line.is_empty())
+                            .map(str::to_string)
+                            .collect(),
+                        _ => Vec::new(),
+                    }
+                };
+                let table = crate::stat::build_table(&files, hash_algo.as_deref()).await;
+                carry = finish_table_stage(
+                    table,
+                    is_last,
+                    stdout_file,
+                    capture.as_mut().map(|s| &mut **s),
+                );
+            }
             Kind::ToJson => {
                 let table = match incoming {
                     Carry::Table(t) => t,
@@ -555,6 +598,8 @@ fn classify_stages(pipeline: &Pipeline, interp: &Interpreter) -> Vec<Kind> {
                 Kind::Select(args[1..].to_vec())
             } else if cmd == "where" || cmd == "filter" {
                 Kind::Where(args[1..].to_vec())
+            } else if cmd == "stat" {
+                Kind::Stat(args[1..].to_vec())
             } else if let Some(table) = interp.get_table(&cmd) {
                 Kind::TableSource(table.clone())
             } else if interp.get_function(&cmd).is_some()

@@ -819,7 +819,8 @@ fn split_at_top_level_chain_op(line: &str) -> Option<(&str, ChainOp, &str)> {
 /// (so `let derived = mytable | where ...` re-derives from a previously
 /// stored table).
 fn is_table_producing_command(cmd: &str, interp: &Interpreter) -> bool {
-    matches!(cmd, "from-json" | "select" | "where" | "filter") || interp.get_table(cmd).is_some()
+    matches!(cmd, "from-json" | "select" | "where" | "filter" | "stat")
+        || interp.get_table(cmd).is_some()
 }
 
 /// Intercepts `let NAME = PIPELINE` — where `PIPELINE`'s *last* stage
@@ -1017,6 +1018,7 @@ async fn dispatch(line: &str, interp: &mut Interpreter, state: &StateHandle) -> 
                 }
                 "pwd" | "dirs" | "folders" | "files" => handle_fs_builtin(cmd.as_str(), &args),
                 "cat" => handle_cat(&args),
+                "stat" => handle_stat(&args).await,
                 "pvar" => handle_pvar(&args, state).await,
                 "dmark" => handle_dmark(&args, state).await,
                 "jobs" => handle_jobs(),
@@ -1134,6 +1136,20 @@ fn handle_cat(args: &[String]) {
         }
         Some(Err(e)) => err_println!("ion-win: {e}"),
         None => unreachable!("fs_builtins::capture always recognizes \"cat\""),
+    }
+}
+
+/// `stat FILE... [--hash sha256]` (`ARCHITECTURE.md` §21) used standalone
+/// (no pipe): builds the same `Table` the pipeline stage would and prints
+/// it as JSON, matching how a bare `from-json`-produced table prints when
+/// nothing consumes it further.
+async fn handle_stat(args: &[String]) {
+    match crate::stat::parse_args(args) {
+        Ok((files, hash_algo)) => {
+            let table = crate::stat::build_table(&files, hash_algo.as_deref()).await;
+            println!("{}", table.to_json());
+        }
+        Err(e) => err_println!("ion-win: {e}"),
     }
 }
 

@@ -16,6 +16,7 @@ mod procexpand;
 mod ranges;
 mod shell;
 mod state;
+mod stat;
 mod table;
 mod types;
 
