@@ -35,6 +35,12 @@ use std::sync::{Arc, Mutex};
 enum Kind {
     /// Args plus whether the trailing newline is suppressed (`echo -n`).
     Echo(Vec<String>, bool),
+    /// `cat FILE...` (ion-win extension, `ARCHITECTURE.md` §20) as a
+    /// pipeline producer — the file paths (already expanded), read and
+    /// concatenated at execution time via `fs_builtins::capture`, the
+    /// same in-process routine `shell.rs`'s standalone `cat` and
+    /// `interp.rs`'s `$(cat ...)` capture both already go through.
+    Cat(Vec<String>),
     External(Vec<String>),
     /// Structured-data pipeline stages (`ARCHITECTURE.md` §17) — an
     /// in-process object bridge, since external processes only ever see
@@ -208,6 +214,28 @@ async fn run_impl(
                     print!("{text}");
                 } else {
                     carry = Carry::Bytes(text.into_bytes());
+                }
+            }
+            Kind::Cat(files) => {
+                drop(incoming); // reads named files, not stdin
+                match crate::fs_builtins::capture("cat", files) {
+                    Some(Ok(text)) => {
+                        // No synthesized trailing newline (unlike Echo):
+                        // this is a file's own bytes passed through as-is.
+                        if let Some(mut f) = stdout_file {
+                            let _ = f.write_all(text.as_bytes());
+                        } else if is_last {
+                            print!("{text}");
+                        } else {
+                            carry = Carry::Bytes(text.into_bytes());
+                        }
+                    }
+                    Some(Err(e)) => {
+                        err_println!("ion-win: {e}");
+                        unregister_spawned!();
+                        return false;
+                    }
+                    None => unreachable!("fs_builtins::capture always recognizes \"cat\""),
                 }
             }
             Kind::External(args) => {
@@ -517,6 +545,8 @@ fn classify_stages(pipeline: &Pipeline, interp: &Interpreter) -> Vec<Kind> {
             if cmd == "echo" {
                 let (rest, no_newline) = crate::interp::split_echo_no_newline_flag(&args[1..]);
                 Kind::Echo(rest.to_vec(), no_newline)
+            } else if cmd == "cat" {
+                Kind::Cat(args[1..].to_vec())
             } else if cmd == "from-json" {
                 Kind::FromJson
             } else if cmd == "to-json" {

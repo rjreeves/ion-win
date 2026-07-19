@@ -7,7 +7,7 @@ Native Windows port of the [Ion shell](docs/ion-manual.pdf) (originally built fo
 ```
 cd ion-win
 cargo build              # debug build
-cargo test                # 143 tests, all passing
+cargo test                # 148 tests, all passing
 cargo run                 # interactive REPL
 cargo run -- script.ion arg1 arg2   # run a script file
 ```
@@ -18,15 +18,15 @@ No special setup needed — it's a standard Cargo binary crate. `.gitignore`/`.g
 
 A working, reasonably faithful interpreter for Ion's language (variables, control flow, functions, expansions, pipelines) plus a real interactive line editor — not a toy. It's driven entirely from the [ion-manual.pdf](docs/ion-manual.pdf) spec: nearly every feature below was implemented by reading the manual's own worked examples and writing tests that reproduce their exact output, byte-for-byte. Where the manual was ambiguous or silent, that's called out explicitly rather than guessed at.
 
-## Module map (8,615 lines across 21 files)
+## Module map (8,753 lines across 21 files)
 
 | File | Lines | Purpose |
 |---|---|---|
 | `interp.rs` | 1925 | The core: tokenizer, `$`/`@` expansion, variable scope stack (scalars/arrays/tables), `let`/`export`/`drop`, method-call and process-expansion dispatch, `echo` output/capture. The biggest and most load-bearing file. |
-| `shell.rs` | 1610 | REPL loop and prompt rendering (`PROMPT` function support), block/control-flow execution (`if`/`while`/`for`/`fn`/`match`/`case`), `for VAR in TABLE` row iteration, `cd`, `&&`/`||`/`and`/`or` chaining, `let NAME = PIPELINE` table capture, dispatch of all builtins |
+| `shell.rs` | 1632 | REPL loop and prompt rendering (`PROMPT` function support), block/control-flow execution (`if`/`while`/`for`/`fn`/`match`/`case`), `for VAR in TABLE` row iteration, `cd`, `&&`/`||`/`and`/`or` chaining, `let NAME = PIPELINE` table capture, dispatch of all builtins |
 | `editor.rs` | 680 | Crossterm raw-mode line editor (arrow keys, history, Tab-completion, word-editing shortcuts, live syntax highlighting) with fallback to plain stdin |
+| `pipeline_exec.rs` | 657 | Real OS pipeline execution (`Command`/`Stdio` chaining), background-job registration, structured-pipeline stages (`from-json`/`select`/`where`/`to-json`/`cat`), table-capturing pipeline runner |
 | `ranges.rs` | 647 | Slice parsing (`[start..end]`) + brace expansion: ranges (`{1..10}`) and permutation lists (`{ext1,ext2}`, nested) |
-| `pipeline_exec.rs` | 627 | Real OS pipeline execution (`Command`/`Stdio` chaining), background-job registration, structured-pipeline stages (`from-json`/`select`/`where`/`to-json`), table-capturing pipeline runner |
 | `methods.rs` | 491 | All 26 string/array methods (`$len`, `@split`, etc.) |
 | `arith.rs` | 430 | `$(( expr ))` arithmetic expansion (recursive-descent parser) |
 | `state.rs` | 302 | `redb`-backed key/value store for `pvar`/`dmark` |
@@ -35,9 +35,9 @@ A working, reasonably faithful interpreter for Ion's language (variables, contro
 | `table.rs` | 284 | Structured "table" data (`from-json`/`select`/`where`/`to-json`): parsing, projection, filtering, JSON round-tripping |
 | `pipeline.rs` | 199 | Pipeline/redirect *parsing* (pure data, no execution) |
 | `jobctl.rs` | 160 | Ctrl+C interrupt plumbing: foreground-PID registry, `CTRL_BREAK_EVENT` forwarding, cooperative interrupt flag |
-| `builtin_names.rs` | 153 | Single source of truth for builtin names/keywords, feeding `help`, Tab-completion, and syntax highlighting |
+| `builtin_names.rs` | 155 | Single source of truth for builtin names/keywords, feeding `help`, Tab-completion, and syntax highlighting |
 | `main.rs` | 120 | Entry point; branches to script-file mode (argv) or interactive `shell::run` |
-| `fs_builtins.rs` | 100 | `pwd`/`dirs`/`folders`/`files` |
+| `fs_builtins.rs` | 184 | `pwd`/`dirs`/`folders`/`files`/`cat` |
 | `functions.rs` | 83 | `fn` parameter parsing (typed params, docstrings) |
 | `colorout.rs` | 82 | `err_println!`/`err_eprintln!` — red-on-terminal error output, `NO_COLOR`-aware |
 | `jobs.rs` | 78 | Background-job registry for `jobs`/`wait`/`disown` |
@@ -75,6 +75,7 @@ A working, reasonably faithful interpreter for Ion's language (variables, contro
 - **Structured pipelines: `from-json` / `select` / `where`/`filter` / `to-json`** (`ARCHITECTURE.md` §17): the first post-1.0 feature — §6/§7's "native object bridge," staged rather than required for the initial port, since it's ion-win's own extension and not something the manual documents (real Ion's pipes are flat text like any other POSIX shell). A `Table` (`src/table.rs`) is an in-process bridge for JSON-emitting Windows tools, deliberately scoped to flat records — no arbitrary nesting, so no path/query syntax is needed — with a non-scalar field kept as its own compact JSON text rather than rejected. `from-json`/`to-json` are explicit boundary adapters (mirroring PowerShell's `ConvertFrom-Json`/`ConvertTo-Json`), not implicit auto-parsing: `select COL...`/`where COLUMN OP VALUE` only accept a table, so the pipe reads unambiguously left to right. `where` (aliased `filter`) reuses `test`/`if`'s exact comparison operators (`=`/`==`/`!=`/`-eq`/`-ne`/`-lt`/`-le`/`-gt`/`-ge`) directly rather than reimplementing them, so `where pid -gt 1000` behaves exactly like `test $pid -gt 1000` would; a row missing the named column never matches rather than erroring. Currently pipe-only (not usable standalone with no `|`), and only after a plain `|`/`echo`, not `^|`/`&|`.
 - **`let NAME = PIPELINE` table capture** (`ARCHITECTURE.md` §18): closes the "storing a `Table` in a shell variable" gap noted above — `Interpreter` gained a fourth scope-stack kind (`tables`, alongside `scalars`/`arrays`/`functions`) with the same ownership/teardown rules as the others. `let procs = some-tool --json | from-json | where cpu -gt 5` now works: `shell.rs` recognizes when a `let` right-hand side's *last* pipeline stage produces a table (`from-json`/`select`/`where`/`filter`, or another table variable) and captures the result instead of running `builtin_let`'s ordinary scalar/array handling. A stored table can be reused as its own pipeline source by bare name (`procs | select name | to-json`), including deriving further table variables from it (`let big = procs | where ...`). Two real bugs caught before shipping: an early version only checked the right-hand side's *first* word, missing the common `echo '[...]' | from-json` shape entirely (the actual table-producing command isn't first); and including `to-json` in the trigger set caused a pipeline ending in it to both print JSON to real stdout *and* fail with "did not produce a table" — fixed by excluding `to-json`, which deliberately opts out of capture since it converts a table *into* text.
 - **`for VAR in TABLE` row iteration** (`ARCHITECTURE.md` §19): closes the practical gap left after §18 — a bare table variable in a `for`'s "in" clause now iterates its rows, one at a time, rather than being flattened as scalar/array text. Each iteration binds `VAR` to a fresh one-row `Table` (not a scalar), so the loop body reuses every mechanism already built for tables with no new primitives: `row | to-json`, `row | select col`, `row | where ...`, or `let derived = row | where ...` to capture a further per-row transformation. Only triggers when the "in" clause is *exactly one token* naming an existing table variable, so ordinary `for x in @arr`/`for x in 1 2 3` are untouched.
+- **`cat FILE...`** (`ARCHITECTURE.md` §20): ion-win extension — real Ion just relies on the system's `/bin/cat` on Unix, but Windows has no equivalent standalone executable (`type` is `cmd.exe`-internal, not spawnable), so before this there was no way at all to get a file's contents into a pipeline. Reuses `fs_builtins::capture` (already shared by `pwd`/`dirs`/`folders`/`files`), so `$(cat file.json)` scalar capture worked with zero changes beyond adding the match arm, and `cat file.json | from-json`/`let procs = cat file.json | from-json`/`for row in procs` all work immediately as a direct payoff of §18/§19's existing "check the last stage, not the first" and "any `Table`, however it was populated" designs. Multi-file `cat a b` concatenates in order, stopping at the first unreadable file (fail-fast, matching every other error path in the structured-pipeline stages) rather than skipping and continuing like GNU `cat`.
 
 ## Known gaps (deliberately not built — not oversights)
 

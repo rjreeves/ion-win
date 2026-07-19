@@ -1016,6 +1016,7 @@ async fn dispatch(line: &str, interp: &mut Interpreter, state: &StateHandle) -> 
                     interp.set_previous_status(ok);
                 }
                 "pwd" | "dirs" | "folders" | "files" => handle_fs_builtin(cmd.as_str(), &args),
+                "cat" => handle_cat(&args),
                 "pvar" => handle_pvar(&args, state).await,
                 "dmark" => handle_dmark(&args, state).await,
                 "jobs" => handle_jobs(),
@@ -1112,6 +1113,27 @@ fn handle_fs_builtin(name: &str, args: &[String]) {
         Some(Ok(_)) => {}
         Some(Err(e)) => err_println!("ion-win: {e}"),
         None => {}
+    }
+}
+
+/// `cat FILE...` (ion-win extension — not a documented Ion feature, and
+/// not needed on Unix, where real Ion just relies on the system's own
+/// `/bin/cat`; Windows has no equivalent standalone executable, so
+/// there's currently no way at all to feed a file's contents into a
+/// pipeline like `cat file.json | from-json`). Printed with `print!`, not
+/// `println!` (unlike `handle_fs_builtin`'s callers): a file's own bytes
+/// already end however they end, and adding a synthesized trailing
+/// newline on top would risk a spurious blank line for the common case of
+/// a file that already ends in one.
+fn handle_cat(args: &[String]) {
+    match fs_builtins::capture("cat", args) {
+        Some(Ok(text)) => {
+            print!("{text}");
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+        }
+        Some(Err(e)) => err_println!("ion-win: {e}"),
+        None => unreachable!("fs_builtins::capture always recognizes \"cat\""),
     }
 }
 
