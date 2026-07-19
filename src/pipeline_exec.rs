@@ -310,6 +310,15 @@ async fn run_impl(
                     }
                 };
 
+                // When sourced from a table, that same table is forwarded
+                // to the next stage after this one finishes — so several
+                // manifest-driven operations can be chained in one pipe
+                // (`manifest | compress out.zip | copy backup`) rather
+                // than each needing its own separate `manifest | ...`
+                // statement. The explicit-files form never had a table to
+                // begin with, so there's nothing to forward in that case.
+                let mut forwarded_table: Option<Table> = None;
+
                 let mut text = if positional.len() >= 2 {
                     // Explicit files: SRC... DEST. Ignores whatever was
                     // piped in, matching Cat's "explicit args win"
@@ -322,7 +331,11 @@ async fn run_impl(
                     // "path" column.
                     let dest = &positional[0];
                     match incoming {
-                        Carry::Table(t) => crate::copy::copy_table(&t, dest, force).await,
+                        Carry::Table(t) => {
+                            let result = crate::copy::copy_table(&t, dest, force).await;
+                            forwarded_table = Some(t);
+                            result
+                        }
                         Carry::None => {
                             err_println!(
                                 "ion-win: copy: no table piped in (pipe through 'stat' first) \
@@ -347,13 +360,21 @@ async fn run_impl(
                 };
 
                 text.push('\n');
+                // Copy is side-effecting: its result is printed
+                // immediately regardless of pipeline position, not only
+                // when it happens to be the last stage — unlike a pure
+                // transform (`select`/`where`), "did the files actually
+                // get copied" shouldn't be swallowed just because
+                // something follows it in the pipe.
                 if let Some(mut f) = stdout_file {
                     let _ = f.write_all(text.as_bytes());
-                } else if is_last {
-                    print!("{text}");
                 } else {
-                    carry = Carry::Bytes(text.into_bytes());
+                    print!("{text}");
                 }
+                carry = match forwarded_table {
+                    Some(t) => Carry::Table(t),
+                    None => Carry::None,
+                };
             }
             Kind::Compress(compress_args) => {
                 let (force, mut positional) = match crate::compress::parse_flags(compress_args) {
@@ -365,6 +386,12 @@ async fn run_impl(
                         return false;
                     }
                 };
+
+                // See `Kind::Copy`'s identical comment: a table source is
+                // forwarded onward so operations can be chained in one
+                // pipe (`manifest | compress out.zip | copy backup`); the
+                // explicit-files form has no table to forward.
+                let mut forwarded_table: Option<Table> = None;
 
                 let mut text = if positional.len() >= 2 {
                     // Explicit files: SRC... DEST.zip. Ignores whatever
@@ -378,7 +405,11 @@ async fn run_impl(
                     // table's "path" column.
                     let dest = &positional[0];
                     match incoming {
-                        Carry::Table(t) => crate::compress::compress_table(&t, dest, force).await,
+                        Carry::Table(t) => {
+                            let result = crate::compress::compress_table(&t, dest, force).await;
+                            forwarded_table = Some(t);
+                            result
+                        }
                         Carry::None => {
                             err_println!(
                                 "ion-win: compress: no table piped in (pipe through 'stat' first) \
@@ -405,13 +436,18 @@ async fn run_impl(
                 };
 
                 text.push('\n');
+                // Compress is side-effecting, same reasoning as Copy: its
+                // result is printed immediately regardless of pipeline
+                // position, not only when it happens to be the last stage.
                 if let Some(mut f) = stdout_file {
                     let _ = f.write_all(text.as_bytes());
-                } else if is_last {
-                    print!("{text}");
                 } else {
-                    carry = Carry::Bytes(text.into_bytes());
+                    print!("{text}");
                 }
+                carry = match forwarded_table {
+                    Some(t) => Carry::Table(t),
+                    None => Carry::None,
+                };
             }
             Kind::External(args) => {
                 let mut command = jobctl::new_command(&args[0]);

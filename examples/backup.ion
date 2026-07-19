@@ -1,12 +1,11 @@
-# Back up every file under src/ into backup/, preserving each file's
-# relative path, keep a CSV manifest (path/size/hash) of what got copied,
-# and also produce a zipped backup.zip archive of the same files.
+# Back up every file under src/ into backup/, zip it into backup.zip,
+# and write a CSV manifest (path/size/hash) of what got backed up — all
+# chained from one scan in a single pipe, since compress/copy forward
+# the same manifest table on to whatever follows them in the pipe.
 
 let manifest = find src --recurse | stat --hash sha256
 
-manifest | to-csv > backup_manifest.csv
-manifest | copy backup
-manifest | compress backup.zip
+manifest | compress backup.zip | copy backup | to-csv > backup_manifest.csv
 
 echo "Manifest:"
 manifest | to-csv
