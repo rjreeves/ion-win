@@ -113,7 +113,7 @@ async fn render_prompt(interp: &mut Interpreter, state: &StateHandle) -> String 
 }
 
 pub async fn run(state: StateHandle) {
-    println!("ion-win 0.8.0 Beta -- type 'exit' to quit, 'help' for builtins");
+    println!("ion-win 1.0.0 -- type 'exit' to quit, 'help' for builtins");
 
     let mut interp = Interpreter::new();
     history::seed_defaults(&mut interp);
