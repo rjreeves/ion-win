@@ -139,6 +139,33 @@ impl Interpreter {
                 break;
             }
 
+            // Pipe/redirect/chain/background operators (`|`, `^|`, `&|`,
+            // `>`, `>>`, `^>`, `&>`, `&&`, `||`, `&`, `&!`) always split
+            // into their own token, even glued directly to a word with no
+            // surrounding whitespace (`find|stat`, `cmd>out.txt`) — matching
+            // how every real shell treats these as metacharacters rather
+            // than ordinary word characters. `pipeline.rs`'s parser (and
+            // `shell.rs`'s `&&`/`||` chain-op splitter) only recognize
+            // these by exact token text, so before this fix `find|stat`
+            // silently became one bareword token `"find|stat"` instead of
+            // three tokens — no error at tokenize time, just a pipeline
+            // that quietly never happened, surfacing later as a confusing
+            // "command not found" for the fused word. A bare `^` not
+            // immediately followed by `|`/`>` isn't a defined operator on
+            // its own in this grammar, so it's left as an ordinary word
+            // character in that case.
+            if let Some(op_len) = operator_len(&chars) {
+                let mut buf = String::new();
+                for _ in 0..op_len {
+                    buf.push(chars.next().expect("operator_len bounds match available chars"));
+                }
+                tokens.push(Token {
+                    text: buf,
+                    quoting: Quoting::None,
+                });
+                continue;
+            }
+
             if c == '"' || c == '\'' {
                 let quote = c;
                 chars.next();
@@ -309,7 +336,7 @@ impl Interpreter {
 
             let mut buf = String::new();
             while let Some(&ch) = chars.peek() {
-                if ch.is_whitespace() {
+                if ch.is_whitespace() || operator_len(&chars).is_some() {
                     break;
                 }
                 buf.push(ch);
@@ -1055,6 +1082,37 @@ impl Interpreter {
             }
         }
     }
+}
+
+/// Returns the length (1 or 2) of the pipe/redirect/chain/background
+/// operator starting at the current position of `chars`, or `None` if no
+/// such operator starts here — a pure lookahead (via `chars.clone()`,
+/// consuming nothing) used both to recognize an operator as its own token
+/// and to make the plain-bareword loop stop *before* consuming into one,
+/// so `find|stat` splits into `find`, `|`, `stat` regardless of adjacent
+/// whitespace, matching every real shell's treatment of these as
+/// metacharacters. Two-character operators are checked first so e.g. `>>`
+/// isn't mistaken for two separate `>` tokens. A bare `^` not immediately
+/// followed by `|`/`>` isn't one of this grammar's defined operators (only
+/// `^|`/`^>` are), so it falls through and stays part of an ordinary word.
+fn operator_len(chars: &std::iter::Peekable<std::str::Chars>) -> Option<usize> {
+    let mut lookahead = chars.clone();
+    let first = lookahead.next()?;
+    let second = lookahead.next();
+    Some(match (first, second) {
+        ('>', Some('>')) => 2,
+        ('&', Some('&')) => 2,
+        ('&', Some('|')) => 2,
+        ('&', Some('>')) => 2,
+        ('&', Some('!')) => 2,
+        ('|', Some('|')) => 2,
+        ('^', Some('|')) => 2,
+        ('^', Some('>')) => 2,
+        ('|', _) => 1,
+        ('>', _) => 1,
+        ('&', _) => 1,
+        _ => return None,
+    })
 }
 
 /// If the upcoming text (starting exactly at `sigil`, which `chars` should
@@ -1875,6 +1933,40 @@ mod tests {
 
         let tokens = Interpreter::tokenize("echo 'literal'");
         assert_eq!(tokens[1].quoting, Quoting::Single);
+    }
+
+    /// Pipe/redirect/chain/background operators must split into their own
+    /// token even with no surrounding whitespace — the real bug this
+    /// guards against: `find|stat` used to tokenize as one bareword
+    /// `"find|stat"` instead of three tokens, so `pipeline.rs` (which
+    /// matches these by exact token text) never saw a pipe at all, and
+    /// the whole line silently ran as a single unrecognized external
+    /// command instead of erroring or piping.
+    #[test]
+    fn operators_split_from_adjacent_words_without_whitespace() {
+        let texts = |s: &str| -> Vec<String> {
+            Interpreter::tokenize(s).into_iter().map(|t| t.text).collect()
+        };
+
+        assert_eq!(texts("find|stat"), vec!["find", "|", "stat"]);
+        assert_eq!(texts("find| stat"), vec!["find", "|", "stat"]);
+        assert_eq!(texts("find |stat"), vec!["find", "|", "stat"]);
+        assert_eq!(texts("find | stat"), vec!["find", "|", "stat"]);
+
+        assert_eq!(texts("cmd>>out.txt"), vec!["cmd", ">>", "out.txt"]);
+        assert_eq!(texts("cmd>out.txt"), vec!["cmd", ">", "out.txt"]);
+        assert_eq!(texts("cmd^|other"), vec!["cmd", "^|", "other"]);
+        assert_eq!(texts("cmd^>out.txt"), vec!["cmd", "^>", "out.txt"]);
+        assert_eq!(texts("cmd&|other"), vec!["cmd", "&|", "other"]);
+        assert_eq!(texts("cmd&>out.txt"), vec!["cmd", "&>", "out.txt"]);
+        assert_eq!(texts("sleep 5&"), vec!["sleep", "5", "&"]);
+        assert_eq!(texts("cmd&!"), vec!["cmd", "&!"]);
+        assert_eq!(texts("true&&echo hi"), vec!["true", "&&", "echo", "hi"]);
+        assert_eq!(texts("false||echo hi"), vec!["false", "||", "echo", "hi"]);
+
+        // A lone `^` not immediately followed by `|`/`>` isn't a defined
+        // operator in this grammar, so it stays part of an ordinary word.
+        assert_eq!(texts("echo a^b"), vec!["echo", "a^b"]);
     }
 
     #[test]
