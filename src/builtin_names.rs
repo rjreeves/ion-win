@@ -73,6 +73,16 @@ pub const BUILTINS: &[Builtin] = &[
         help_display: Some("cd"),
     },
     Builtin {
+        name: "pushd",
+        is_keyword: false,
+        help_display: Some("pushd DIRECTORY"),
+    },
+    Builtin {
+        name: "popd",
+        is_keyword: false,
+        help_display: Some("popd"),
+    },
+    Builtin {
         name: "pwd",
         is_keyword: false,
         help_display: Some("pwd"),
@@ -114,6 +124,36 @@ pub const BUILTINS: &[Builtin] = &[
     },
     Builtin {
         name: "cp",
+        is_keyword: false,
+        help_display: None,
+    },
+    Builtin {
+        name: "mkdir",
+        is_keyword: false,
+        help_display: Some("mkdir/md DIR..."),
+    },
+    Builtin {
+        name: "md",
+        is_keyword: false,
+        help_display: None,
+    },
+    Builtin {
+        name: "move",
+        is_keyword: false,
+        help_display: Some("move/mv [--force] SRC... DEST"),
+    },
+    Builtin {
+        name: "mv",
+        is_keyword: false,
+        help_display: None,
+    },
+    Builtin {
+        name: "rename",
+        is_keyword: false,
+        help_display: Some("rename/ren [--force] SOURCE NEW_NAME"),
+    },
+    Builtin {
+        name: "ren",
         is_keyword: false,
         help_display: None,
     },
@@ -313,6 +353,11 @@ pub const BUILTINS: &[Builtin] = &[
         help_display: Some("highlight on|off"),
     },
     Builtin {
+        name: "cls",
+        is_keyword: false,
+        help_display: Some("cls"),
+    },
+    Builtin {
         name: "from-json",
         is_keyword: false,
         help_display: Some("from-json"),
@@ -372,15 +417,15 @@ Getting started
   help history     shared history settings
 
 Commands by category
-  Navigation       cd  pwd  dirs  folders  files  find  dmark
-  Files            cat  stat  copy  compress  delete
+  Navigation       cd  pushd  popd  pwd  dirs  folders  files  find  dmark
+  Files            mkdir  cat  stat  copy  move  rename  compress  delete
   Language         let  export  drop  read  echo  eval  source  fn
   Control flow     if  while  for  match  and  or  break  continue
   Conditions       test  matches  bool  contains  starts-with  ends-with
                    eq/is  exists  intersects  isatty  true  false  not
   Tables           from-json  from-csv  select  where/filter  to-json  to-csv
   State & jobs     pvar  jobs  wait  disown  which/type
-  Editor           highlight
+  Editor           highlight  cls
 
 Examples
   help delete
@@ -502,6 +547,8 @@ pub fn help_text(topic: Option<&str>) -> Result<String, String> {
         "read" => page("read VARIABLE...", "Reads one input line and assigns whitespace-separated fields to named variables.", &["read first last"], &[]),
         "echo" => page("echo [-n] VALUE...", "Prints expanded values. `-n` suppresses the trailing newline.", &["echo \"Hello $name\"", "echo -n \"prompt> \""], &[]),
         "cd" => page("cd [DIRECTORY]", "Changes directory; with no argument, goes to %USERPROFILE%.", &["cd ~/Documents", "..", "examples/"], &["Path-looking bare commands perform an implicit cd."]),
+        "pushd" => page("pushd DIRECTORY", "Saves the current directory on an in-memory stack, then changes to DIRECTORY.", &["pushd build", "popd"], &["A failed directory change does not alter the stack."]),
+        "popd" => page("popd", "Returns to the most recently saved pushd directory.", &[], &["Fails without changing directory when the stack is empty."]),
         "pwd" => page("pwd", "Prints the current directory.", &[], &[]),
         "dirs" => page("dirs", "Lists directory entries in the current directory.", &[], &[]),
         "folders" => page("folders [--all] [--full] [PATH]", "Lists directories only.", &["folders --all ."], &[]),
@@ -514,6 +561,24 @@ pub fn help_text(topic: Option<&str>) -> Result<String, String> {
             "Copies explicit files or every path in a table. Table paths retain their relative layout.",
             &["copy report.txt backup", "manifest | copy backup"],
             &["Existing destinations are skipped unless --force is supplied.", "`cp` is an alias."],
+        ),
+        "mkdir" | "md" => page(
+            "mkdir DIR...",
+            "Creates one or more directories, including missing parent directories.",
+            &["mkdir reports/2026/july", "mkdir cache output"],
+            &["Existing directories are counted and left unchanged.", "`md` is an alias."],
+        ),
+        "move" | "mv" => page(
+            "move [--force] SRC... DEST\n        TABLE | move [--force] DEST",
+            "Moves files or folders. A table supplies sources from its `path` column and preserves relative layout under DEST.",
+            &["move draft.txt final.txt", "move one.txt two.txt archive", "manifest | move archive"],
+            &["Existing destinations are skipped unless --force is supplied.", "Existing directories are never replaced.", "`mv` is an alias."],
+        ),
+        "rename" | "ren" => page(
+            "rename [--force] SOURCE NEW_NAME",
+            "Renames one file or folder in place. Use move when changing its parent directory.",
+            &["rename draft.txt final.txt", "rename old-folder new-folder"],
+            &["NEW_NAME must be a name, not a path.", "`ren` is an alias."],
         ),
         "compress" => page(
             "compress [--force] SRC... DEST.zip\n        TABLE | compress [--force] DEST.zip",
@@ -564,6 +629,7 @@ pub fn help_text(topic: Option<&str>) -> Result<String, String> {
         "disown" => page("disown [-a | PID...]", "Stops tracking selected or all background processes without terminating them.", &["disown -a"], &[]),
         "source" => page("source FILE", "Executes an Ion script in the current shell and scope.", &["source setup.ion"], &[]),
         "highlight" => page("highlight [on|off]", "Shows or changes live syntax highlighting in the line editor.", &["highlight off"], &[]),
+        "cls" => page("cls", "Clears the terminal and moves the cursor to the top-left corner.", &[], &[]),
         "from-json" => page("BYTES | from-json", "Parses a JSON object or array of objects into a table.", &["cat data.json | from-json | select name"], &["Structured stages are pipeline-only."]),
         "from-csv" => page("BYTES | from-csv", "Parses CSV with a header row into a table.", &["cat data.csv | from-csv | where size -gt 100"], &["Structured stages are pipeline-only."]),
         "select" => page("TABLE | select COLUMN...", "Projects selected columns from each table row.", &["manifest | select path size | to-csv"], &[]),

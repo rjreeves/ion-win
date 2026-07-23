@@ -1,0 +1,14 @@
+# Real-binary exercise for native cmd.exe-style conveniences.
+mkdir workspace/inbox workspace/archive
+echo alpha > workspace/inbox/alpha.txt
+move workspace/inbox/alpha.txt workspace/inbox/draft.txt
+rename workspace/inbox/draft.txt final.txt
+
+pushd workspace/inbox
+pwd
+popd
+pwd
+
+let manifest = find workspace/inbox | stat
+manifest | move workspace/archive
+cls

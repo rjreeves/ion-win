@@ -562,4 +562,37 @@ The original `help` output was one comma-separated builtin list followed by seve
 
 Bare `help` is now a short categorized landing page. `help COMMAND` provides usage, purpose, examples, aliases, and relevant safety notes for every registered builtin; `help syntax`, `help tables`, `help methods`, and `help history` cover concepts larger than one command. `help all` provides the complete registry-derived index. Unknown topics point back to the overview and index instead of silently printing the same generic text.
 
-The help tests enforce that every name in `BUILTINS` resolves to a focused page, aliases share their canonical content, safety-critical delete guidance is present, and the overview remains categorized. A release-binary smoke test verified the overview plus the `delete` and `tables` pages through the real shell. The full suite now contains 219 passing tests.
+The help tests enforce that every name in `BUILTINS` resolves to a focused page, aliases share their canonical content, safety-critical delete guidance is present, and the overview remains categorized. A release-binary smoke test verified the overview plus the `delete` and `tables` pages through the real shell.
+
+## 35. Native Windows filesystem and navigation conveniences
+
+ion-win now supplies the most useful `cmd.exe` conveniences that were still
+missing: `mkdir`/`md`, `move`/`mv`, `rename`/`ren`, `pushd`/`popd`, and `cls`.
+This is a focused compatibility layer, not an attempt to reproduce every
+historical `cmd.exe` builtin.
+
+`mkdir DIR...` creates missing parents by default and leaves existing
+directories unchanged. `move [--force] SRC... DEST` handles files and
+directories, treats a multi-source destination as a directory, auto-creates
+destination parents, refuses overwrite by default, and never replaces an
+existing directory. A failed same-volume rename of a regular file falls back
+to copy-then-remove, enabling cross-volume moves while rolling the destination
+back if source removal fails.
+
+Like the other manifest operations, `TABLE | move [--force] DEST` reads each
+row's `path` field and preserves its relative layout beneath the destination.
+The table is deliberately not forwarded: its paths are stale after a move.
+`rename [--force] SOURCE NEW_NAME` is narrower and safer—it only accepts a
+single name, never a path, making relocation an explicit `move` operation.
+
+`pushd DIRECTORY` saves the current path only after a successful directory
+change; `popd` removes a saved entry only after successfully returning to it.
+The stack is process-local and intentionally not persisted. `cls` uses
+crossterm to clear the screen and move the cursor to the top-left.
+
+Seven focused unit tests cover parent creation, overwrite protection/forcing,
+same-target data-loss prevention, directory moves, table layout, and rename restrictions. The compiled
+`scripts/exercise/14_windows_conveniences.ion` smoke test exercised all five
+features in a temporary working directory, including table-driven move and
+the real terminal clear sequence. The full suite now contains 226 passing
+tests.

@@ -59,6 +59,7 @@ use std::future::Future;
 use std::io;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::{Mutex, OnceLock};
 
 /// Whether `line` opens a multi-line block. `fn` only opens a block when
 /// it's a definition (`fn NAME ...`) — bare `fn`/`fn -h`/`fn --help` is the
@@ -73,6 +74,7 @@ fn is_block_opener(line: &str) -> bool {
 }
 
 const DEFAULT_PROMPT: &str = "ion> ";
+static DIRECTORY_STACK: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
 
 /// Keeps `$PWD` current before every prompt render, so a `PROMPT` function
 /// (or any other script) can rely on it reflecting the shell's actual
@@ -113,7 +115,10 @@ async fn render_prompt(interp: &mut Interpreter, state: &StateHandle) -> String 
 }
 
 pub async fn run(state: StateHandle) {
-    println!("ion-win 1.0.0 -- type 'exit' to quit, 'help' for builtins");
+    println!(
+        "ion-win {} -- type 'exit' to quit, 'help' for guidance",
+        env!("CARGO_PKG_VERSION")
+    );
 
     let mut interp = Interpreter::new();
     history::seed_defaults(&mut interp);
@@ -1049,9 +1054,21 @@ async fn dispatch(line: &str, interp: &mut Interpreter, state: &StateHandle) -> 
                 }
                 "cat" => handle_cat(&args),
                 "copy" | "cp" => handle_copy(&args).await,
+                "mkdir" | "md" => handle_mkdir(&args),
+                "move" | "mv" => handle_move(&args).await,
+                "rename" | "ren" => handle_rename(&args).await,
                 "compress" => handle_compress(&args).await,
                 "delete" => handle_delete(&args).await,
                 "stat" => handle_stat(&args).await,
+                "pushd" => {
+                    let ok = handle_pushd(&args);
+                    interp.set_previous_status(ok);
+                }
+                "popd" => {
+                    let ok = handle_popd(&args);
+                    interp.set_previous_status(ok);
+                }
+                "cls" => handle_cls(&args),
                 "pvar" => handle_pvar(&args, state).await,
                 "dmark" => handle_dmark(&args, state).await,
                 "jobs" => handle_jobs(),
@@ -1181,6 +1198,90 @@ async fn handle_copy(args: &[String]) {
         Ok(summary) => println!("{summary}"),
         Err(e) => err_println!("ion-win: {e}"),
     }
+}
+
+fn handle_mkdir(args: &[String]) {
+    match crate::fs_ops::mkdir(args) {
+        Ok(summary) => println!("{summary}"),
+        Err(error) => err_println!("ion-win: {error}"),
+    }
+}
+
+async fn handle_move(args: &[String]) {
+    match crate::fs_ops::parse_and_move(args).await {
+        Ok(summary) => println!("{summary}"),
+        Err(error) => err_println!("ion-win: {error}"),
+    }
+}
+
+async fn handle_rename(args: &[String]) {
+    match crate::fs_ops::rename(args).await {
+        Ok(summary) => println!("{summary}"),
+        Err(error) => err_println!("ion-win: {error}"),
+    }
+}
+
+fn directory_stack() -> &'static Mutex<Vec<PathBuf>> {
+    DIRECTORY_STACK.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn handle_pushd(args: &[String]) -> bool {
+    let [destination] = args else {
+        err_println!("ion-win: pushd: usage: pushd DIRECTORY");
+        return false;
+    };
+    let Ok(current) = std::env::current_dir() else {
+        err_println!("ion-win: pushd: could not read the current directory");
+        return false;
+    };
+    if !handle_cd(std::slice::from_ref(destination)) {
+        return false;
+    }
+    directory_stack()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(current);
+    true
+}
+
+fn handle_popd(args: &[String]) -> bool {
+    if !args.is_empty() {
+        err_println!("ion-win: popd: usage: popd");
+        return false;
+    }
+    let destination = {
+        let stack = directory_stack()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        stack.last().cloned()
+    };
+    let Some(destination) = destination else {
+        err_println!("ion-win: popd: directory stack is empty");
+        return false;
+    };
+    if !handle_cd(&[destination.to_string_lossy().into_owned()]) {
+        return false;
+    }
+    directory_stack()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .pop();
+    true
+}
+
+fn handle_cls(args: &[String]) {
+    if !args.is_empty() {
+        err_println!("ion-win: cls: usage: cls");
+        return;
+    }
+    use std::io::Write;
+    let mut stdout = std::io::stdout();
+    let _ = crossterm::execute!(
+        stdout,
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+        crossterm::cursor::MoveTo(0, 0)
+    );
+    let _ = stdout.flush();
 }
 
 /// `compress SRC... DEST.zip` (`ARCHITECTURE.md` §25) used standalone (no

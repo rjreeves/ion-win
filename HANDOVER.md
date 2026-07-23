@@ -7,7 +7,7 @@ Native Windows port of the [Ion shell](docs/ion-manual.pdf) (originally built fo
 ```
 cd ion-win
 cargo build              # debug build
-cargo test                # 219 tests, all passing
+cargo test                # 226 tests, all passing
 cargo run                 # interactive REPL
 cargo run -- script.ion arg1 arg2   # run a script file
 ```
@@ -18,13 +18,13 @@ No special setup needed — it's a standard Cargo binary crate. `.gitignore`/`.g
 
 A working, reasonably faithful interpreter for Ion's language (variables, control flow, functions, expansions, pipelines) plus a real interactive line editor — not a toy. It's driven entirely from the [ion-manual.pdf](docs/ion-manual.pdf) spec: nearly every feature below was implemented by reading the manual's own worked examples and writing tests that reproduce their exact output, byte-for-byte. Where the manual was ambiguous or silent, that's called out explicitly rather than guessed at.
 
-## Module map (11,342 lines across 25 files)
+## Module map (11,920 lines across 26 files)
 
 | File | Lines | Purpose |
 |---|---|---|
 | `interp.rs` | 2243 | The core: tokenizer (pipe/redirect/chain/background operators always split into their own token, even with no surrounding whitespace), `$`/`@` expansion, variable scope stack (scalars/arrays/tables), `let`/`export`/`drop`, method-call and process-expansion dispatch, `echo` output/capture. The biggest and most load-bearing file. |
-| `shell.rs` | 1714 | REPL loop and prompt rendering (`PROMPT` function support), block/control-flow execution (`if`/`while`/`for`/`fn`/`match`/`case`), `for VAR in TABLE` row iteration, `cd`, `&&`/`||`/`and`/`or` chaining, `let NAME = PIPELINE` table capture, dispatch of all builtins |
-| `pipeline_exec.rs` | 1029 | Real OS pipeline execution (`Command`/`Stdio` chaining), background-job registration, structured-pipeline stages (`from-json`/`select`/`where`/`to-json`/`from-csv`/`to-csv`/`cat`/`stat`/`find`/`copy`/`compress`/`delete`), table-capturing pipeline runner |
+| `shell.rs` | 1815 | REPL loop and prompt rendering (`PROMPT` function support), block/control-flow execution (`if`/`while`/`for`/`fn`/`match`/`case`), directory-stack and terminal helpers, `cd`, `&&`/`||`/`and`/`or` chaining, table capture, dispatch of all builtins |
+| `pipeline_exec.rs` | 1083 | Real OS pipeline execution (`Command`/`Stdio` chaining), background-job registration, structured-pipeline and manifest stages (`from-json`/CSV, `select`/`where`, `stat`/`find`, `copy`/`move`/`compress`/`delete`), table-capturing pipeline runner |
 | `editor.rs` | 871 | Crossterm raw-mode line editor (arrow keys, shared history, Tab-completion, word-editing shortcuts, Shift-selection, live syntax highlighting) with fallback to plain stdin |
 | `ranges.rs` | 659 | Slice parsing (`[start..end]`) + brace expansion: ranges (`{1..10}`) and permutation lists (`{ext1,ext2}`, nested) |
 | `methods.rs` | 520 | String/array methods (`$len`, `@split`, Unicode graphemes, etc.) |
@@ -40,8 +40,9 @@ A working, reasonably faithful interpreter for Ion's language (variables, contro
 | `delete.rs` | 384 | Safe standalone/table deletion: Windows Recycle Bin by default; permanent removal only behind `--permanent --force`, directories behind `--recurse`, with root/current-directory and reparse-point guards |
 | `pipeline.rs` | 199 | Pipeline/redirect *parsing* (pure data, no execution) |
 | `jobctl.rs` | 160 | Ctrl+C interrupt plumbing: foreground-PID registry, `CTRL_BREAK_EVENT` forwarding, cooperative interrupt flag |
-| `builtin_names.rs` | 658 | Builtin registry for Tab-completion/highlighting plus categorized overview, focused command help, concept guides, examples, aliases, and safety notes |
-| `main.rs` | 124 | Entry point; branches to script-file mode (argv) or interactive `shell::run` |
+| `fs_ops.rs` | 390 | Native `mkdir`/`move`/`rename` operations, including safe overwrite rules, same-target protection, cross-volume file fallback, and table-driven moves |
+| `builtin_names.rs` | 724 | Builtin registry for Tab-completion/highlighting plus categorized overview, focused command help, concept guides, examples, aliases, and safety notes |
+| `main.rs` | 125 | Entry point; branches to script-file mode (argv) or interactive `shell::run` |
 | `functions.rs` | 83 | `fn` parameter parsing (typed params, docstrings) |
 | `colorout.rs` | 82 | `err_println!`/`err_eprintln!` — red-on-terminal error output, `NO_COLOR`-aware |
 | `jobs.rs` | 78 | Background-job registry for `jobs`/`wait`/`disown` |
@@ -94,6 +95,7 @@ A working, reasonably faithful interpreter for Ion's language (variables, contro
 - **Real Unicode grapheme handling** (`ARCHITECTURE.md` §32): added `unicode-segmentation`; `@graphemes()` now returns extended grapheme clusters rather than aliasing `@chars()`, and user-facing string `$len`, `find` positions, `reverse`, `split_at`, and string indexing/slicing use the same boundaries. `@chars()` deliberately remains Unicode-scalar based and `@bytes()` remains UTF-8-byte based. Combining-mark text and a ZWJ emoji sequence are covered by unit and real-binary tests.
 - **Safe `delete` builtin** (`ARCHITECTURE.md` §33): `delete PATH...` and `TABLE | delete` now complete the manifest-operation family. Default deletion uses Windows `IFileOperation` with recycle-only semantics; permanent deletion requires the exact `--permanent --force` pair. Directories additionally require `--recurse`. Batch output always reports deleted/recycled, skipped, and failed counts; missing paths and table rows without `path` are skipped with warnings. Permanent recursion removes symlinks/junctions themselves without traversing their targets and refuses filesystem roots, the current directory, or its ancestors. Verified by five unit tests, the compiled `scripts/exercise/13_delete_safety.ion`, and an independent real-junction test whose external target survived.
 - **Useful topic-based `help`** (`ARCHITECTURE.md` §34): bare `help` is now a categorized landing page rather than one dense builtin line. `help COMMAND` covers every registered builtin with usage, examples, aliases, and safety notes; conceptual pages cover `syntax`, `tables`, `methods`, and `history`, while `help all` prints the complete command index. Registry-coverage tests prevent new builtins from silently missing focused help.
+- **Native Windows conveniences** (`ARCHITECTURE.md` §35): `mkdir`/`md` creates parent directories; safe `move`/`mv` supports explicit sources and table manifests without overwrite unless `--force`; `rename`/`ren` changes one name in place; `pushd`/`popd` provides a process-local directory stack; and `cls` clears through crossterm. Verified with focused unit tests and the compiled `scripts/exercise/14_windows_conveniences.ion` in an isolated working directory.
 
 ## Known gaps (deliberately not built — not oversights)
 
@@ -106,21 +108,21 @@ Ranked roughly by how much a real user would notice:
 
 Every feature in this codebase was verified two ways, and both matter:
 
-1. **Unit tests** covering manual examples, regressions, concurrency, safety rules, and help coverage (219 passing). Fast, but they only prove the code path you thought to test.
+1. **Unit tests** covering manual examples, regressions, concurrency, safety rules, and help coverage (226 passing). Fast, but they only prove the code path you thought to test.
 2. **Interactive smoke tests** via the actual compiled binary (`cargo build` then pipe a `.ion` script into `target/debug/ion-win.exe`, or spawn it as a subprocess for anything touching real OS state like `cd`/env vars/child processes). This caught several real bugs unit tests missed — e.g. the tokenizer originally split `$(( x * x ))` into garbage tokens because of internal spaces (same bug recurred for `$(cmd)` and `@method(...)` until each was specifically fixed), and `$len([1 2 3])` was silently counting the *literal bracket text's characters* instead of the array's elements until an interactive test caught it.
 
 **Do not skip step 2.** Anything involving `std::env::set_var`, `std::env::set_current_dir`, or spawning child processes should be tested via a real subprocess invocation, never as an in-process `#[test]` — those mutate whole-process state that would race with other tests running concurrently in the same `cargo test` binary.
 
 ## Suggested next steps
 
-Nothing is mid-implementation or broken right now — all 219 tests pass. The best remaining refinements are:
+Nothing is mid-implementation or broken right now — all 226 tests pass. The best remaining refinements are:
 
 1. Clipboard operations for editor selections (`Ctrl+C` copy when selected, `Ctrl+X`, `Ctrl+V`).
 2. Optional history session IDs and session-aware history inspection.
 3. History compaction/size limits without disrupting concurrent windows.
 4. Manual interactive testing of selection, Unicode editing, and live history in Windows Terminal.
 
-Whatever's picked up, follow this session's established rhythm: real-binary smoke test (not just `cargo test`) before claiming anything works, update `ARCHITECTURE.md` with a new numbered section (currently ends at §34) and add an "Implemented, verified" bullet here in `HANDOVER.md`, and don't commit/push without being asked.
+Whatever's picked up, follow this session's established rhythm: real-binary smoke test (not just `cargo test`) before claiming anything works, update `ARCHITECTURE.md` with a new numbered section (currently ends at §35) and add an "Implemented, verified" bullet here in `HANDOVER.md`, and don't commit/push without being asked.
 
 ## A note on the interactive line editor
 

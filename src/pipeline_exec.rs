@@ -6,7 +6,7 @@
 //! waiting — `&` registers with `jobs.rs` for `jobs`/`wait`/`disown`;
 //! `&!` never does, no `fg`/`bg` — see `jobs.rs`'s module doc for why).
 //!
-//! Not supported as a pipeline stage: any other builtin (`pvar`, `dmark`,
+//! Not supported as a pipeline stage: most other builtins (`pvar`, `dmark`,
 //! `test`, `matches`, `read`, ...) or a user-defined `fn` —
 //! encountering one there aborts the pipeline with a clear message rather
 //! than silently doing something surprising. This is because those
@@ -55,6 +55,10 @@ enum Kind {
     /// in, matching `Cat`'s "explicit args win" precedent) or just `DEST`
     /// (sources come from the incoming `Table`'s `path` column instead).
     Copy(Vec<String>),
+    /// `move`/`mv [--force] ...`: explicit `SRC... DEST`, or one `DEST`
+    /// consuming a table's `path` column. A moved manifest is not
+    /// forwarded because its recorded paths are stale afterward.
+    Move(Vec<String>),
     /// `compress [--force] ...` (ion-win extension, `ARCHITECTURE.md`
     /// §25) — raw args, resolved at execution time exactly like `Copy`:
     /// `SRC... DEST.zip` (explicit files) or just `DEST.zip` (sources
@@ -380,6 +384,54 @@ async fn run_impl(
                     Some(t) => Carry::Table(t),
                     None => Carry::None,
                 };
+            }
+            Kind::Move(move_args) => {
+                let (force, mut positional) = match crate::fs_ops::parse_move_flags(move_args) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        drop(incoming);
+                        err_println!("ion-win: {error}");
+                        unregister_spawned!();
+                        return false;
+                    }
+                };
+                let mut text = if positional.len() >= 2 {
+                    drop(incoming);
+                    let destination = positional.pop().expect("checked length");
+                    crate::fs_ops::move_paths(&positional, &destination, force).await
+                } else if positional.len() == 1 {
+                    match incoming {
+                        Carry::Table(table) => {
+                            crate::fs_ops::move_table(&table, &positional[0], force).await
+                        }
+                        Carry::None => {
+                            err_println!(
+                                "ion-win: move: no table piped in and no source paths given"
+                            );
+                            unregister_spawned!();
+                            return false;
+                        }
+                        _ => {
+                            err_println!("ion-win: move: expected a table");
+                            unregister_spawned!();
+                            return false;
+                        }
+                    }
+                } else {
+                    drop(incoming);
+                    err_println!(
+                        "ion-win: move: usage: move [--force] SRC... DEST  |  TABLE | move [--force] DEST"
+                    );
+                    unregister_spawned!();
+                    return false;
+                };
+                text.push('\n');
+                if let Some(mut file) = stdout_file {
+                    let _ = file.write_all(text.as_bytes());
+                } else {
+                    print!("{text}");
+                }
+                carry = Carry::None;
             }
             Kind::Compress(compress_args) => {
                 let (force, mut positional) = match crate::compress::parse_flags(compress_args) {
@@ -909,6 +961,8 @@ fn classify_stages(pipeline: &Pipeline, interp: &Interpreter) -> Vec<Kind> {
                 Kind::Find(args[1..].to_vec())
             } else if cmd == "copy" || cmd == "cp" {
                 Kind::Copy(args[1..].to_vec())
+            } else if cmd == "move" || cmd == "mv" {
+                Kind::Move(args[1..].to_vec())
             } else if cmd == "compress" {
                 Kind::Compress(args[1..].to_vec())
             } else if cmd == "delete" {

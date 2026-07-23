@@ -7,6 +7,7 @@ mod copy;
 mod delete;
 mod editor;
 mod fs_builtins;
+mod fs_ops;
 mod functions;
 mod history;
 mod interp;
