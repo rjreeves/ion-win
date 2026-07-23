@@ -1,6 +1,7 @@
 mod arith;
 mod builtin_names;
 mod builtins;
+mod clipboard;
 mod colorout;
 mod compress;
 mod copy;

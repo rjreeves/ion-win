@@ -259,6 +259,13 @@ impl LineEditor {
                     return EditorOutcome::Line(buffer.into_iter().collect());
                 }
                 (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
+                    if let Some(text) = selected_text(&buffer, selection_anchor, cursor_pos) {
+                        if crate::clipboard::write_text(&text).is_err() {
+                            print!("\x07");
+                            let _ = io::stdout().flush();
+                        }
+                        continue;
+                    }
                     print!("^C\r\n");
                     let _ = io::stdout().flush();
                     buffer.clear();
@@ -266,6 +273,40 @@ impl LineEditor {
                     selection_anchor = None;
                     history_index = self.history.len();
                     redraw(prompt, &buffer, cursor_pos, selection_anchor);
+                }
+                (KeyCode::Char('x'), m) if m.contains(KeyModifiers::CONTROL) => {
+                    if let Some(text) = selected_text(&buffer, selection_anchor, cursor_pos) {
+                        if crate::clipboard::write_text(&text).is_ok() {
+                            delete_selection(
+                                &mut buffer,
+                                &mut cursor_pos,
+                                &mut selection_anchor,
+                            );
+                        } else {
+                            print!("\x07");
+                            let _ = io::stdout().flush();
+                        }
+                    }
+                }
+                (KeyCode::Char('v'), m) if m.contains(KeyModifiers::CONTROL) => {
+                    match crate::clipboard::read_text() {
+                        Ok(text) => {
+                            delete_selection(
+                                &mut buffer,
+                                &mut cursor_pos,
+                                &mut selection_anchor,
+                            );
+                            let text = single_line_clipboard_text(&text);
+                            let inserted: Vec<char> = text.chars().collect();
+                            let count = inserted.len();
+                            buffer.splice(cursor_pos..cursor_pos, inserted);
+                            cursor_pos += count;
+                        }
+                        Err(_) => {
+                            print!("\x07");
+                            let _ = io::stdout().flush();
+                        }
+                    }
                 }
                 (KeyCode::Char('d'), m) if m.contains(KeyModifiers::CONTROL) => {
                     if buffer.is_empty() {
@@ -483,6 +524,20 @@ fn selection_range(anchor: Option<usize>, cursor_pos: usize) -> Option<(usize, u
             (cursor_pos, anchor)
         }
     })
+}
+
+fn selected_text(
+    buffer: &[char],
+    anchor: Option<usize>,
+    cursor_pos: usize,
+) -> Option<String> {
+    let (start, end) = selection_range(anchor, cursor_pos)?;
+    Some(buffer[start..end].iter().collect())
+}
+
+fn single_line_clipboard_text(text: &str) -> String {
+    text.replace("\r\n", " ")
+        .replace(['\r', '\n'], " ")
 }
 
 fn extend_selection(anchor: &mut Option<usize>, cursor_pos: &mut usize, destination: usize) {
@@ -762,6 +817,22 @@ mod tests {
         assert_eq!(buffer.into_iter().collect::<String>(), "echo ");
         assert_eq!(cursor, 5);
         assert_eq!(anchor, None);
+    }
+
+    #[test]
+    fn selected_text_works_in_both_selection_directions() {
+        let buffer: Vec<char> = "echo hello".chars().collect();
+        assert_eq!(selected_text(&buffer, Some(5), 10).as_deref(), Some("hello"));
+        assert_eq!(selected_text(&buffer, Some(10), 5).as_deref(), Some("hello"));
+        assert_eq!(selected_text(&buffer, Some(5), 5), None);
+    }
+
+    #[test]
+    fn pasted_multiline_text_stays_on_one_editable_command_line() {
+        assert_eq!(
+            single_line_clipboard_text("one\r\ntwo\nthree\rfour"),
+            "one two three four"
+        );
     }
 
     #[test]

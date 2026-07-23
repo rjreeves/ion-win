@@ -49,7 +49,7 @@ end
 - **Expansion**: `$name`/`@name`/`${name}`/`@{name}`, `$((arithmetic))`, `$(cmd)`/`@(cmd)` process expansion, string/array methods, grapheme-aware length/slicing, brace ranges and permutation lists (`{1..10}`, `{ext1,ext2}`, nesting)
 - **Control flow**: `if`/`else if`/`else`, `while`, `for`/`in`, `match`/`case` with guards, `break`/`continue`, `and`/`or`/`&&`/`||`
 - **Process execution**: pipelines (`|` `^|` `&|`), redirection (`>` `>>` `^>` `&>`), background/disown (`&` `&!`), `jobs`/`wait`/`disown`
-- **Shell UX**: a real interactive line editor (live history shared safely across windows, Tab-completion, word-editing shortcuts, Shift+Arrow text selection, syntax highlighting), implicit `cd`, persistent `pvar`/`dmark` state, a custom `PROMPT` function, `Ctrl+C` that interrupts the running command without killing the shell
+- **Shell UX**: a real interactive line editor (live history shared safely across windows, Tab-completion, word-editing shortcuts, Shift+Arrow text selection, Windows clipboard copy/cut/paste, syntax highlighting), implicit `cd`, persistent `pvar`/`dmark` state, a custom `PROMPT` function, `Ctrl+C` that interrupts the running command without killing the shell
 - **Discoverable help**: categorized `help`, focused `help COMMAND` pages for every builtin, and concept guides such as `help tables`, `help methods`, and `help history`
 - **Windows conveniences**: recursive `mkdir`/`md`, safe `move`/`mv` (including table manifests), in-place `rename`/`ren`, `pushd`/`popd`, and `cls`
 - **Structured data**: table variables, JSON/CSV pipelines, `$len(table)` row counts, and `$field(row column)` scalar access during row iteration

@@ -629,3 +629,25 @@ spellings (`name:type` and `name: type`). Unit tests cover canonicalization,
 impossible dates, typed bindings, interval arithmetic, extraction/truncation,
 offset-aware equality, and differences. The compiled-binary smoke test is
 `scripts/exercise/15_native_datetime.ion`.
+
+## 37. Selection-aware Windows clipboard editing
+
+The interactive editor now connects its existing Shift+Arrow selection model
+to the native Unicode Windows clipboard. `Ctrl+C` copies when a non-empty
+selection exists; with no selection it retains its established shell meaning
+and interrupts/clears the current command. `Ctrl+X` writes the selected text
+first and deletes it only after the clipboard accepts it, so a busy or failed
+clipboard cannot silently lose input. `Ctrl+V` replaces a selection or inserts
+at the cursor.
+
+Clipboard text uses `CF_UNICODETEXT`, preserving non-ASCII command text through
+UTF-16 conversion. Pasted CR/LF sequences become spaces because this editor
+edits one command line at a time; raw embedded line breaks would repaint
+incorrectly and could blur the boundary between editing and command execution.
+Clipboard errors ring the terminal bell and leave selected input intact.
+
+Pure editor tests cover selection extraction in both directions and safe
+single-line paste normalization. The full suite contains 235 passing tests.
+The native clipboard calls compile into both debug and release configurations;
+interactive key delivery still requires a real Windows Terminal rather than
+the test runner's non-TTY stdin.
