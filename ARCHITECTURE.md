@@ -527,3 +527,15 @@ The old `@graphemes()` implementation was only an alias for `@chars()`, and stri
 The `unicode-segmentation` crate now supplies extended grapheme cluster boundaries. `@graphemes()` returns those clusters; `$len(string)`, string `find` positions, scalar `reverse`, `split_at`, and `[...]` indexing/slicing use the same user-facing units. `@chars()` intentionally continues to expose scalar values, while `@bytes()` and `$len_bytes()` retain byte semantics, so every abstraction level remains available explicitly.
 
 Tests use `e\u{301}👩‍💻`: it has two graphemes, multiple scalar values, and fourteen UTF-8 bytes. They verify counting, search position, reversal, splitting, grapheme enumeration, and forward/reverse slicing without separating the accent or emoji sequence. `scripts/exercise/12_language_fidelity.ion` confirms the same behavior through the compiled executable.
+
+## 32. Safe `delete`: Recycle Bin by default, forced permanent mode
+
+`delete` completes the manifest-driven file-operation family begun by `copy` (§24) and `compress` (§25), with two forms: `delete [FLAGS] PATH...` and `TABLE | delete [FLAGS]`, where the table form reads the same `path` column produced by `stat`. Explicit paths win when supplied in a pipeline. A table is not forwarded after deletion because it would describe paths that no longer exist.
+
+**The product safety decision is encoded in the syntax.** Plain `delete` sends items to the Windows Recycle Bin. Irreversible deletion is rejected unless both `--permanent` and `--force` are present; neither flag alone can trigger it. A directory, in either mode, is rejected unless `--recurse`/`-r` is also present. Filesystem roots, the current directory, and any ancestor of the current directory are refused even in forced permanent mode.
+
+The recycle backend uses Windows `IFileOperation` with `FOFX_RECYCLEONDELETE`, not the older `SHFileOperation`/`FOF_ALLOWUNDO` path whose undo behavior is only best-effort. User paths are normalized to native backslashes before Shell namespace parsing—caught by the real-binary test, where a mixed-separator absolute path initially caused `0x80070057` rather than recycling. Each item is performed and tallied individually, so the final summary accurately reports recycled/deleted, skipped, and failed counts.
+
+Permanent directory removal is an explicit recursive walk rather than `remove_dir_all`. Every child is inspected with `symlink_metadata`; symlinks and Windows reparse points (including junctions) are removed as links and are never traversed into. This was verified independently with a real Windows junction inside the deleted tree pointing to an external directory: the tree and junction disappeared, while the target file remained intact.
+
+Five unit tests cover flag gating, unknown options, permanent file deletion, directory recursion refusal/success, missing/table-row skip accounting, and broad-target refusal. `scripts/exercise/13_delete_safety.ion` runs through the compiled executable and verifies Recycle Bin default, rejection of unforced permanent mode, forced file deletion, table deletion, and directory recursion gating. All 210 tests pass.

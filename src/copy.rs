@@ -1,7 +1,7 @@
 //! `copy`/`cp` (`ARCHITECTURE.md` §24): the first of ion-win's
 //! file-operation builtins that act on a manifest — copying is the
-//! deliberately-chosen starting point, since (unlike a future delete) it
-//! can't destroy the source. Works two ways: a plain multi-file copy
+//! deliberately-chosen starting point, since (unlike the later `delete`
+//! builtin) it can't destroy the source. Works two ways: a plain multi-file copy
 //! (matching real `cp`/PowerShell's `Copy-Item`), and as a pipeline stage
 //! consuming a `Table`'s `path` column directly — the same column name
 //! `stat` (§21) already produces — so `manifest | where size -lt 1000000

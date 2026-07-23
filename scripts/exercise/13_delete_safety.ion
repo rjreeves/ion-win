@@ -1,0 +1,11 @@
+# Exercises Recycle Bin default, forced permanent deletion, directory
+# recursion gating, and table-driven deletion. The runner must create the
+# target/delete-smoke inputs before invoking this script.
+echo CASE 13 delete safety
+delete target/delete-smoke/recycle.txt
+delete --permanent target/delete-smoke/must-survive.txt
+delete --permanent --force target/delete-smoke/permanent.txt
+let manifest = find target/delete-smoke/table --recurse | stat
+manifest | delete --permanent --force
+delete --permanent --force target/delete-smoke/tree
+delete --recurse --permanent --force target/delete-smoke/tree

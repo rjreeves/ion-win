@@ -60,6 +60,11 @@ enum Kind {
     /// `SRC... DEST.zip` (explicit files) or just `DEST.zip` (sources
     /// come from the incoming `Table`'s `path` column instead).
     Compress(Vec<String>),
+    /// `delete [--recurse] [--permanent --force] [PATH...]`. With
+    /// explicit paths it ignores pipeline input; with no paths it consumes
+    /// the incoming table's `path` column. Unlike copy/compress, it does
+    /// not forward a now-stale manifest after deletion.
+    Delete(Vec<String>),
     External(Vec<String>),
     /// Structured-data pipeline stages (`ARCHITECTURE.md` §17) — an
     /// in-process object bridge, since external processes only ever see
@@ -448,6 +453,46 @@ async fn run_impl(
                     Some(t) => Carry::Table(t),
                     None => Carry::None,
                 };
+            }
+            Kind::Delete(delete_args) => {
+                let (options, positional) = match crate::delete::parse_flags(delete_args) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        drop(incoming);
+                        err_println!("ion-win: {e}");
+                        unregister_spawned!();
+                        return false;
+                    }
+                };
+
+                let mut text = if !positional.is_empty() {
+                    drop(incoming);
+                    crate::delete::delete_paths(&positional, options).await
+                } else {
+                    match incoming {
+                        Carry::Table(t) => crate::delete::delete_table(&t, options).await,
+                        Carry::None => {
+                            err_println!(
+                                "ion-win: delete: no paths given and no table piped in"
+                            );
+                            unregister_spawned!();
+                            return false;
+                        }
+                        _ => {
+                            err_println!("ion-win: delete: expected a table");
+                            unregister_spawned!();
+                            return false;
+                        }
+                    }
+                };
+
+                text.push('\n');
+                if let Some(mut f) = stdout_file {
+                    let _ = f.write_all(text.as_bytes());
+                } else {
+                    print!("{text}");
+                }
+                carry = Carry::None;
             }
             Kind::External(args) => {
                 let mut command = jobctl::new_command(&args[0]);
@@ -866,6 +911,8 @@ fn classify_stages(pipeline: &Pipeline, interp: &Interpreter) -> Vec<Kind> {
                 Kind::Copy(args[1..].to_vec())
             } else if cmd == "compress" {
                 Kind::Compress(args[1..].to_vec())
+            } else if cmd == "delete" {
+                Kind::Delete(args[1..].to_vec())
             } else if cmd == "from-json" {
                 Kind::FromJson
             } else if cmd == "to-json" {

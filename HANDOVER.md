@@ -7,7 +7,7 @@ Native Windows port of the [Ion shell](docs/ion-manual.pdf) (originally built fo
 ```
 cd ion-win
 cargo build              # debug build
-cargo test                # 205 tests, all passing
+cargo test                # 210 tests, all passing
 cargo run                 # interactive REPL
 cargo run -- script.ion arg1 arg2   # run a script file
 ```
@@ -37,6 +37,7 @@ A working, reasonably faithful interpreter for Ion's language (variables, contro
 | `stat.rs` | 217 | `stat FILE... [--hash sha256]`: file metadata into a `Table`, hashing parallelized across files via `tokio::task::spawn_blocking` |
 | `copy.rs` | 440 | `copy`/`cp [--force] SRC... DEST`, and the `Table`-consuming `TABLE \| copy DEST` form: the first file-operation builtin acting on a manifest, copying every file concurrently via `spawn_blocking` |
 | `compress.rs` | 456 | `compress [--force] SRC... DEST.zip`, and the `Table`-consuming form: builds a standard WinZip-compatible `.zip`, compressing every file concurrently via `spawn_blocking` then splicing pre-compressed entries into the final archive with `raw_copy_file` |
+| `delete.rs` | 355 | Safe standalone/table deletion: Windows Recycle Bin by default; permanent removal only behind `--permanent --force`, directories behind `--recurse`, with root/current-directory and reparse-point guards |
 | `pipeline.rs` | 199 | Pipeline/redirect *parsing* (pure data, no execution) |
 | `jobctl.rs` | 160 | Ctrl+C interrupt plumbing: foreground-PID registry, `CTRL_BREAK_EVENT` forwarding, cooperative interrupt flag |
 | `builtin_names.rs` | 157 | Single source of truth for builtin names/keywords, feeding `help`, Tab-completion, and syntax highlighting |
@@ -90,6 +91,7 @@ A working, reasonably faithful interpreter for Ion's language (variables, contro
 - **`HISTORY_IGNORE=no_such_command`** (`ARCHITECTURE.md` §29): missing executables are now tracked separately from ordinary nonzero exits, and a simple interactive input that fails command resolution is removed from the editor's accumulated history before persistence. The same signal is set for missing pipeline stages. The rule is read from the live `HISTORY_IGNORE` array, so users can enable or disable it during the session. Verified with unit tests and a real interactive executable session whose history file kept `echo kept`/`exit` but omitted the nonexistent command.
 - **Quoted-array fidelity through nested and adjacent contexts** (`ARCHITECTURE.md` §30): double-quoted arrays continue to coerce to one space-joined string inside nested method arguments, and quoted segments concatenated to an unquoted prefix/suffix now remain one shell word without retaining literal quote marks. Trailing variable names are rewritten internally to Ion's braced disambiguation form (`"@arr"tail` → `@{arr}tail`) so the suffix cannot be swallowed into the variable name. Verified by focused tests and the compiled `scripts/exercise/12_language_fidelity.ion` smoke script.
 - **Real Unicode grapheme handling** (`ARCHITECTURE.md` §31): added `unicode-segmentation`; `@graphemes()` now returns extended grapheme clusters rather than aliasing `@chars()`, and user-facing string `$len`, `find` positions, `reverse`, `split_at`, and string indexing/slicing use the same boundaries. `@chars()` deliberately remains Unicode-scalar based and `@bytes()` remains UTF-8-byte based. Combining-mark text and a ZWJ emoji sequence are covered by unit and real-binary tests.
+- **Safe `delete` builtin** (`ARCHITECTURE.md` §32): `delete PATH...` and `TABLE | delete` now complete the manifest-operation family. Default deletion uses Windows `IFileOperation` with recycle-only semantics; permanent deletion requires the exact `--permanent --force` pair. Directories additionally require `--recurse`. Batch output always reports deleted/recycled, skipped, and failed counts; missing paths and table rows without `path` are skipped with warnings. Permanent recursion removes symlinks/junctions themselves without traversing their targets and refuses filesystem roots, the current directory, or its ancestors. Verified by five unit tests, the compiled `scripts/exercise/13_delete_safety.ion`, and an independent real-junction test whose external target survived.
 
 ## Known gaps (deliberately not built — not oversights)
 
@@ -111,12 +113,11 @@ Every feature in this codebase was verified two ways, and both matter:
 
 ## Suggested next steps
 
-Nothing is mid-implementation or broken right now — all 205 tests pass. Pick up from here:
+Nothing is mid-implementation or broken right now — all 210 tests pass. Pick up from here:
 
-1. **`delete`, the third manifest-driven file-operation builtin** — `copy` (§24) and `compress` (§25) were explicitly framed as the first two of a small planned family ("copy, then compress, then possibly delete"); `delete` was never started. Unlike copy/compress it's destructive and irreversible, so if picked up: mirror `copy`/`compress`'s two-forms-by-positional-count shape and choose deliberately between a Recycle Bin default and permanent deletion gated behind `--force`.
-2. Everything in "Known gaps" above, roughly in the listed order, none of which are currently blocking anything.
+1. Everything in "Known gaps" above, roughly in the listed order, none of which are currently blocking anything.
 
-Whatever's picked up, follow this session's established rhythm: real-binary smoke test (not just `cargo test`) before claiming anything works, update `ARCHITECTURE.md` with a new numbered section (currently ends at §31) and add an "Implemented, verified" bullet here in `HANDOVER.md`, and don't commit/push without being asked.
+Whatever's picked up, follow this session's established rhythm: real-binary smoke test (not just `cargo test`) before claiming anything works, update `ARCHITECTURE.md` with a new numbered section (currently ends at §32) and add an "Implemented, verified" bullet here in `HANDOVER.md`, and don't commit/push without being asked.
 
 ## A note on the interactive line editor
 

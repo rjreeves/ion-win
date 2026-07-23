@@ -1034,6 +1034,7 @@ async fn dispatch(line: &str, interp: &mut Interpreter, state: &StateHandle) -> 
                 "cat" => handle_cat(&args),
                 "copy" | "cp" => handle_copy(&args).await,
                 "compress" => handle_compress(&args).await,
+                "delete" => handle_delete(&args).await,
                 "stat" => handle_stat(&args).await,
                 "pvar" => handle_pvar(&args, state).await,
                 "dmark" => handle_dmark(&args, state).await,
@@ -1173,6 +1174,15 @@ async fn handle_copy(args: &[String]) {
 /// `pipeline_exec.rs`'s `Kind::Compress`.
 async fn handle_compress(args: &[String]) {
     match crate::compress::parse_and_compress_files(args).await {
+        Ok(summary) => println!("{summary}"),
+        Err(e) => err_println!("ion-win: {e}"),
+    }
+}
+
+/// `delete PATH...` used standalone. Recycle Bin is the default;
+/// irreversible removal is accepted only as `--permanent --force`.
+async fn handle_delete(args: &[String]) {
+    match crate::delete::parse_and_delete_files(args).await {
         Ok(summary) => println!("{summary}"),
         Err(e) => err_println!("ion-win: {e}"),
     }

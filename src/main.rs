@@ -4,6 +4,7 @@ mod builtins;
 mod colorout;
 mod compress;
 mod copy;
+mod delete;
 mod editor;
 mod fs_builtins;
 mod functions;
