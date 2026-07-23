@@ -958,7 +958,17 @@ async fn dispatch(line: &str, interp: &mut Interpreter, state: &StateHandle) -> 
         "break" => return Flow::Break,
         "continue" => return Flow::LoopContinue,
 
-        "help" => println!("{}", builtin_names::help_text()),
+        "help" => {
+            let args = interp.expand_all(raw_args);
+            if args.len() > 1 {
+                err_println!("ion-win: help: usage: help [TOPIC]");
+            } else {
+                match builtin_names::help_text(args.first().map(String::as_str)) {
+                    Ok(text) => println!("{text}"),
+                    Err(error) => err_println!("ion-win: {error}"),
+                }
+            }
+        }
 
         // Not part of upstream Ion — an ion-win-specific runtime toggle for
         // the interactive line editor's live syntax highlighting, since

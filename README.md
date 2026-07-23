@@ -50,6 +50,7 @@ end
 - **Control flow**: `if`/`else if`/`else`, `while`, `for`/`in`, `match`/`case` with guards, `break`/`continue`, `and`/`or`/`&&`/`||`
 - **Process execution**: pipelines (`|` `^|` `&|`), redirection (`>` `>>` `^>` `&>`), background/disown (`&` `&!`), `jobs`/`wait`/`disown`
 - **Shell UX**: a real interactive line editor (live history shared safely across windows, Tab-completion, word-editing shortcuts, Shift+Arrow text selection, syntax highlighting), implicit `cd`, persistent `pvar`/`dmark` state, a custom `PROMPT` function, `Ctrl+C` that interrupts the running command without killing the shell
+- **Discoverable help**: categorized `help`, focused `help COMMAND` pages for every builtin, and concept guides such as `help tables`, `help methods`, and `help history`
 - **Structured data**: table variables, JSON/CSV pipelines, `$len(table)` row counts, and `$field(row column)` scalar access during row iteration
 - **Manifest operations**: `copy`, ZIP `compress`, and safe `delete` (Recycle Bin by default; permanent only with `--permanent --force`)
 - **Conditionals/builtins**: `test`, `matches`, `contains`/`starts-with`/`ends-with`, `eq`/`is`, `exists`, `which`/`type`, `eval`, and more

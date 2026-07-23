@@ -528,7 +528,7 @@ so `no_such_command` continues to omit failed simple commands.
 
 Verified with unit tests for live rule detection and exact editor removal, the full suite, and a real piped interactive session against the compiled executable. With the default rules, `echo kept`, a deliberately nonexistent command, and `exit` produced a persisted history containing exactly `echo kept` and `exit`.
 
-## 30. Quoted-array fidelity in nested and adjacent word contexts
+## 31. Quoted-array fidelity in nested and adjacent word contexts
 
 Nested method arguments already re-tokenized their inner text, but this behavior was not protected by focused tests. Those tests now establish that `$len("@arr")` sees the quoted array as one joined string and `@reverse("@arr")` receives one scalar-coerced element rather than two array elements.
 
@@ -536,7 +536,7 @@ The real mismatch was adjacent quote concatenation. `prefix"@arr"suffix` was pre
 
 Focused tests cover both prefix/suffix directions and nested method arguments. The compiled smoke script prints `adjacent prefixone twosuffix`, confirming one coerced word with no literal quote leakage.
 
-## 31. Unicode grapheme-aware string operations
+## 32. Unicode grapheme-aware string operations
 
 The old `@graphemes()` implementation was only an alias for `@chars()`, and string length/slicing counted Unicode scalar values. That splits user-perceived characters such as `e` plus a combining acute accent and multi-code-point emoji joined with ZWJ.
 
@@ -544,7 +544,7 @@ The `unicode-segmentation` crate now supplies extended grapheme cluster boundari
 
 Tests use `e\u{301}👩‍💻`: it has two graphemes, multiple scalar values, and fourteen UTF-8 bytes. They verify counting, search position, reversal, splitting, grapheme enumeration, and forward/reverse slicing without separating the accent or emoji sequence. `scripts/exercise/12_language_fidelity.ion` confirms the same behavior through the compiled executable.
 
-## 32. Safe `delete`: Recycle Bin by default, forced permanent mode
+## 33. Safe `delete`: Recycle Bin by default, forced permanent mode
 
 `delete` completes the manifest-driven file-operation family begun by `copy` (§24) and `compress` (§25), with two forms: `delete [FLAGS] PATH...` and `TABLE | delete [FLAGS]`, where the table form reads the same `path` column produced by `stat`. Explicit paths win when supplied in a pipeline. A table is not forwarded after deletion because it would describe paths that no longer exist.
 
@@ -554,4 +554,12 @@ The recycle backend uses Windows `IFileOperation` with `FOFX_RECYCLEONDELETE`, n
 
 Permanent directory removal is an explicit recursive walk rather than `remove_dir_all`. Every child is inspected with `symlink_metadata`; symlinks and Windows reparse points (including junctions) are removed as links and are never traversed into. This was verified independently with a real Windows junction inside the deleted tree pointing to an external directory: the tree and junction disappeared, while the target file remained intact.
 
-Five unit tests cover flag gating, unknown options, permanent file deletion, directory recursion refusal/success, missing/table-row skip accounting, and broad-target refusal. `scripts/exercise/13_delete_safety.ion` runs through the compiled executable and verifies Recycle Bin default, rejection of unforced permanent mode, forced file deletion, table deletion, and directory recursion gating. All 210 tests pass.
+Five unit tests cover flag gating, unknown options, permanent file deletion, directory recursion refusal/success, missing/table-row skip accounting, and broad-target refusal. `scripts/exercise/13_delete_safety.ion` runs through the compiled executable and verifies Recycle Bin default, rejection of unforced permanent mode, forced file deletion, table deletion, and directory recursion gating.
+
+## 34. Discoverable, topic-based `help`
+
+The original `help` output was one comma-separated builtin list followed by several dense syntax lines, and it ignored every argument. It was technically complete but poor at answering practical questions such as “how do I safely delete a directory?” or “how do table pipelines work?”
+
+Bare `help` is now a short categorized landing page. `help COMMAND` provides usage, purpose, examples, aliases, and relevant safety notes for every registered builtin; `help syntax`, `help tables`, `help methods`, and `help history` cover concepts larger than one command. `help all` provides the complete registry-derived index. Unknown topics point back to the overview and index instead of silently printing the same generic text.
+
+The help tests enforce that every name in `BUILTINS` resolves to a focused page, aliases share their canonical content, safety-critical delete guidance is present, and the overview remains categorized. A release-binary smoke test verified the overview plus the `delete` and `tables` pages through the real shell. The full suite now contains 219 passing tests.
