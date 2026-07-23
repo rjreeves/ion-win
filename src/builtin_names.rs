@@ -534,11 +534,13 @@ pub fn help_text(topic: Option<&str>) -> Result<String, String> {
                 "echo $date_trunc('day' $started)",
                 "echo $date_compare($started $now())",
                 "echo $date_format($started '%Y-%m-%d %H:%M')",
+                "echo $date_format($started dd-MMM-yy)",
             ],
             &[
                 "Types: date, time, datetime (alias timestamp), duration (alias interval).",
                 "Durations such as `2 days 3 hours` normalize to ISO seconds such as `PT183600S`.",
                 "Offset datetimes preserve their numeric offset; comparisons use the actual instant.",
+                "`dd-MMM-yy` is a friendly pattern for output such as `23-Jul-26`; strftime `%` patterns remain available.",
                 "Named timezone and DST conversion is not yet supported.",
             ],
         ),

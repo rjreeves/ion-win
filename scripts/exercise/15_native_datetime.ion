@@ -13,3 +13,4 @@ echo "added=$date_add($stamp $span)"
 echo "difference=$date_diff(2026-07-05 2026-07-03)"
 echo "same-instant=$date_compare(2026-07-03T10:00:00+10:00 2026-07-03T00:00:00Z)"
 echo $date_format($stamp "%d/%m/%Y %H:%M")
+echo "friendly=$date_format($stamp dd-MMM-yy)"

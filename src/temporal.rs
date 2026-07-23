@@ -169,6 +169,10 @@ fn shift(value: &str, amount: Duration) -> Result<String, String> {
 }
 
 pub fn format(value: &str, pattern: &str) -> Result<String, String> {
+    let pattern = match pattern {
+        "dd-MMM-yy" => "%d-%b-%y",
+        pattern => pattern,
+    };
     if let Ok(value) = NaiveDate::parse_from_str(value, "%Y-%m-%d") {
         return Ok(value.format(pattern).to_string());
     }
@@ -370,5 +374,10 @@ mod tests {
             "0"
         );
         assert_eq!(difference("2026-07-05", "2026-07-03").unwrap(), "PT172800S");
+    }
+
+    #[test]
+    fn friendly_day_month_year_format_is_supported() {
+        assert_eq!(format("2026-07-23", "dd-MMM-yy").unwrap(), "23-Jul-26");
     }
 }
