@@ -1,0 +1,7 @@
+# Exercises scalar access to structured tables without flattening the table.
+echo CASE 11 table accessors
+let manifest = echo '[{"name":"alpha.txt","size":10},{"name":"beta.txt","size":20}]' | from-json
+echo rows=$len(manifest)
+for row in manifest
+    echo $field(row name) $field(row size)
+end

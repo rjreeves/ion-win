@@ -499,6 +499,37 @@ impl Interpreter {
     /// Invokes a `$name(...)` string method with its raw (unresolved)
     /// argument text.
     fn call_string_method_here(&self, name: &str, inner: &str) -> Result<String, String> {
+        let tokens = Self::tokenize(inner);
+
+        // Structured `Table`s deliberately do not participate in ordinary
+        // string/array coercion (ARCHITECTURE.md §18). Keep the bridge
+        // narrow and explicit: `$len(table)` counts rows, while
+        // `$field(one_row_table column)` extracts one scalar field. Both
+        // require a bare table-variable name so quoted text and normal
+        // scalar/array method calls retain their existing meaning.
+        if name == "len" && tokens.len() == 1 && tokens[0].quoting == Quoting::None {
+            if let Some(table) = self.get_table(&tokens[0].text) {
+                return Ok(table.rows.len().to_string());
+            }
+        }
+
+        if name == "field" && tokens.len() == 2 && tokens[0].quoting == Quoting::None {
+            if let Some(table) = self.get_table(&tokens[0].text) {
+                if table.rows.len() != 1 {
+                    return Err(format!(
+                        "field: expected exactly one row in '{}', found {}",
+                        tokens[0].text,
+                        table.rows.len()
+                    ));
+                }
+                let column = self.resolve_method_arg(&tokens[1]).as_str();
+                return table.rows[0]
+                    .iter()
+                    .find_map(|(name, value)| (name == &column).then(|| value.clone()))
+                    .ok_or_else(|| format!("field: column '{column}' does not exist"));
+            }
+        }
+
         let args = self.resolve_method_args(inner);
         crate::methods::call_string_method(name, &args)
             .unwrap_or_else(|| Err(format!("no such string method '{name}'")))
@@ -1552,6 +1583,79 @@ mod tests {
         assert_eq!(
             interp.expand_all(&["@reverse([1 2 3])".into()]),
             vec!["3".to_string(), "2".to_string(), "1".to_string()]
+        );
+    }
+
+    #[test]
+    fn table_len_returns_row_count_without_text_coercion() {
+        let mut interp = Interpreter::new();
+        interp.set_table(
+            "manifest".to_string(),
+            crate::table::Table {
+                rows: vec![
+                    vec![("path".to_string(), "one.txt".to_string())],
+                    vec![("path".to_string(), "two.txt".to_string())],
+                    vec![("path".to_string(), "three.txt".to_string())],
+                ],
+            },
+        );
+
+        assert_eq!(
+            interp.expand_all(&["$len(manifest)".into()]),
+            vec!["3".to_string()]
+        );
+    }
+
+    #[test]
+    fn field_extracts_a_scalar_from_exactly_one_table_row() {
+        let mut interp = Interpreter::new();
+        interp.set_table(
+            "row".to_string(),
+            crate::table::Table {
+                rows: vec![vec![
+                    ("path".to_string(), "notes.txt".to_string()),
+                    ("size".to_string(), "42".to_string()),
+                ]],
+            },
+        );
+
+        assert_eq!(
+            interp.expand_all(&["$field(row path)".into()]),
+            vec!["notes.txt".to_string()]
+        );
+        interp.set_scalar("column".to_string(), "size".to_string());
+        assert_eq!(
+            interp.expand_all(&["$field(row column)".into()]),
+            vec!["42".to_string()]
+        );
+    }
+
+    #[test]
+    fn table_accessors_reject_ambiguous_or_missing_fields() {
+        let mut interp = Interpreter::new();
+        interp.set_table(
+            "many".to_string(),
+            crate::table::Table {
+                rows: vec![
+                    vec![("path".to_string(), "one.txt".to_string())],
+                    vec![("path".to_string(), "two.txt".to_string())],
+                ],
+            },
+        );
+        interp.set_table(
+            "one".to_string(),
+            crate::table::Table {
+                rows: vec![vec![("path".to_string(), "one.txt".to_string())]],
+            },
+        );
+
+        assert_eq!(
+            interp.call_string_method_here("field", "many path"),
+            Err("field: expected exactly one row in 'many', found 2".to_string())
+        );
+        assert_eq!(
+            interp.call_string_method_here("field", "one missing"),
+            Err("field: column 'missing' does not exist".to_string())
         );
     }
 

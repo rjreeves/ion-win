@@ -50,6 +50,7 @@ end
 - **Control flow**: `if`/`else if`/`else`, `while`, `for`/`in`, `match`/`case` with guards, `break`/`continue`, `and`/`or`/`&&`/`||`
 - **Process execution**: pipelines (`|` `^|` `&|`), redirection (`>` `>>` `^>` `&>`), background/disown (`&` `&!`), `jobs`/`wait`/`disown`
 - **Shell UX**: a real interactive line editor (history, Tab-completion, word-editing shortcuts, live syntax highlighting), implicit `cd`, persistent `pvar`/`dmark` state, a custom `PROMPT` function, `Ctrl+C` that interrupts the running command without killing the shell
+- **Structured data**: table variables, JSON/CSV pipelines, `$len(table)` row counts, and `$field(row column)` scalar access during row iteration
 - **Conditionals/builtins**: `test`, `matches`, `contains`/`starts-with`/`ends-with`, `eq`/`is`, `exists`, `which`/`type`, `eval`, and more
 
 See [HANDOVER.md](HANDOVER.md) for the full, current list of what's implemented and verified, and what's deliberately not (e.g. `fg`/`bg` and Vi keybindings have no clean fit on Windows / are out of scope by choice, not oversight).
