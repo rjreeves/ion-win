@@ -53,6 +53,7 @@ end
 - **Discoverable help**: categorized `help`, focused `help COMMAND` pages for every builtin, and concept guides such as `help tables`, `help methods`, and `help history`
 - **Windows conveniences**: recursive `mkdir`/`md`, safe `move`/`mv` (including table manifests), in-place `rename`/`ren`, `pushd`/`popd`, and `cls`
 - **Structured data**: table variables, JSON/CSV pipelines, `$len(table)` row counts, and `$field(row column)` scalar access during row iteration
+- **Native date/time**: validated `date`, `time`, `datetime`, and `duration` types; ISO constructors, local current values, extraction/truncation, arithmetic, instant-aware comparison, difference, and formatting
 - **Manifest operations**: `copy`, ZIP `compress`, and safe `delete` (Recycle Bin by default; permanent only with `--permanent --force`)
 - **Conditionals/builtins**: `test`, `matches`, `contains`/`starts-with`/`ends-with`, `eq`/`is`, `exists`, `which`/`type`, `eval`, and more
 

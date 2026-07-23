@@ -11,6 +11,7 @@ crossterm = "0.27"
 ctrlc = "3"
 regex = "1"
 unicode-segmentation = "1.12"
+chrono = { version = "0.4", features = ["clock"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
 zip = { version = "8", default-features = false, features = ["deflate", "time"] }

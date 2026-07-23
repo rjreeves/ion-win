@@ -76,8 +76,43 @@ pub fn call_string_method(name: &str, args: &[MethodArg]) -> Option<Result<Strin
         "escape" => escape(args),
         "unescape" => unescape(args),
         "or" => or(args),
+        "date" => temporal_unary(args, crate::temporal::date),
+        "time" => temporal_unary(args, crate::temporal::time),
+        "datetime" | "timestamp" => temporal_unary(args, crate::temporal::datetime),
+        "duration" | "interval" => temporal_unary(args, crate::temporal::duration),
+        "now" => no_arg(args, "now", crate::temporal::now),
+        "today" => no_arg(args, "today", crate::temporal::today),
+        "extract" => temporal_binary(args, crate::temporal::extract),
+        "date_trunc" => temporal_binary(args, crate::temporal::truncate),
+        "date_add" => temporal_binary(args, crate::temporal::add),
+        "date_sub" => temporal_binary(args, crate::temporal::subtract),
+        "date_format" => temporal_binary(args, crate::temporal::format),
+        "date_compare" => temporal_binary(args, crate::temporal::compare),
+        "date_diff" => temporal_binary(args, crate::temporal::difference),
         _ => return None,
     })
+}
+
+fn temporal_unary(
+    args: &[MethodArg],
+    operation: fn(&str) -> Result<String, String>,
+) -> Result<String, String> {
+    operation(&arg_str(args, 0)?)
+}
+
+fn temporal_binary(
+    args: &[MethodArg],
+    operation: fn(&str, &str) -> Result<String, String>,
+) -> Result<String, String> {
+    operation(&arg_str(args, 0)?, &arg_str(args, 1)?)
+}
+
+fn no_arg(args: &[MethodArg], name: &str, operation: fn() -> String) -> Result<String, String> {
+    if args.is_empty() {
+        Ok(operation())
+    } else {
+        Err(format!("{name}: takes no arguments"))
+    }
 }
 
 /// Dispatches an array method (`@name(...)`) by name. `None` means `name`

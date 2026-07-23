@@ -596,3 +596,36 @@ same-target data-loss prevention, directory moves, table layout, and rename rest
 features in a temporary working directory, including table-driven move and
 the real terminal clear sequence. The full suite now contains 226 passing
 tests.
+
+## 36. Native date/time values and PostgreSQL-inspired operations
+
+Temporal support extends Ion's existing typed-scalar model instead of adding a
+display-only command or a second general-purpose value runtime. `date`, `time`,
+`datetime`/`timestamp`, and `duration`/`interval` are accepted anywhere a
+`TypeTag` is used, including typed `let` bindings and function parameters.
+Validation normalizes them to shell-friendly ISO text: `YYYY-MM-DD`,
+`HH:MM:SS`, ISO 8601 datetimes (with an optional numeric offset), and
+`PT<n>S` durations. This preserves ordinary `$variable` expansion, pipelines,
+tables, child-process arguments, and serialization without implicit locale
+formatting.
+
+The scalar method family provides `$today()` and `$now()`; `$date`, `$time`,
+`$datetime`, and `$duration` constructors; `$extract` and `$date_trunc`;
+`$date_add`/`$date_sub`; `$date_compare`/`$date_diff`; and `$date_format`.
+Durations accept PostgreSQL-like readable unit pairs such as
+`"2 days 3 hours"` while deliberately excluding calendar-relative months and
+years from this first slice: their length depends on the starting date, unlike
+weeks through milliseconds. Offset-aware datetime comparison compares actual
+instants, so `10:00+10:00` equals `00:00Z`.
+
+Timezone behavior is intentionally explicit. `$now()` returns the host's local
+numeric UTC offset, parsed offset datetimes retain their offset through
+arithmetic, and naive datetimes remain naive. Named IANA/Windows timezone
+conversion and its daylight-saving ambiguity policy are not guessed here; that
+requires a separate design and timezone database dependency.
+
+The implementation also fixes typed `let` itself to accept both documented
+spellings (`name:type` and `name: type`). Unit tests cover canonicalization,
+impossible dates, typed bindings, interval arithmetic, extraction/truncation,
+offset-aware equality, and differences. The compiled-binary smoke test is
+`scripts/exercise/15_native_datetime.ion`.

@@ -7,6 +7,10 @@ pub enum TypeTag {
     Bool,
     Int,
     Float,
+    Date,
+    Time,
+    DateTime,
+    Duration,
 }
 
 pub fn parse_type_name(s: &str) -> Option<TypeTag> {
@@ -15,6 +19,10 @@ pub fn parse_type_name(s: &str) -> Option<TypeTag> {
         "bool" => Some(TypeTag::Bool),
         "int" => Some(TypeTag::Int),
         "float" => Some(TypeTag::Float),
+        "date" => Some(TypeTag::Date),
+        "time" => Some(TypeTag::Time),
+        "datetime" | "timestamp" => Some(TypeTag::DateTime),
+        "duration" | "interval" => Some(TypeTag::Duration),
         _ => None,
     }
 }
@@ -45,6 +53,10 @@ pub fn validate(value: &str, ty: TypeTag) -> Result<String, String> {
             .parse::<f64>()
             .map(|_| value.to_string())
             .map_err(|_| format!("expected float, found value '{value}'")),
+        TypeTag::Date => crate::temporal::date(value),
+        TypeTag::Time => crate::temporal::time(value),
+        TypeTag::DateTime => crate::temporal::datetime(value),
+        TypeTag::Duration => crate::temporal::duration(value),
     }
 }
 
@@ -64,5 +76,17 @@ mod tests {
     fn int_rejects_non_numeric() {
         assert!(validate("3", TypeTag::Int).is_ok());
         assert!(validate("a", TypeTag::Int).is_err());
+    }
+
+    #[test]
+    fn temporal_types_validate_and_normalize() {
+        assert_eq!(validate("2026-7-3", TypeTag::Date), Ok("2026-07-03".into()));
+        assert_eq!(validate("9:05", TypeTag::Time), Ok("09:05:00".into()));
+        assert_eq!(
+            validate("2026-07-03 09:05", TypeTag::DateTime),
+            Ok("2026-07-03T09:05:00".into())
+        );
+        assert_eq!(validate("1 day 2 hours", TypeTag::Duration), Ok("PT93600S".into()));
+        assert!(validate("2026-02-30", TypeTag::Date).is_err());
     }
 }

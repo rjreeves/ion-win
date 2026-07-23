@@ -22,6 +22,7 @@ mod shell;
 mod state;
 mod stat;
 mod table;
+mod temporal;
 mod types;
 
 use std::path::PathBuf;

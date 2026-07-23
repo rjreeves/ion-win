@@ -512,14 +512,35 @@ pub fn help_text(topic: Option<&str>) -> Result<String, String> {
         ),
         "methods" | "method" => page(
             "$method(value [ARG...])  |  @method(value [ARG...])",
-            "The $ form returns a scalar; the @ form returns an array. Methods include len, len_bytes, lines, chars, graphemes, split, split_at, join, find, replace, replacen, reverse, repeat, case conversion, path helpers, and escaping.",
+            "The $ form returns a scalar; the @ form returns an array. Methods include text/array operations, path helpers, escaping, and native date/time operations.",
             &[
                 "echo $len(\"hello\")",
                 "let words = @split(\"one two three\" \" \")",
                 "echo $join(@words \", \")",
                 "echo @graphemes(\"👩‍💻\")",
             ],
-            &["String indexing, slicing, length, and reversal use Unicode grapheme boundaries."],
+            &[
+                "String indexing, slicing, length, and reversal use Unicode grapheme boundaries.",
+                "Use `help datetime` for temporal constructors, arithmetic, extraction, and formatting.",
+            ],
+        ),
+        "datetime" | "date" | "time" | "temporal" => page(
+            "$date(VALUE) | $time(VALUE) | $datetime(VALUE)",
+            "Creates canonical ISO date/time values and provides current time, duration arithmetic, extraction, truncation, comparison, difference, and formatting.",
+            &[
+                "let started: datetime = $now()",
+                "let due: date = $date_add(2026-07-23 \"2 days\")",
+                "echo $extract('month' $due)",
+                "echo $date_trunc('day' $started)",
+                "echo $date_compare($started $now())",
+                "echo $date_format($started '%Y-%m-%d %H:%M')",
+            ],
+            &[
+                "Types: date, time, datetime (alias timestamp), duration (alias interval).",
+                "Durations such as `2 days 3 hours` normalize to ISO seconds such as `PT183600S`.",
+                "Offset datetimes preserve their numeric offset; comparisons use the actual instant.",
+                "Named timezone and DST conversion is not yet supported.",
+            ],
         ),
         "history" => page(
             "let HISTORY_SETTING = VALUE",
@@ -540,7 +561,7 @@ pub fn help_text(topic: Option<&str>) -> Result<String, String> {
             "let NAME[: TYPE] = VALUE",
             "Defines or updates a scalar, array, arithmetic value, function-adjacent value, or captured table pipeline.",
             &["let name = Robert", "let nums = [1 2 3]", "let total: int = 4", "let manifest = find . --recurse | stat"],
-            &["Types include str, bool, int, and float."],
+            &["Types include str, bool, int, float, date, time, datetime/timestamp, and duration/interval."],
         ),
         "export" => page("export NAME = VALUE", "Sets an Ion scalar and exports it to child-process environments.", &["export MODE = production"], &[]),
         "drop" => page("drop NAME...", "Deletes scalar, array, table, or function variables from the active scope.", &["drop temporary manifest"], &[]),

@@ -852,11 +852,32 @@ impl Interpreter {
             err_println!("ion: let: usage: let NAME = VALUE  |  let NAME = [ elements... ]  |  let NAME OP VALUE");
             return;
         };
-        if op_pos != 1 {
+        if op_pos != 1 && op_pos != 2 {
             err_println!("ion: let: multiple-name assignment not yet supported in this scaffold");
             return;
         }
-        let name = args[0].text.clone();
+        let separated_type = (op_pos == 2 && args[0].text.ends_with(':'))
+            .then(|| args[1].text.as_str());
+        let (name, declared_type) = match args[0].text.split_once(':') {
+            Some((name, "")) if !name.is_empty() => match separated_type
+                .and_then(crate::types::parse_type_name)
+            {
+                Some(tag) => (name.to_string(), Some(tag)),
+                None => {
+                    let ty = separated_type.unwrap_or("");
+                    err_println!("ion: let: unknown type '{ty}'");
+                    return;
+                }
+            },
+            Some((name, ty)) if !name.is_empty() => match crate::types::parse_type_name(ty) {
+                Some(tag) => (name.to_string(), Some(tag)),
+                None => {
+                    err_println!("ion: let: unknown type '{ty}'");
+                    return;
+                }
+            },
+            _ => (args[0].text.clone(), None),
+        };
         let op = args[op_pos].text.as_str();
         let rhs = &args[op_pos + 1..];
 
@@ -884,7 +905,18 @@ impl Interpreter {
         }
 
         let expanded = self.expand_all(rhs);
-        self.set_scalar(name, expanded.join(" "));
+        let value = expanded.join(" ");
+        let value = match declared_type {
+            Some(tag) => match crate::types::validate(&value, tag) {
+                Ok(value) => value,
+                Err(error) => {
+                    err_println!("ion: let: {error}");
+                    return;
+                }
+            },
+            None => value,
+        };
+        self.set_scalar(name, value);
     }
 
     /// `export NAME = VALUE` (ion-manual page 19): "operates identical to
@@ -2239,5 +2271,21 @@ mod tests {
 
         interp.builtin_let(&["value".into(), "/=".into(), "2".into()]);
         assert_eq!(interp.get_scalar("value").unwrap(), "32.0");
+    }
+
+    #[test]
+    fn typed_let_accepts_attached_and_separated_temporal_types() {
+        let mut interp = Interpreter::new();
+        interp.builtin_let(&["day:date".into(), "=".into(), "2026-7-3".into()]);
+        interp.builtin_let(&["at:".into(), "time".into(), "=".into(), "9:05".into()]);
+        assert_eq!(
+            interp.get_scalar("day").map(String::as_str),
+            Some("2026-07-03")
+        );
+        assert_eq!(
+            interp.get_scalar("at").map(String::as_str),
+            Some("09:05:00")
+        );
+        assert!(interp.get_scalar("day:date").is_none());
     }
 }
