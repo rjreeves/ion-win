@@ -508,6 +508,7 @@ async fn run_impl(
                 let mut child = match command.spawn() {
                     Ok(c) => c,
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        interp.mark_command_not_found();
                         err_println!("ion-win: command not found: {}", args[0]);
                         unregister_spawned!();
                         return false;

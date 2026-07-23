@@ -31,6 +31,11 @@ pub struct Interpreter {
     /// specific arms with a real failure mode (`test`, `cd`, external
     /// processes, ...) override that default with their actual result.
     previous_status: bool,
+    /// Set when any command in the current interactive input could not be
+    /// resolved. The REPL consumes this after execution to implement the
+    /// documented `HISTORY_IGNORE=no_such_command` rule without confusing
+    /// an ordinary non-zero exit status with a missing executable.
+    command_not_found: bool,
     /// When `Some`, `echo`'s output is appended here instead of going to
     /// real stdout — used to capture a `PROMPT` function's output as the
     /// prompt string rather than printing it (ion-manual page 6, "Prompt
@@ -58,6 +63,7 @@ impl Default for Interpreter {
             arrays: vec![HashMap::new()],
             functions: HashMap::new(),
             previous_status: true,
+            command_not_found: false,
             echo_capture: None,
             tables: vec![HashMap::new()],
         }
@@ -181,6 +187,39 @@ impl Interpreter {
                 } else {
                     Quoting::Single
                 };
+
+                // A double-quoted segment may be concatenated directly to
+                // an unquoted suffix (`"@arr"suffix`) and still forms one
+                // shell word. Keep consuming until the real word boundary,
+                // stripping any further double-quote delimiters while
+                // preserving their contents (including spaces).
+                if quoting == Quoting::Double {
+                    let followed_by_word = chars
+                        .peek()
+                        .copied()
+                        .map(|next| !next.is_whitespace() && operator_len(&chars).is_none())
+                        .unwrap_or(false);
+                    if followed_by_word {
+                        buf = brace_trailing_variable(&buf);
+                    }
+                    while let Some(&next) = chars.peek() {
+                        if next.is_whitespace() || operator_len(&chars).is_some() {
+                            break;
+                        }
+                        if next == '"' {
+                            chars.next();
+                            for ch in chars.by_ref() {
+                                if ch == '"' {
+                                    break;
+                                }
+                                buf.push(ch);
+                            }
+                        } else {
+                            buf.push(next);
+                            chars.next();
+                        }
+                    }
+                }
                 tokens.push(Token { text: buf, quoting });
                 continue;
             }
@@ -335,16 +374,42 @@ impl Interpreter {
             }
 
             let mut buf = String::new();
+            let mut has_double_quoted_segment = false;
             while let Some(&ch) = chars.peek() {
                 if ch.is_whitespace() || operator_len(&chars).is_some() {
                     break;
+                }
+                if ch == '"' {
+                    has_double_quoted_segment = true;
+                    chars.next();
+                    let mut quoted_segment = String::new();
+                    for quoted_ch in chars.by_ref() {
+                        if quoted_ch == '"' {
+                            break;
+                        }
+                        quoted_segment.push(quoted_ch);
+                    }
+                    let followed_by_word = chars
+                        .peek()
+                        .copied()
+                        .map(|next| !next.is_whitespace() && operator_len(&chars).is_none())
+                        .unwrap_or(false);
+                    if followed_by_word {
+                        quoted_segment = brace_trailing_variable(&quoted_segment);
+                    }
+                    buf.push_str(&quoted_segment);
+                    continue;
                 }
                 buf.push(ch);
                 chars.next();
             }
             tokens.push(Token {
                 text: buf,
-                quoting: Quoting::None,
+                quoting: if has_double_quoted_segment {
+                    Quoting::Double
+                } else {
+                    Quoting::None
+                },
             });
         }
 
@@ -952,6 +1017,18 @@ impl Interpreter {
         self.previous_status = ok;
     }
 
+    pub fn clear_command_not_found(&mut self) {
+        self.command_not_found = false;
+    }
+
+    pub fn mark_command_not_found(&mut self) {
+        self.command_not_found = true;
+    }
+
+    pub fn command_not_found(&self) -> bool {
+        self.command_not_found
+    }
+
     /// Starts capturing `echo`'s output instead of printing it (ion-manual
     /// page 6's `PROMPT` function). Any capture already in progress is
     /// discarded — capture sessions don't nest.
@@ -1146,6 +1223,25 @@ fn operator_len(chars: &std::iter::Peekable<std::str::Chars>) -> Option<usize> {
     })
 }
 
+/// When a quoted segment ending in `$name`/`@name` is concatenated to an
+/// unquoted suffix, add Ion's normal disambiguation braces so the suffix
+/// cannot be swallowed into the variable name (`"@arr"tail` ->
+/// `@{arr}tail`).
+fn brace_trailing_variable(segment: &str) -> String {
+    let Some((start, sigil)) = segment
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| *ch == '$' || *ch == '@')
+    else {
+        return segment.to_string();
+    };
+    let name = &segment[start + sigil.len_utf8()..];
+    if name.is_empty() || !name.chars().all(|ch| ch.is_alphanumeric() || ch == '_') {
+        return segment.to_string();
+    }
+    format!("{}{}{{{name}}}", &segment[..start], sigil)
+}
+
 /// If the upcoming text (starting exactly at `sigil`, which `chars` should
 /// currently be positioned at) matches `sigil` + an identifier + `(` — a
 /// method call like `$len(` or `@split(`, ion-manual page 32 — consumes
@@ -1249,7 +1345,7 @@ fn apply_optional_array_slice(items: Vec<String>, slice_spec: Option<&str>) -> V
     }
 }
 
-/// Same as `apply_optional_array_slice`, for a string sliced by `char`.
+/// Same as `apply_optional_array_slice`, for a string sliced by grapheme.
 fn apply_optional_string_slice(s: String, slice_spec: Option<&str>) -> String {
     match slice_spec {
         Some(spec) => match crate::ranges::apply_string_slice(&s, spec) {
@@ -1836,6 +1932,32 @@ mod tests {
         let tokens = Interpreter::tokenize(r#"echo "@arr""#);
         let expanded = interp.expand_all(&tokens[1..]);
         assert_eq!(expanded, vec!["one two three".to_string()]);
+    }
+
+    #[test]
+    fn adjacent_double_quoted_array_segments_stay_one_coerced_word() {
+        let mut interp = Interpreter::new();
+        interp.builtin_let(&["arr".into(), "=".into(), "[ one two ]".into()]);
+
+        let tokens = Interpreter::tokenize(r#"echo prefix"@arr"suffix "@arr"tail"#);
+        assert_eq!(
+            interp.expand_all(&tokens[1..]),
+            vec!["prefixone twosuffix".to_string(), "one twotail".to_string()]
+        );
+    }
+
+    #[test]
+    fn nested_double_quoted_array_arguments_keep_string_coercion() {
+        let mut interp = Interpreter::new();
+        interp.builtin_let(&["arr".into(), "=".into(), "[ one two ]".into()]);
+        assert_eq!(
+            interp.expand_all(&[r#"$len("@arr")"#.into()]),
+            vec!["7".to_string()]
+        );
+        assert_eq!(
+            interp.expand_all(&[r#"@reverse("@arr")"#.into()]),
+            vec!["one two".to_string()]
+        );
     }
 
     /// ion-manual page 4: "Variables are expanded in double quotes, but not

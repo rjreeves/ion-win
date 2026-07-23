@@ -8,11 +8,13 @@
 //! permutation) otherwise — matching upstream Ion's `expand_brace`
 //! (`Linux/ion-master/src/lib/expansion/mod.rs`).
 //!
-//! Indexing/slicing here operates on Unicode scalar values (`char`), not
-//! grapheme clusters — a known simplification consistent with the rest of
-//! this scaffold not depending on a graphemes crate yet. Array indices
+//! String indexing/slicing operates on Unicode grapheme clusters (what a
+//! user perceives as characters), while array indexing operates on items.
+//! Array indices
 //! don't support negative absolute positions (the manual doesn't document
 //! that either); only a negative *step* is supported, for reverse slicing.
+
+use unicode_segmentation::UnicodeSegmentation;
 
 /// A parsed `[start..end]`-style slice specifier.
 #[derive(Debug, Clone, Copy)]
@@ -44,18 +46,18 @@ pub fn apply_array_slice(items: &[String], spec: &str) -> Result<Vec<String>, St
     }
 }
 
-/// Applies a `[...]` spec to a string, indexed/sliced by `char`.
+/// Applies a `[...]` spec to a string, indexed/sliced by grapheme cluster.
 pub fn apply_string_slice(s: &str, spec: &str) -> Result<String, String> {
-    let chars: Vec<char> = s.chars().collect();
+    let graphemes: Vec<&str> = s.graphemes(true).collect();
     match parse_index_spec(spec).ok_or_else(|| format!("invalid index/range '{spec}'"))? {
         IndexSpec::Index(i) => {
-            let idx = normalize_index(i, chars.len())
+            let idx = normalize_index(i, graphemes.len())
                 .ok_or_else(|| format!("index {i} out of bounds"))?;
-            Ok(chars[idx].to_string())
+            Ok(graphemes[idx].to_string())
         }
         IndexSpec::Range(slice) => {
-            let indices = slice_indices(chars.len(), &slice);
-            Ok(indices.into_iter().map(|i| chars[i]).collect())
+            let indices = slice_indices(graphemes.len(), &slice);
+            Ok(indices.into_iter().map(|i| graphemes[i]).collect())
         }
     }
 }
@@ -445,6 +447,16 @@ mod tests {
             apply_string_slice("Hello, World", "2..9").unwrap(),
             "llo, Wo"
         );
+    }
+
+
+    #[test]
+    fn string_slice_uses_grapheme_cluster_boundaries() {
+        let text = "e\u{301}👩‍💻x";
+        assert_eq!(apply_string_slice(text, "0").unwrap(), "e\u{301}");
+        assert_eq!(apply_string_slice(text, "1").unwrap(), "👩‍💻");
+        assert_eq!(apply_string_slice(text, "0..2").unwrap(), "e\u{301}👩‍💻");
+        assert_eq!(apply_string_slice(text, "2,-1..0").unwrap(), "x👩‍💻");
     }
 
     #[test]

@@ -503,3 +503,27 @@ Structured tables were intentionally kept separate from scalar and array expansi
 `$field(row column)` is the matching narrow scalar bridge. Its first argument must be a bare table-variable name and that table must contain exactly one row, which makes it a natural fit inside `for row in manifest`. The column argument follows existing method-argument resolution, so it may be a literal column name or a scalar variable containing one. A zero-row or multi-row table is rejected rather than silently choosing a row, and a missing column is an explicit error rather than an empty string that could be mistaken for real data.
 
 Both accessors live in `Interpreter::call_string_method_here`, ahead of ordinary string/array method dispatch. This avoids adding a `Table` variant to `MethodArg`, which would force every unrelated method to invent table-to-string and table-to-array coercion semantics. Three unit tests cover row counting, literal and variable column lookup, multi-row rejection, and missing-column rejection. The compiled executable was also verified with `scripts/exercise/11_table_accessors.ion`: a two-row JSON table reports `rows=2`, then row iteration extracts `alpha.txt 10` and `beta.txt 20` as scalars.
+
+## 29. `HISTORY_IGNORE=no_such_command`
+
+The documented default `no_such_command` history rule was previously accepted but inert because history was recorded before dispatch and execution returned only a success boolean. A normal nonzero exit must remain in history, so failure status alone cannot identify the rule's target.
+
+`Interpreter` now carries a dedicated `command_not_found` signal, cleared before each simple interactive input and set only when process creation returns `ErrorKind::NotFound`. Both direct external commands and external pipeline stages set it; ordinary exit code failures do not. After execution, the REPL consults the live `HISTORY_IGNORE` array and removes the just-recorded line when the signal is set and `no_such_command` is enabled. `LineEditor::remove_last_history_if` only removes an exact latest match, preventing an older identical entry from being accidentally deleted. Multi-line blocks retain their existing per-line history recording because one aggregate execution signal cannot safely identify which of several entered lines failed.
+
+Verified with unit tests for live rule detection and exact editor removal, the full suite, and a real piped interactive session against the compiled executable. With the default rules, `echo kept`, a deliberately nonexistent command, and `exit` produced a persisted history containing exactly `echo kept` and `exit`.
+
+## 30. Quoted-array fidelity in nested and adjacent word contexts
+
+Nested method arguments already re-tokenized their inner text, but this behavior was not protected by focused tests. Those tests now establish that `$len("@arr")` sees the quoted array as one joined string and `@reverse("@arr")` receives one scalar-coerced element rather than two array elements.
+
+The real mismatch was adjacent quote concatenation. `prefix"@arr"suffix` was previously tokenized as one unquoted string containing literal quote characters, producing `prefix"one two"suffix`; a word beginning with quotes followed by a suffix was split incorrectly. Double-quoted segments are now consumed as part of the surrounding word, their delimiters are removed, and the resulting token retains double-quoted coercion. When a quoted segment ends in a variable immediately followed by a suffix, the tokenizer internally applies Ion's documented braced disambiguation (`"@arr"tail` becomes `@{arr}tail`) so interpolation does not look for a nonexistent `arrtail` variable.
+
+Focused tests cover both prefix/suffix directions and nested method arguments. The compiled smoke script prints `adjacent prefixone twosuffix`, confirming one coerced word with no literal quote leakage.
+
+## 31. Unicode grapheme-aware string operations
+
+The old `@graphemes()` implementation was only an alias for `@chars()`, and string length/slicing counted Unicode scalar values. That splits user-perceived characters such as `e` plus a combining acute accent and multi-code-point emoji joined with ZWJ.
+
+The `unicode-segmentation` crate now supplies extended grapheme cluster boundaries. `@graphemes()` returns those clusters; `$len(string)`, string `find` positions, scalar `reverse`, `split_at`, and `[...]` indexing/slicing use the same user-facing units. `@chars()` intentionally continues to expose scalar values, while `@bytes()` and `$len_bytes()` retain byte semantics, so every abstraction level remains available explicitly.
+
+Tests use `e\u{301}👩‍💻`: it has two graphemes, multiple scalar values, and fourteen UTF-8 bytes. They verify counting, search position, reversal, splitting, grapheme enumeration, and forward/reverse slicing without separating the accent or emoji sequence. `scripts/exercise/12_language_fidelity.ion` confirms the same behavior through the compiled executable.

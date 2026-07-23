@@ -130,19 +130,31 @@ pub async fn run(state: StateHandle) {
             continue;
         }
 
-        let flow = if is_block_opener(&line) {
+        interp.clear_command_not_found();
+        let is_block = is_block_opener(&line);
+        let flow = if is_block {
             let Some(body) = read_block_body(&mut editor) else {
                 // Esc (pressed twice) cancelled the whole in-progress
                 // block: discard it entirely, nothing gets executed.
                 continue;
             };
-            let mut block = vec![line];
+            let mut block = vec![line.clone()];
             block.extend(body);
             block.push("end".to_string());
             exec_block(&block, &mut interp, &state).await
         } else {
             dispatch(&line, &mut interp, &state).await
         };
+
+        // A block records several separate input lines, so there is no
+        // single latest entry that safely represents the failed command.
+        // Simple inputs are exact: remove only the line just executed.
+        if !is_block
+            && interp.command_not_found()
+            && history::ignores_no_such_command(&interp)
+        {
+            editor.remove_last_history_if(&line);
+        }
 
         match flow {
             Flow::ShellExit => break,
@@ -755,7 +767,7 @@ fn eval_condition_tokens<'a>(
                         handle_dmark(&args, state).await;
                         true
                     }
-                    other => run_external_status(other, &args),
+                    other => run_external_status(other, &args, interp),
                 }
             }
         }
@@ -1073,7 +1085,7 @@ async fn dispatch(line: &str, interp: &mut Interpreter, state: &StateHandle) -> 
                 // evaluates the result as a single new command.
                 "eval" => return Box::pin(dispatch(&args.join(" "), interp, state)).await,
                 other => {
-                    let ok = run_external(other, &args);
+                    let ok = run_external(other, &args, interp);
                     interp.set_previous_status(ok);
                 }
             }
@@ -1529,10 +1541,11 @@ fn handle_fn_builtin(interp: &Interpreter) {
 /// Abstraction Layer Matrix in ARCHITECTURE.md section 5. Registered as
 /// the foreground job while it runs (see `jobctl.rs`), so Ctrl+C
 /// interrupts it instead of doing nothing or killing the whole shell.
-fn run_external_status(program: &str, args: &[String]) -> bool {
+fn run_external_status(program: &str, args: &[String], interp: &mut Interpreter) -> bool {
     match jobctl::new_command(program).args(args).spawn() {
         Ok(child) => jobctl::wait_foreground(child).map(|s| s.success()).unwrap_or(false),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            interp.mark_command_not_found();
             err_println!("ion-win: command not found: {program}");
             false
         }
@@ -1546,7 +1559,7 @@ fn run_external_status(program: &str, args: &[String]) -> bool {
 /// Statement-context wrapper around `run_external_status` that also reports
 /// a non-zero exit code, matching typical shell prompt feedback. Returns
 /// whether the process succeeded, for `previous_status` (`$?`) tracking.
-fn run_external(program: &str, args: &[String]) -> bool {
+fn run_external(program: &str, args: &[String], interp: &mut Interpreter) -> bool {
     match jobctl::new_command(program).args(args).spawn() {
         Ok(child) => match jobctl::wait_foreground(child) {
             Ok(status) => {
@@ -1560,6 +1573,7 @@ fn run_external(program: &str, args: &[String]) -> bool {
             Err(_) => false,
         },
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            interp.mark_command_not_found();
             err_println!("ion-win: command not found: {program}");
             false
         }
@@ -1672,4 +1686,3 @@ fn handle_disown(args: &[String]) {
     let count = jobs::disown(&pids);
     println!("ion-win: disowned {count} job(s)");
 }
-

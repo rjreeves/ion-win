@@ -1,0 +1,10 @@
+# Exercises nested quoted arrays and Unicode grapheme-aware operations.
+echo CASE 12 language fidelity
+let arr = [ one two ]
+echo quoted "@arr"
+echo nested $len("@arr") @reverse("@arr")
+echo adjacent prefix"@arr"suffix
+let text = é👩‍💻x
+echo grapheme-len $len(text)
+echo graphemes @graphemes(text)
+echo grapheme-slice $text[0..2]

@@ -2,12 +2,12 @@
 //! `@method(args)` call syntax, dispatched here after `interp.rs` resolves
 //! the argument tokens.
 //!
-//! Indexing/counting is by Unicode scalar value (`char`), not grapheme
-//! cluster — a known simplification consistent with the rest of this
-//! scaffold (no graphemes crate dependency yet), so `graphemes` is
-//! currently an alias for `chars`.
+//! User-facing string indexing/counting uses Unicode grapheme clusters;
+//! `chars` remains available when callers explicitly need Unicode scalar
+//! values and `bytes` for raw UTF-8 bytes.
 
 use regex::Regex;
+use unicode_segmentation::UnicodeSegmentation;
 
 /// A resolved method argument: either a string or an array, matching
 /// ion's own "quoted/`$`-prefixed are strings; `[`/`@`-prefixed are
@@ -89,7 +89,7 @@ pub fn call_array_method(name: &str, args: &[MethodArg]) -> Option<Result<Vec<St
         "split_at" => split_at(args),
         "bytes" => bytes(args),
         "chars" => chars_method(args),
-        "graphemes" => chars_method(args), // alias; see module doc
+        "graphemes" => graphemes_method(args),
         "reverse" => reverse_arr(args),
         "subst" => subst(args),
         _ => return None,
@@ -137,7 +137,7 @@ fn find(args: &[MethodArg]) -> Result<String, String> {
     let haystack = arg_str(args, 0)?;
     let needle = arg_str(args, 1)?;
     match haystack.find(&needle) {
-        Some(byte_idx) => Ok(haystack[..byte_idx].chars().count().to_string()),
+        Some(byte_idx) => Ok(haystack[..byte_idx].graphemes(true).count().to_string()),
         None => Ok("-1".to_string()),
     }
 }
@@ -145,7 +145,7 @@ fn find(args: &[MethodArg]) -> Result<String, String> {
 fn len(args: &[MethodArg]) -> Result<String, String> {
     match args.first() {
         Some(MethodArg::Arr(v)) => Ok(v.len().to_string()),
-        Some(MethodArg::Str(s)) => Ok(s.chars().count().to_string()),
+        Some(MethodArg::Str(s)) => Ok(s.graphemes(true).count().to_string()),
         None => Err("len: requires an argument".to_string()),
     }
 }
@@ -192,7 +192,7 @@ fn regex_replace(args: &[MethodArg]) -> Result<String, String> {
 }
 
 fn reverse_str(args: &[MethodArg]) -> Result<String, String> {
-    Ok(arg_str(args, 0)?.chars().rev().collect())
+    Ok(arg_str(args, 0)?.graphemes(true).rev().collect())
 }
 
 fn to_lowercase(args: &[MethodArg]) -> Result<String, String> {
@@ -276,12 +276,12 @@ fn split(args: &[MethodArg]) -> Result<Vec<String>, String> {
 fn split_at(args: &[MethodArg]) -> Result<Vec<String>, String> {
     let s = arg_str(args, 0)?;
     let idx = arg_usize(args, 1, "split_at")?;
-    let chars: Vec<char> = s.chars().collect();
-    if idx > chars.len() {
+    let graphemes: Vec<&str> = s.graphemes(true).collect();
+    if idx > graphemes.len() {
         return Err("split_at: value is out of bounds".to_string());
     }
-    let (a, b) = chars.split_at(idx);
-    Ok(vec![a.iter().collect(), b.iter().collect()])
+    let (a, b) = graphemes.split_at(idx);
+    Ok(vec![a.concat(), b.concat()])
 }
 
 fn bytes(args: &[MethodArg]) -> Result<Vec<String>, String> {
@@ -290,6 +290,13 @@ fn bytes(args: &[MethodArg]) -> Result<Vec<String>, String> {
 
 fn chars_method(args: &[MethodArg]) -> Result<Vec<String>, String> {
     Ok(arg_str(args, 0)?.chars().map(|c| c.to_string()).collect())
+}
+
+fn graphemes_method(args: &[MethodArg]) -> Result<Vec<String>, String> {
+    Ok(arg_str(args, 0)?
+        .graphemes(true)
+        .map(str::to_string)
+        .collect())
 }
 
 fn reverse_arr(args: &[MethodArg]) -> Result<Vec<String>, String> {
@@ -352,6 +359,16 @@ mod tests {
         assert_eq!(len(&[s("foobar")]).unwrap(), "6");
         assert_eq!(len(&[a(&["one", "two", "three", "four"])]).unwrap(), "4");
         assert_eq!(len_bytes(&[s("foobar")]).unwrap(), "6");
+    }
+
+    #[test]
+    fn user_facing_string_operations_respect_grapheme_clusters() {
+        let text = s("e\u{301}👩‍💻");
+        assert_eq!(len(&[text.clone()]).unwrap(), "2");
+        assert_eq!(len_bytes(&[text.clone()]).unwrap(), "14");
+        assert_eq!(find(&[text.clone(), s("👩‍💻")]).unwrap(), "1");
+        assert_eq!(reverse_str(&[text.clone()]).unwrap(), "👩‍💻e\u{301}");
+        assert_eq!(split_at(&[text, s("1")]).unwrap(), vec!["e\u{301}", "👩‍💻"]);
     }
 
     #[test]
@@ -463,6 +480,18 @@ mod tests {
         assert_eq!(
             chars_method(&[s("onetwo")]).unwrap(),
             vec!["o", "n", "e", "t", "w", "o"]
+        );
+    }
+
+    #[test]
+    fn graphemes_keeps_combining_marks_and_emoji_sequences_together() {
+        assert_eq!(
+            graphemes_method(&[s("e\u{301}👩‍💻")]).unwrap(),
+            vec!["e\u{301}", "👩‍💻"]
+        );
+        assert_eq!(
+            chars_method(&[s("e\u{301}")]).unwrap(),
+            vec!["e", "\u{301}"]
         );
     }
 

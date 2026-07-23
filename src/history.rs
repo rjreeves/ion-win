@@ -11,16 +11,13 @@
 //! for the rest of the session — there's no separate out-of-band config
 //! struct.
 //!
-//! Implemented `HISTORY_IGNORE` rules: `all`, `whitespace`, `duplicates`
+//! Implemented `HISTORY_IGNORE` rules: `all`, `whitespace`, `duplicates`,
+//! `no_such_command`,
 //! (per the manual's exact wording — *all* earlier occurrences of a
 //! repeated command are dropped, keeping only the latest, not just
 //! adjacent-consecutive dedup), and `regex:PATTERN`.
 //!
 //! NOT implemented:
-//! - `no_such_command` — accepted (so the documented default list doesn't
-//!   error) but currently inert. Detecting it needs the executed command's
-//!   outcome plumbed back to wherever history is recorded, which isn't
-//!   wired up yet.
 //! - `+shared`/live incremental history across concurrent shell instances
 //!   — this module only does read-at-start/write-at-exit for a single
 //!   session, so two `ion-win` instances running at once will each
@@ -102,6 +99,15 @@ fn is_timestamped(interp: &Interpreter) -> bool {
             .unwrap_or(false),
         None => false,
     }
+}
+
+/// Whether the current rules request post-execution removal of inputs that
+/// failed specifically because an executable could not be found.
+pub fn ignores_no_such_command(interp: &Interpreter) -> bool {
+    interp
+        .get_array(HISTORY_IGNORE_VAR)
+        .map(|rules| rules.iter().any(|r| r == "no_such_command"))
+        .unwrap_or_else(|| default_ignore_rules().iter().any(|r| r == "no_such_command"))
 }
 
 /// A `#<digits>` line is a timestamp marker, not a command — skip it when
@@ -274,5 +280,15 @@ mod tests {
         interp.set_scalar(HISTFILE_ENABLED_VAR.to_string(), "0".to_string());
         seed_defaults(&mut interp);
         assert_eq!(interp.get_scalar(HISTFILE_ENABLED_VAR).unwrap(), "0");
+    }
+
+
+    #[test]
+    fn no_such_command_rule_is_detected_from_current_interpreter_state() {
+        let mut interp = Interpreter::new();
+        seed_defaults(&mut interp);
+        assert!(ignores_no_such_command(&interp));
+        interp.set_array(HISTORY_IGNORE_VAR.to_string(), v(&["duplicates"]));
+        assert!(!ignores_no_such_command(&interp));
     }
 }
