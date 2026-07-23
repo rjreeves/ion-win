@@ -150,10 +150,10 @@ impl LineEditor {
         LineEditor { history: initial }
     }
 
-    /// The full accumulated history (loaded entries plus everything typed
-    /// this session), for `history::save` to persist at shell exit.
-    pub fn history(&self) -> &[String] {
-        &self.history
+    /// Replaces the recall list with the latest shared history snapshot.
+    /// Called only between prompts, when no history item is being browsed.
+    pub fn replace_history(&mut self, entries: Vec<String>) {
+        self.history = entries;
     }
 
     /// Reads one line, using raw-mode editing if stdin is a terminal and

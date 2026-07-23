@@ -510,6 +510,22 @@ The documented default `no_such_command` history rule was previously accepted bu
 
 `Interpreter` now carries a dedicated `command_not_found` signal, cleared before each simple interactive input and set only when process creation returns `ErrorKind::NotFound`. Both direct external commands and external pipeline stages set it; ordinary exit code failures do not. After execution, the REPL consults the live `HISTORY_IGNORE` array and removes the just-recorded line when the signal is set and `no_such_command` is enabled. `LineEditor::remove_last_history_if` only removes an exact latest match, preventing an older identical entry from being accidentally deleted. Multi-line blocks retain their existing per-line history recording because one aggregate execution signal cannot safely identify which of several entered lines failed.
 
+## 30. Live shared history
+
+Interactive commands are persisted after execution rather than rewriting the
+whole history file at shell exit. Reads and append batches use a Windows named
+mutex derived from the normalized `HISTFILE` path, preventing concurrent
+ion-win processes from interleaving records. Before every prompt, the editor
+replaces its recall list with a freshly loaded snapshot, so commands completed
+in another window become available through Up-arrow at the next prompt.
+
+The on-disk format remains compatible: one command per line, optionally
+preceded by the existing `#<unix-epoch>` marker. `HISTORY_IGNORE` is applied
+before append and again while loading; the latter preserves the documented
+"keep only the latest occurrence" behavior without destructively compacting a
+file another shell is using. Persistence occurs only after command resolution,
+so `no_such_command` continues to omit failed simple commands.
+
 Verified with unit tests for live rule detection and exact editor removal, the full suite, and a real piped interactive session against the compiled executable. With the default rules, `echo kept`, a deliberately nonexistent command, and `exit` produced a persisted history containing exactly `echo kept` and `exit`.
 
 ## 30. Quoted-array fidelity in nested and adjacent word contexts

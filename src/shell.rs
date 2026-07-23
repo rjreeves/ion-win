@@ -121,6 +121,9 @@ pub async fn run(state: StateHandle) {
     load_initrc(&mut interp, &state).await;
 
     loop {
+        if let Some(shared) = history::refresh(&interp) {
+            editor.replace_history(shared);
+        }
         let prompt = render_prompt(&mut interp, &state).await;
         let Some(line) = editor.read_line(&prompt) else {
             break;
@@ -132,18 +135,20 @@ pub async fn run(state: StateHandle) {
 
         interp.clear_command_not_found();
         let is_block = is_block_opener(&line);
-        let flow = if is_block {
+        let (flow, accepted_lines) = if is_block {
             let Some(body) = read_block_body(&mut editor) else {
                 // Esc (pressed twice) cancelled the whole in-progress
                 // block: discard it entirely, nothing gets executed.
                 continue;
             };
             let mut block = vec![line.clone()];
+            let mut accepted = block.clone();
+            accepted.extend(body.clone());
             block.extend(body);
             block.push("end".to_string());
-            exec_block(&block, &mut interp, &state).await
+            (exec_block(&block, &mut interp, &state).await, accepted)
         } else {
-            dispatch(&line, &mut interp, &state).await
+            (dispatch(&line, &mut interp, &state).await, vec![line.clone()])
         };
 
         // A block records several separate input lines, so there is no
@@ -154,6 +159,8 @@ pub async fn run(state: StateHandle) {
             && history::ignores_no_such_command(&interp)
         {
             editor.remove_last_history_if(&line);
+        } else {
+            history::append(&interp, &accepted_lines);
         }
 
         match flow {
@@ -165,7 +172,6 @@ pub async fn run(state: StateHandle) {
         }
     }
 
-    history::save(&interp, editor.history());
 }
 
 /// Runs a script file non-interactively (ion-manual "Script Executions"):

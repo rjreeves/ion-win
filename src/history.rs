@@ -1,10 +1,9 @@
 //! Persistent command history (ion-manual pages 84-87).
 //!
-//! History is read from `HISTFILE` once at shell startup and written back
-//! once at shell exit (not incrementally per command) — matching the
-//! manual's own description: "At Ion's startup, the history will be read
-//! from this file, and when it exits, the session's history will be
-//! appended to this file." `HISTFILE`, `HISTFILE_ENABLED`,
+//! History is shared live across concurrent ion-win windows. Accepted
+//! commands are appended immediately under a cross-process lock, and each
+//! prompt reloads the file so Up-arrow sees commands entered in other
+//! windows. `HISTFILE`, `HISTFILE_ENABLED`,
 //! `HISTORY_IGNORE`, and `HISTORY_TIMESTAMP` are seeded as ordinary ion
 //! variables at startup (via `seed_defaults`) so `echo $HISTFILE` etc. work
 //! immediately, and `let HISTORY_IGNORE = [ ... ]` naturally overrides them
@@ -18,10 +17,6 @@
 //! adjacent-consecutive dedup), and `regex:PATTERN`.
 //!
 //! NOT implemented:
-//! - `+shared`/live incremental history across concurrent shell instances
-//!   — this module only does read-at-start/write-at-exit for a single
-//!   session, so two `ion-win` instances running at once will each
-//!   overwrite the other's session history on exit rather than merging.
 //! - `HISTFILE_SIZE`/`HISTORY_SIZE` enforcement — per the manual, these are
 //!   also "(Currently ignored)" in upstream Ion, so not enforcing them
 //!   matches documented behavior rather than being a gap.
@@ -29,6 +24,8 @@
 use crate::interp::Interpreter;
 use crate::types::{validate, TypeTag};
 use regex::Regex;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -101,13 +98,68 @@ fn is_timestamped(interp: &Interpreter) -> bool {
     }
 }
 
+#[cfg(windows)]
+struct HistoryLock(isize);
+
+#[cfg(windows)]
+impl HistoryLock {
+    fn acquire(path: &std::path::Path) -> Option<Self> {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        use windows_sys::Win32::Foundation::{WAIT_ABANDONED, WAIT_OBJECT_0};
+        use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject, INFINITE};
+
+        let mut hasher = DefaultHasher::new();
+        path.to_string_lossy().to_lowercase().hash(&mut hasher);
+        let name = format!("Local\\ion-win-history-{:016x}", hasher.finish());
+        let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        let handle = unsafe { CreateMutexW(std::ptr::null(), 0, wide.as_ptr()) };
+        if handle == 0 {
+            return None;
+        }
+        let wait = unsafe { WaitForSingleObject(handle, INFINITE) };
+        if wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED {
+            Some(Self(handle))
+        } else {
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(handle);
+            }
+            None
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for HistoryLock {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::System::Threading::ReleaseMutex(self.0);
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+struct HistoryLock;
+
+#[cfg(not(windows))]
+impl HistoryLock {
+    fn acquire(_path: &std::path::Path) -> Option<Self> {
+        Some(Self)
+    }
+}
+
 /// Whether the current rules request post-execution removal of inputs that
 /// failed specifically because an executable could not be found.
 pub fn ignores_no_such_command(interp: &Interpreter) -> bool {
     interp
         .get_array(HISTORY_IGNORE_VAR)
         .map(|rules| rules.iter().any(|r| r == "no_such_command"))
-        .unwrap_or_else(|| default_ignore_rules().iter().any(|r| r == "no_such_command"))
+        .unwrap_or_else(|| {
+            default_ignore_rules()
+                .iter()
+                .any(|r| r == "no_such_command")
+        })
 }
 
 /// A `#<digits>` line is a timestamp marker, not a command — skip it when
@@ -125,50 +177,72 @@ pub fn load(interp: &Interpreter) -> Vec<String> {
         return Vec::new();
     }
     let path = histfile_path(interp);
+    let Some(_lock) = HistoryLock::acquire(&path) else {
+        return Vec::new();
+    };
     let Ok(contents) = std::fs::read_to_string(&path) else {
         return Vec::new();
     };
-    contents
+    let entries: Vec<String> = contents
         .lines()
         .filter(|l| !is_timestamp_marker(l))
         .map(str::to_string)
-        .collect()
+        .collect();
+    let rules = interp
+        .get_array(HISTORY_IGNORE_VAR)
+        .cloned()
+        .unwrap_or_else(default_ignore_rules);
+    apply_ignore_rules(&entries, &rules)
 }
 
-/// Writes `entries` back to `HISTFILE` (creating its parent directory if
-/// needed), filtering per the current `HISTORY_IGNORE` rules and prefixing
-/// each with a `#<unix-epoch>` marker if `HISTORY_TIMESTAMP` is enabled.
-/// A no-op if `HISTFILE_ENABLED` is false.
-pub fn save(interp: &Interpreter, entries: &[String]) {
-    if !is_enabled(interp) {
+/// Returns a fresh shared-history snapshot while persistence is enabled.
+/// `None` means the live `HISTFILE_ENABLED` setting is off, so callers
+/// should retain their in-memory session history.
+pub fn refresh(interp: &Interpreter) -> Option<Vec<String>> {
+    is_enabled(interp).then(|| load(interp))
+}
+
+/// Appends newly accepted commands as one locked record batch. Filtering is
+/// applied before writing; duplicate cleanup is applied when snapshots load,
+/// avoiding a destructive whole-file rewrite while other windows are active.
+pub fn append(interp: &Interpreter, entries: &[String]) {
+    if !is_enabled(interp) || entries.is_empty() {
         return;
     }
-
     let rules = interp
         .get_array(HISTORY_IGNORE_VAR)
         .cloned()
         .unwrap_or_else(default_ignore_rules);
     let filtered = apply_ignore_rules(entries, &rules);
-    let timestamped = is_timestamped(interp);
-
-    let mut out = String::new();
-    for line in &filtered {
-        if timestamped {
-            let epoch = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            out.push_str(&format!("#{epoch}\n"));
-        }
-        out.push_str(line);
-        out.push('\n');
+    if filtered.is_empty() {
+        return;
     }
 
     let path = histfile_path(interp);
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(&path, out);
+    let Some(_lock) = HistoryLock::acquire(&path) else {
+        return;
+    };
+    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) else {
+        return;
+    };
+    let timestamped = is_timestamped(interp);
+    let epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut out = String::new();
+    for line in filtered {
+        if timestamped {
+            out.push_str(&format!("#{epoch}\n"));
+        }
+        out.push_str(&line);
+        out.push('\n');
+    }
+    let _ = file.write_all(out.as_bytes());
+    let _ = file.flush();
 }
 
 /// Applies `HISTORY_IGNORE` rules to `entries`, in the order the manual
@@ -210,6 +284,24 @@ mod tests {
 
     fn v(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn temp_history(name: &str) -> (Interpreter, PathBuf) {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "ion-win-history-{name}-{}-{unique}",
+            std::process::id()
+        ));
+        let mut interp = Interpreter::new();
+        seed_defaults(&mut interp);
+        interp.set_scalar(
+            HISTFILE_VAR.to_string(),
+            path.to_string_lossy().into_owned(),
+        );
+        (interp, path)
     }
 
     #[test]
@@ -282,7 +374,6 @@ mod tests {
         assert_eq!(interp.get_scalar(HISTFILE_ENABLED_VAR).unwrap(), "0");
     }
 
-
     #[test]
     fn no_such_command_rule_is_detected_from_current_interpreter_state() {
         let mut interp = Interpreter::new();
@@ -290,5 +381,60 @@ mod tests {
         assert!(ignores_no_such_command(&interp));
         interp.set_array(HISTORY_IGNORE_VAR.to_string(), v(&["duplicates"]));
         assert!(!ignores_no_such_command(&interp));
+    }
+
+    #[test]
+    fn append_preserves_existing_commands_and_load_applies_duplicate_rule() {
+        let (interp, path) = temp_history("append");
+        append(&interp, &v(&["echo first", "echo shared"]));
+        append(&interp, &v(&["echo second", "echo shared"]));
+        assert_eq!(
+            load(&interp),
+            v(&["echo first", "echo second", "echo shared"])
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn append_respects_live_filter_and_timestamp_settings() {
+        let (mut interp, path) = temp_history("rules");
+        interp.set_array(
+            HISTORY_IGNORE_VAR.to_string(),
+            v(&["whitespace", "regex:secret"]),
+        );
+        interp.set_scalar(HISTORY_TIMESTAMP_VAR.to_string(), "1".to_string());
+        append(&interp, &v(&["echo kept", " echo private", "echo secret"]));
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.lines().next().is_some_and(is_timestamp_marker));
+        assert_eq!(load(&interp), v(&["echo kept"]));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn concurrent_appenders_do_not_overwrite_each_other() {
+        let (interp, path) = temp_history("concurrent");
+        let path_text = interp.get_scalar(HISTFILE_VAR).unwrap().to_string();
+        let threads: Vec<_> = (0..12)
+            .map(|i| {
+                let path_text = path_text.clone();
+                std::thread::spawn(move || {
+                    let mut writer = Interpreter::new();
+                    seed_defaults(&mut writer);
+                    writer.set_scalar(HISTFILE_VAR.to_string(), path_text);
+                    writer.set_array(HISTORY_IGNORE_VAR.to_string(), Vec::new());
+                    append(&writer, &[format!("echo window-{i}")]);
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let mut loaded = load(&interp);
+        loaded.sort();
+        let mut expected: Vec<_> = (0..12).map(|i| format!("echo window-{i}")).collect();
+        expected.sort();
+        assert_eq!(loaded, expected);
+        let _ = std::fs::remove_file(path);
     }
 }
