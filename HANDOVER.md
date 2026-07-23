@@ -25,7 +25,7 @@ A working, reasonably faithful interpreter for Ion's language (variables, contro
 | `interp.rs` | 2017 | The core: tokenizer (pipe/redirect/chain/background operators always split into their own token, even with no surrounding whitespace), `$`/`@` expansion, variable scope stack (scalars/arrays/tables), `let`/`export`/`drop`, method-call and process-expansion dispatch, `echo` output/capture. The biggest and most load-bearing file. |
 | `shell.rs` | 1675 | REPL loop and prompt rendering (`PROMPT` function support), block/control-flow execution (`if`/`while`/`for`/`fn`/`match`/`case`), `for VAR in TABLE` row iteration, `cd`, `&&`/`||`/`and`/`or` chaining, `let NAME = PIPELINE` table capture, dispatch of all builtins |
 | `pipeline_exec.rs` | 981 | Real OS pipeline execution (`Command`/`Stdio` chaining), background-job registration, structured-pipeline stages (`from-json`/`select`/`where`/`to-json`/`from-csv`/`to-csv`/`cat`/`stat`/`find`/`copy`/`compress`, the latter two forwarding their table onward so they can be chained together), table-capturing pipeline runner |
-| `editor.rs` | 680 | Crossterm raw-mode line editor (arrow keys, history, Tab-completion, word-editing shortcuts, live syntax highlighting) with fallback to plain stdin |
+| `editor.rs` | ~800 | Crossterm raw-mode line editor (arrow keys, history, Tab-completion, word-editing shortcuts, Shift-selection, live syntax highlighting) with fallback to plain stdin |
 | `ranges.rs` | 647 | Slice parsing (`[start..end]`) + brace expansion: ranges (`{1..10}`) and permutation lists (`{ext1,ext2}`, nested) |
 | `methods.rs` | 491 | All 26 string/array methods (`$len`, `@split`, etc.) |
 | `arith.rs` | 430 | `$(( expr ))` arithmetic expansion (recursive-descent parser) |
@@ -55,7 +55,7 @@ A working, reasonably faithful interpreter for Ion's language (variables, contro
 - **Control flow**: `if`/`else if`/`else`, `while`, `for`/`in`, `break`/`continue` (correctly scoped to the nearest enclosing loop, propagates through nested `if`s)
 - **Functions**: `fn` with typed/array params, docstrings, `fn` (bare) lists definitions
 - **Process execution**: pipelines (`|` `^|` `&|`), redirection (`>` `>>` `^>` `&>`), background/disown (`&` `&!`), `echo` as a pipeline producer
-- **Shell UX**: `cd` + implicit cd (bare `~/path`, `..`, `.config`, `examples/`), `read`, `pvar`/`dmark` (redb-backed state), persistent history (`HISTFILE`/`HISTORY_IGNORE`/`HISTORY_TIMESTAMP`), crossterm line editor (arrow keys, history recall, Ctrl+U/C/D)
+- **Shell UX**: `cd` + implicit cd (bare `~/path`, `..`, `.config`, `examples/`), `read`, `pvar`/`dmark` (redb-backed state), persistent history (`HISTFILE`/`HISTORY_IGNORE`/`HISTORY_TIMESTAMP`), crossterm line editor (arrow keys, history recall, Ctrl+U/C/D, Shift+Arrow/Home/End selection with replace/delete behavior)
 - **Ctrl+C interrupt handling** (`src/jobctl.rs`, `ARCHITECTURE.md` §9): breaks a running foreground external process/pipeline (via process-group isolation + `CTRL_BREAK_EVENT`, the only Windows-supported way to selectively signal one child) or a pure-Ion loop with no external process (`while true; end`, via a cooperative interrupt flag) without killing the shell itself. Verified via real Ctrl+C signals against a running `ion-win.exe`, both interactively and in script mode.
 - **Environment**: `${env::VAR}`, `export` (real OS env var, inherited by spawned child processes)
 - **Script execution**: `ion-win.exe script.ion arg1 arg2` with `@args`

@@ -15,6 +15,8 @@
 //!   exit the shell)
 //! - Ctrl+D on an empty line: EOF (exits the shell); on a non-empty line,
 //!   behaves like Delete (matches common shell convention)
+//! - Shift+Arrow/Home/End: select text; typing replaces it and
+//!   Backspace/Delete removes it
 //!
 //! NOT implemented: Ctrl+R/Ctrl+S incremental history search, Ctrl+F
 //! autosuggestion acceptance, Vi keybindings, and persisting history to
@@ -226,10 +228,11 @@ impl LineEditor {
     fn run_editor(&mut self, prompt: &str, allow_abort: bool) -> EditorOutcome {
         let mut buffer: Vec<char> = Vec::new();
         let mut cursor_pos = 0usize;
+        let mut selection_anchor = None;
         let mut history_index = self.history.len(); // == "not browsing history"
         let mut saved_current = String::new();
 
-        redraw(prompt, &buffer, cursor_pos);
+        redraw(prompt, &buffer, cursor_pos, selection_anchor);
 
         loop {
             let event = match event::read() {
@@ -260,33 +263,46 @@ impl LineEditor {
                     let _ = io::stdout().flush();
                     buffer.clear();
                     cursor_pos = 0;
+                    selection_anchor = None;
                     history_index = self.history.len();
-                    redraw(prompt, &buffer, cursor_pos);
+                    redraw(prompt, &buffer, cursor_pos, selection_anchor);
                 }
                 (KeyCode::Char('d'), m) if m.contains(KeyModifiers::CONTROL) => {
                     if buffer.is_empty() {
                         return EditorOutcome::Eof;
                     }
-                    if cursor_pos < buffer.len() {
+                    if !delete_selection(&mut buffer, &mut cursor_pos, &mut selection_anchor)
+                        && cursor_pos < buffer.len()
+                    {
                         buffer.remove(cursor_pos);
                     }
                 }
                 (KeyCode::Char('u'), m) if m.contains(KeyModifiers::CONTROL) => {
-                    buffer.drain(0..cursor_pos);
-                    cursor_pos = 0;
+                    if !delete_selection(&mut buffer, &mut cursor_pos, &mut selection_anchor) {
+                        buffer.drain(0..cursor_pos);
+                        cursor_pos = 0;
+                    }
                 }
                 (KeyCode::Char('k'), m) if m.contains(KeyModifiers::CONTROL) => {
                     // Kill to end of line, complementing Ctrl+U's kill to
                     // start. No kill-ring/yank — matches Ctrl+U's existing
                     // plain-delete behavior rather than adding new state.
-                    buffer.truncate(cursor_pos);
+                    if !delete_selection(&mut buffer, &mut cursor_pos, &mut selection_anchor) {
+                        buffer.truncate(cursor_pos);
+                    }
                 }
                 (KeyCode::Char('w'), m) if m.contains(KeyModifiers::CONTROL) => {
-                    let start = prev_word_boundary(&buffer, cursor_pos);
-                    buffer.drain(start..cursor_pos);
-                    cursor_pos = start;
+                    if !delete_selection(&mut buffer, &mut cursor_pos, &mut selection_anchor) {
+                        let start = prev_word_boundary(&buffer, cursor_pos);
+                        buffer.drain(start..cursor_pos);
+                        cursor_pos = start;
+                    }
                 }
                 (KeyCode::Esc, _) => {
+                    if selection_anchor.take().is_some() {
+                        redraw(prompt, &buffer, cursor_pos, selection_anchor);
+                        continue;
+                    }
                     // On a continuation line (typing a `while`/`if`/`for`/
                     // `fn` block's body), pressing Esc again once the
                     // current line is already empty cancels the whole
@@ -301,40 +317,88 @@ impl LineEditor {
                     }
                     buffer.clear();
                     cursor_pos = 0;
+                    selection_anchor = None;
                     history_index = self.history.len();
                 }
                 (KeyCode::Tab, _) => {
+                    delete_selection(&mut buffer, &mut cursor_pos, &mut selection_anchor);
                     if let Some((new_buffer, new_cursor_pos)) = complete(&buffer, cursor_pos) {
                         buffer = new_buffer;
                         cursor_pos = new_cursor_pos;
                     }
                 }
                 (KeyCode::Backspace, m) if m.contains(KeyModifiers::ALT) => {
-                    let start = prev_word_boundary(&buffer, cursor_pos);
-                    buffer.drain(start..cursor_pos);
-                    cursor_pos = start;
+                    if !delete_selection(&mut buffer, &mut cursor_pos, &mut selection_anchor) {
+                        let start = prev_word_boundary(&buffer, cursor_pos);
+                        buffer.drain(start..cursor_pos);
+                        cursor_pos = start;
+                    }
                 }
                 (KeyCode::Backspace, _) => {
-                    if cursor_pos > 0 {
+                    if !delete_selection(&mut buffer, &mut cursor_pos, &mut selection_anchor)
+                        && cursor_pos > 0
+                    {
                         buffer.remove(cursor_pos - 1);
                         cursor_pos -= 1;
                     }
                 }
                 (KeyCode::Delete, _) => {
-                    if cursor_pos < buffer.len() {
+                    if !delete_selection(&mut buffer, &mut cursor_pos, &mut selection_anchor)
+                        && cursor_pos < buffer.len()
+                    {
                         buffer.remove(cursor_pos);
                     }
                 }
+                (KeyCode::Left, m)
+                    if m.contains(KeyModifiers::CONTROL) && m.contains(KeyModifiers::SHIFT) =>
+                {
+                    let destination = prev_word_boundary(&buffer, cursor_pos);
+                    extend_selection(&mut selection_anchor, &mut cursor_pos, destination);
+                }
+                (KeyCode::Right, m)
+                    if m.contains(KeyModifiers::CONTROL) && m.contains(KeyModifiers::SHIFT) =>
+                {
+                    let destination = next_word_boundary(&buffer, cursor_pos);
+                    extend_selection(&mut selection_anchor, &mut cursor_pos, destination);
+                }
                 (KeyCode::Left, m) if m.contains(KeyModifiers::CONTROL) => {
+                    selection_anchor = None;
                     cursor_pos = prev_word_boundary(&buffer, cursor_pos);
                 }
                 (KeyCode::Right, m) if m.contains(KeyModifiers::CONTROL) => {
+                    selection_anchor = None;
                     cursor_pos = next_word_boundary(&buffer, cursor_pos);
                 }
-                (KeyCode::Left, _) => cursor_pos = cursor_pos.saturating_sub(1),
-                (KeyCode::Right, _) => cursor_pos = (cursor_pos + 1).min(buffer.len()),
-                (KeyCode::Home, _) => cursor_pos = 0,
-                (KeyCode::End, _) => cursor_pos = buffer.len(),
+                (KeyCode::Left, m) if m.contains(KeyModifiers::SHIFT) => {
+                    let destination = cursor_pos.saturating_sub(1);
+                    extend_selection(&mut selection_anchor, &mut cursor_pos, destination);
+                }
+                (KeyCode::Right, m) if m.contains(KeyModifiers::SHIFT) => {
+                    let destination = (cursor_pos + 1).min(buffer.len());
+                    extend_selection(&mut selection_anchor, &mut cursor_pos, destination);
+                }
+                (KeyCode::Home, m) if m.contains(KeyModifiers::SHIFT) => {
+                    extend_selection(&mut selection_anchor, &mut cursor_pos, 0);
+                }
+                (KeyCode::End, m) if m.contains(KeyModifiers::SHIFT) => {
+                    extend_selection(&mut selection_anchor, &mut cursor_pos, buffer.len());
+                }
+                (KeyCode::Left, _) => {
+                    selection_anchor = None;
+                    cursor_pos = cursor_pos.saturating_sub(1);
+                }
+                (KeyCode::Right, _) => {
+                    selection_anchor = None;
+                    cursor_pos = (cursor_pos + 1).min(buffer.len());
+                }
+                (KeyCode::Home, _) => {
+                    selection_anchor = None;
+                    cursor_pos = 0;
+                }
+                (KeyCode::End, _) => {
+                    selection_anchor = None;
+                    cursor_pos = buffer.len();
+                }
                 (KeyCode::Up, _) => {
                     if history_index > 0 {
                         if history_index == self.history.len() {
@@ -343,6 +407,7 @@ impl LineEditor {
                         history_index -= 1;
                         buffer = self.history[history_index].chars().collect();
                         cursor_pos = buffer.len();
+                        selection_anchor = None;
                     }
                 }
                 (KeyCode::Down, _) => {
@@ -354,18 +419,20 @@ impl LineEditor {
                             self.history[history_index].chars().collect()
                         };
                         cursor_pos = buffer.len();
+                        selection_anchor = None;
                     }
                 }
                 (KeyCode::Char(ch), m)
                     if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
                 {
+                    delete_selection(&mut buffer, &mut cursor_pos, &mut selection_anchor);
                     buffer.insert(cursor_pos, ch);
                     cursor_pos += 1;
                 }
                 _ => continue, // unhandled key: don't redraw needlessly
             }
 
-            redraw(prompt, &buffer, cursor_pos);
+            redraw(prompt, &buffer, cursor_pos, selection_anchor);
         }
     }
 }
@@ -407,11 +474,84 @@ fn next_word_boundary(buffer: &[char], pos: usize) -> usize {
     i
 }
 
+fn selection_range(anchor: Option<usize>, cursor_pos: usize) -> Option<(usize, usize)> {
+    let anchor = anchor?;
+    (anchor != cursor_pos).then(|| {
+        if anchor < cursor_pos {
+            (anchor, cursor_pos)
+        } else {
+            (cursor_pos, anchor)
+        }
+    })
+}
+
+fn extend_selection(anchor: &mut Option<usize>, cursor_pos: &mut usize, destination: usize) {
+    let original = *cursor_pos;
+    anchor.get_or_insert(original);
+    *cursor_pos = destination;
+    if *anchor == Some(destination) {
+        *anchor = None;
+    }
+}
+
+fn delete_selection(
+    buffer: &mut Vec<char>,
+    cursor_pos: &mut usize,
+    anchor: &mut Option<usize>,
+) -> bool {
+    let Some((start, end)) = selection_range(*anchor, *cursor_pos) else {
+        *anchor = None;
+        return false;
+    };
+    buffer.drain(start..end);
+    *cursor_pos = start;
+    *anchor = None;
+    true
+}
+
+/// Adds reverse-video SGR around a visible character range while preserving
+/// syntax colors. Syntax spans use reset codes, so reverse video is re-applied
+/// after every SGR sequence inside the selected range.
+fn apply_selection_highlight(rendered: &str, range: (usize, usize)) -> String {
+    let (start, end) = range;
+    let mut out = String::with_capacity(rendered.len() + 32);
+    let mut visible = 0usize;
+    let mut chars = rendered.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' && chars.peek() == Some(&'[') {
+            out.push(ch);
+            while let Some(code) = chars.next() {
+                out.push(code);
+                if code == 'm' {
+                    if visible >= start && visible < end {
+                        out.push_str("\u{1b}[7m");
+                    }
+                    break;
+                }
+            }
+            continue;
+        }
+        if visible == start {
+            out.push_str("\u{1b}[7m");
+        }
+        if visible == end {
+            out.push_str("\u{1b}[27m");
+        }
+        out.push(ch);
+        visible += 1;
+    }
+    if visible == end {
+        out.push_str("\u{1b}[27m");
+    }
+    out
+}
+
 /// Repaints the current line: clears it, reprints `prompt` + buffer
 /// contents, then positions the terminal cursor at `cursor_pos` within the
 /// buffer (not byte position — `char` position, consistent with the
 /// buffer's own indexing).
-fn redraw(prompt: &str, buffer: &[char], cursor_pos: usize) {
+fn redraw(prompt: &str, buffer: &[char], cursor_pos: usize, selection_anchor: Option<usize>) {
     let mut stdout = io::stdout();
     let _ = execute!(
         stdout,
@@ -419,11 +559,14 @@ fn redraw(prompt: &str, buffer: &[char], cursor_pos: usize) {
         terminal::Clear(terminal::ClearType::CurrentLine)
     );
     let line: String = buffer.iter().collect();
-    let rendered = if highlight_enabled() {
+    let mut rendered = if highlight_enabled() {
         highlight(&line)
     } else {
         line
     };
+    if let Some(range) = selection_range(selection_anchor, cursor_pos) {
+        rendered = apply_selection_highlight(&rendered, range);
+    }
     print!("{prompt}{rendered}");
     let _ = stdout.flush();
     // Color escape sequences are zero-width, so the cursor's target column
@@ -602,6 +745,34 @@ mod tests {
         assert_eq!(next_word_boundary(&buf, 11), buf.len()); // last word -> end of buffer
     }
 
+    #[test]
+    fn selection_range_normalizes_both_directions_and_ignores_empty() {
+        assert_eq!(selection_range(Some(2), 5), Some((2, 5)));
+        assert_eq!(selection_range(Some(5), 2), Some((2, 5)));
+        assert_eq!(selection_range(Some(2), 2), None);
+        assert_eq!(selection_range(None, 2), None);
+    }
+
+    #[test]
+    fn deleting_selection_replaces_the_whole_selected_range() {
+        let mut buffer: Vec<char> = "echo hello".chars().collect();
+        let mut cursor = 10;
+        let mut anchor = Some(5);
+        assert!(delete_selection(&mut buffer, &mut cursor, &mut anchor));
+        assert_eq!(buffer.into_iter().collect::<String>(), "echo ");
+        assert_eq!(cursor, 5);
+        assert_eq!(anchor, None);
+    }
+
+    #[test]
+    fn selection_highlight_preserves_text_and_ansi_syntax_colors() {
+        let rendered = highlight("echo \"$name\"");
+        let selected = apply_selection_highlight(&rendered, (5, 12));
+        assert_eq!(strip_ansi(&selected), "echo \"$name\"");
+        assert!(selected.contains("\u{1b}[7m"));
+        assert!(selected.contains("\u{1b}[27m"));
+    }
+
     /// Strips ANSI SGR escape sequences (`ESC '[' ... 'm'`) so a colored
     /// string can be compared against the plain original — the invariant
     /// `highlight` must never break, since `redraw`'s cursor-column math
@@ -672,7 +843,6 @@ mod tests {
             vec!["a".to_string(), "b".to_string(), "a".to_string()]
         );
     }
-
 
     #[test]
     fn remove_last_history_if_only_removes_the_matching_latest_entry() {
