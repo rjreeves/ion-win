@@ -983,6 +983,17 @@ async fn dispatch(line: &str, interp: &mut Interpreter, state: &StateHandle) -> 
             let args = interp.expand_all(raw_args);
             handle_highlight(&args);
         }
+        "history" => {
+            let args = interp.expand_all(raw_args);
+            match history::inspect(interp, &args) {
+                Ok(output) if !output.is_empty() => println!("{output}"),
+                Ok(_) => {}
+                Err(error) => {
+                    err_println!("ion-win: {error}");
+                    interp.set_previous_status(false);
+                }
+            }
+        }
 
         // These operate on raw tokens because destination names must not
         // expand. `read` expands only its optional `-p` prompt after parsing.

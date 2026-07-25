@@ -519,12 +519,13 @@ ion-win processes from interleaving records. Before every prompt, the editor
 replaces its recall list with a freshly loaded snapshot, so commands completed
 in another window become available through Up-arrow at the next prompt.
 
-The on-disk format remains compatible: one command per line, optionally
-preceded by the existing `#<unix-epoch>` marker. `HISTORY_IGNORE` is applied
-before append and again while loading; the latter preserves the documented
-"keep only the latest occurrence" behavior without destructively compacting a
-file another shell is using. Persistence occurs only after command resolution,
-so `no_such_command` continues to omit failed simple commands.
+The original on-disk format used one command per line, optionally preceded by
+the existing `#<unix-epoch>` marker. Section 40 extends it with comment-form
+session metadata while retaining backward-compatible parsing.
+`HISTORY_IGNORE` is applied before append and again while loading; the latter
+preserves the documented "keep only the latest occurrence" behavior.
+Persistence occurs only after command resolution, so `no_such_command`
+continues to omit failed simple commands.
 
 Verified with unit tests for live rule detection and exact editor removal, the full suite, and a real piped interactive session against the compiled executable. With the default rules, `echo kept`, a deliberately nonexistent command, and `exit` produced a persisted history containing exactly `echo kept` and `exit`.
 
@@ -702,3 +703,77 @@ instants, both spring-forward resolutions, unknown zones, and invalid policy
 names. The release-binary exercise in
 `scripts/exercise/15_native_datetime.ion` covers the same method through the
 real parser and expansion path.
+
+## 40. Persistent history sessions, limits, and compaction
+
+Each interactive process receives a generated `$HISTORY_SESSION_ID`, stable
+for that process and visible to scripts. Appended batches start with
+`#@session=ID`; the marker remains active until another marker appears, just
+as `#<epoch>` attaches timestamp metadata to the following command. Old files
+with neither marker parse as legacy records with no session, and the new
+markers are Ion comments to older readers.
+
+The new `history` builtin exposes the metadata without changing Up-arrow
+behavior:
+
+- `history` shows the current filtered recall snapshot.
+- `history --session current` or `--session ID` filters by session.
+- `history --sessions` lists persisted session IDs and command counts.
+- `history --limit N` shows only the latest N matching entries.
+- `history --compact` applies the current persisted-file limit immediately.
+
+The previously ignored manual variables are now enforced with the manual's
+documented defaults: `HISTORY_SIZE=1000` limits commands loaded into the
+editor, while `HISTFILE_SIZE=100000` limits commands retained on disk. Values
+are live Ion scalars and `0` therefore means retain zero entries. Limits count
+commands, not metadata lines.
+
+Every append still holds the path-derived cross-process mutex. If the file is
+over its limit, records are parsed, the latest entries retained with their
+session/timestamp metadata, and a same-directory temporary file is atomically
+installed with Windows `MoveFileExW(MOVEFILE_REPLACE_EXISTING |
+MOVEFILE_WRITE_THROUGH)`. Readers and other writers use the same mutex, so
+they never observe the replacement mid-flight or overwrite a concurrent
+append.
+
+Six focused tests cover legacy/new-format round trips, stable and unique IDs,
+memory and file limits, session inspection, metadata preservation, and twelve
+simultaneous compacting writers. A release-binary smoke test ran two shells
+concurrently against one file, observed two distinct session IDs, then used a
+third shell to inspect and atomically compact the file to five commands.
+
+## 41. Grapheme-safe Unicode terminal editing
+
+The interactive editor previously stored Unicode scalar values but treated
+each scalar as one editable character and one terminal column. That corrupted
+editing semantics for combining text (`é`), ZWJ emoji (`👩‍💻`), flags
+(`🇦🇺`), and double-width CJK text (`中文`). It also ignored crossterm
+`Event::Paste`, which explained a real report where pasted emoji components
+vanished while the surrounding Latin and Chinese text survived.
+
+Raw-mode editing now enables crossterm bracketed paste and inserts a complete
+paste event in one operation (normalizing embedded newlines to spaces, as the
+native Ctrl+V path already did). The mode is explicitly disabled before raw
+mode ends. Crossterm's Windows backend already joins UTF-16 surrogate pairs
+for directly entered non-BMP characters, so no second Windows-specific input
+decoder is needed.
+
+The buffer remains a `Vec<char>` for compatibility with syntax highlighting,
+completion, selection, and existing tests, but every single-step movement,
+Shift-selection extension, Backspace, Delete, and Ctrl+D now resolves the
+previous/next extended grapheme boundary through `unicode-segmentation`.
+Selections therefore cannot be extended into the middle of an emoji or
+combining sequence.
+
+Cursor placement uses `unicode-width` over the prompt plus text before the
+cursor, accounting for zero-width combining marks, two-column emoji
+ligatures, and wide CJK characters. Completion assembly was also corrected:
+its token start is a UTF-8 byte offset while the editor cursor is a scalar
+index, so prefix/suffix slicing now occurs in separately constructed strings
+rather than mixing those units.
+
+Four focused regression tests cover exact boundaries, whole-grapheme
+Backspace/Delete, lossless insertion of the reported Unicode mix, and display
+columns. The full suite contains 255 passing tests. Actual terminal event and
+font rendering still require the user-facing Windows Terminal check because
+the automated runner has no TTY.

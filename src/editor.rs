@@ -17,19 +17,24 @@
 //!   behaves like Delete (matches common shell convention)
 //! - Shift+Arrow/Home/End: select text; typing replaces it and
 //!   Backspace/Delete removes it
+//! - Bracketed paste: insert pasted Unicode as one editable operation
+//! - Left/Right/Backspace/Delete: move/delete by extended grapheme cluster
 //!
 //! NOT implemented: Ctrl+R/Ctrl+S incremental history search, Ctrl+F
-//! autosuggestion acceptance, Vi keybindings, and persisting history to
-//! `$HOME/.local/share/ion/history` across sessions (history here is
-//! in-memory for the current process only) — see ARCHITECTURE.md.
+//! autosuggestion acceptance and Vi keybindings — see ARCHITECTURE.md.
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
+};
 use crossterm::style::Stylize;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use crossterm::{cursor, execute, terminal};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 /// Runtime on/off switch for live syntax highlighting, toggled via the
 /// `highlight on|off` builtin (see `shell.rs`). A plain global rather than
@@ -216,7 +221,9 @@ impl LineEditor {
                 None => EditorOutcome::Eof,
             };
         }
+        let _ = execute!(io::stdout(), EnableBracketedPaste);
         let result = self.run_editor(prompt, allow_abort);
+        let _ = execute!(io::stdout(), DisableBracketedPaste);
         let _ = disable_raw_mode();
         // Raw mode suppresses normal newline echo; move to a fresh line
         // ourselves before the caller prints anything further.
@@ -240,6 +247,17 @@ impl LineEditor {
                 Err(_) => return EditorOutcome::Eof,
             };
 
+            if let Event::Paste(text) = event {
+                insert_text(
+                    &mut buffer,
+                    &mut cursor_pos,
+                    &mut selection_anchor,
+                    &single_line_clipboard_text(&text),
+                );
+                redraw(prompt, &buffer, cursor_pos, selection_anchor);
+                continue;
+            }
+
             let Event::Key(KeyEvent {
                 code,
                 modifiers,
@@ -247,7 +265,7 @@ impl LineEditor {
                 ..
             }) = event
             else {
-                continue; // ignore resize/mouse/focus/paste events
+                continue; // ignore resize/mouse/focus events
             };
             // Windows reports both press and release; only act once per key.
             if kind == KeyEventKind::Release {
@@ -291,16 +309,13 @@ impl LineEditor {
                 (KeyCode::Char('v'), m) if m.contains(KeyModifiers::CONTROL) => {
                     match crate::clipboard::read_text() {
                         Ok(text) => {
-                            delete_selection(
+                            let text = single_line_clipboard_text(&text);
+                            insert_text(
                                 &mut buffer,
                                 &mut cursor_pos,
                                 &mut selection_anchor,
+                                &text,
                             );
-                            let text = single_line_clipboard_text(&text);
-                            let inserted: Vec<char> = text.chars().collect();
-                            let count = inserted.len();
-                            buffer.splice(cursor_pos..cursor_pos, inserted);
-                            cursor_pos += count;
                         }
                         Err(_) => {
                             print!("\x07");
@@ -312,10 +327,8 @@ impl LineEditor {
                     if buffer.is_empty() {
                         return EditorOutcome::Eof;
                     }
-                    if !delete_selection(&mut buffer, &mut cursor_pos, &mut selection_anchor)
-                        && cursor_pos < buffer.len()
-                    {
-                        buffer.remove(cursor_pos);
+                    if !delete_selection(&mut buffer, &mut cursor_pos, &mut selection_anchor) {
+                        delete_next_grapheme(&mut buffer, cursor_pos);
                     }
                 }
                 (KeyCode::Char('u'), m) if m.contains(KeyModifiers::CONTROL) => {
@@ -376,18 +389,13 @@ impl LineEditor {
                     }
                 }
                 (KeyCode::Backspace, _) => {
-                    if !delete_selection(&mut buffer, &mut cursor_pos, &mut selection_anchor)
-                        && cursor_pos > 0
-                    {
-                        buffer.remove(cursor_pos - 1);
-                        cursor_pos -= 1;
+                    if !delete_selection(&mut buffer, &mut cursor_pos, &mut selection_anchor) {
+                        delete_previous_grapheme(&mut buffer, &mut cursor_pos);
                     }
                 }
                 (KeyCode::Delete, _) => {
-                    if !delete_selection(&mut buffer, &mut cursor_pos, &mut selection_anchor)
-                        && cursor_pos < buffer.len()
-                    {
-                        buffer.remove(cursor_pos);
+                    if !delete_selection(&mut buffer, &mut cursor_pos, &mut selection_anchor) {
+                        delete_next_grapheme(&mut buffer, cursor_pos);
                     }
                 }
                 (KeyCode::Left, m)
@@ -411,11 +419,11 @@ impl LineEditor {
                     cursor_pos = next_word_boundary(&buffer, cursor_pos);
                 }
                 (KeyCode::Left, m) if m.contains(KeyModifiers::SHIFT) => {
-                    let destination = cursor_pos.saturating_sub(1);
+                    let destination = prev_grapheme_boundary(&buffer, cursor_pos);
                     extend_selection(&mut selection_anchor, &mut cursor_pos, destination);
                 }
                 (KeyCode::Right, m) if m.contains(KeyModifiers::SHIFT) => {
-                    let destination = (cursor_pos + 1).min(buffer.len());
+                    let destination = next_grapheme_boundary(&buffer, cursor_pos);
                     extend_selection(&mut selection_anchor, &mut cursor_pos, destination);
                 }
                 (KeyCode::Home, m) if m.contains(KeyModifiers::SHIFT) => {
@@ -426,11 +434,11 @@ impl LineEditor {
                 }
                 (KeyCode::Left, _) => {
                     selection_anchor = None;
-                    cursor_pos = cursor_pos.saturating_sub(1);
+                    cursor_pos = prev_grapheme_boundary(&buffer, cursor_pos);
                 }
                 (KeyCode::Right, _) => {
                     selection_anchor = None;
-                    cursor_pos = (cursor_pos + 1).min(buffer.len());
+                    cursor_pos = next_grapheme_boundary(&buffer, cursor_pos);
                 }
                 (KeyCode::Home, _) => {
                     selection_anchor = None;
@@ -564,6 +572,62 @@ fn delete_selection(
     true
 }
 
+fn insert_text(
+    buffer: &mut Vec<char>,
+    cursor_pos: &mut usize,
+    selection_anchor: &mut Option<usize>,
+    text: &str,
+) {
+    delete_selection(buffer, cursor_pos, selection_anchor);
+    let inserted: Vec<char> = text.chars().collect();
+    let count = inserted.len();
+    buffer.splice(*cursor_pos..*cursor_pos, inserted);
+    *cursor_pos += count;
+}
+
+fn prev_grapheme_boundary(buffer: &[char], pos: usize) -> usize {
+    if pos == 0 {
+        return 0;
+    }
+    let prefix: String = buffer[..pos].iter().collect();
+    pos - prefix
+        .graphemes(true)
+        .next_back()
+        .map(|grapheme| grapheme.chars().count())
+        .unwrap_or(0)
+}
+
+fn next_grapheme_boundary(buffer: &[char], pos: usize) -> usize {
+    if pos >= buffer.len() {
+        return buffer.len();
+    }
+    let suffix: String = buffer[pos..].iter().collect();
+    pos + suffix
+        .graphemes(true)
+        .next()
+        .map(|grapheme| grapheme.chars().count())
+        .unwrap_or(0)
+}
+
+fn delete_previous_grapheme(buffer: &mut Vec<char>, cursor_pos: &mut usize) -> bool {
+    let start = prev_grapheme_boundary(buffer, *cursor_pos);
+    if start == *cursor_pos {
+        return false;
+    }
+    buffer.drain(start..*cursor_pos);
+    *cursor_pos = start;
+    true
+}
+
+fn delete_next_grapheme(buffer: &mut Vec<char>, cursor_pos: usize) -> bool {
+    let end = next_grapheme_boundary(buffer, cursor_pos);
+    if end == cursor_pos {
+        return false;
+    }
+    buffer.drain(cursor_pos..end);
+    true
+}
+
 /// Adds reverse-video SGR around a visible character range while preserving
 /// syntax colors. Syntax spans use reset codes, so reverse video is re-applied
 /// after every SGR sequence inside the selected range.
@@ -603,9 +667,10 @@ fn apply_selection_highlight(rendered: &str, range: (usize, usize)) -> String {
 }
 
 /// Repaints the current line: clears it, reprints `prompt` + buffer
-/// contents, then positions the terminal cursor at `cursor_pos` within the
-/// buffer (not byte position — `char` position, consistent with the
-/// buffer's own indexing).
+/// contents, then positions the terminal cursor at the displayed column for
+/// `cursor_pos`. The buffer index is a Unicode-scalar boundary, while the
+/// terminal column accounts for combining marks, emoji ligatures, and
+/// double-width CJK characters.
 fn redraw(prompt: &str, buffer: &[char], cursor_pos: usize, selection_anchor: Option<usize>) {
     let mut stdout = io::stdout();
     let _ = execute!(
@@ -624,11 +689,16 @@ fn redraw(prompt: &str, buffer: &[char], cursor_pos: usize, selection_anchor: Op
     }
     print!("{prompt}{rendered}");
     let _ = stdout.flush();
-    // Color escape sequences are zero-width, so the cursor's target column
-    // is still just prompt length + character offset into the buffer,
-    // regardless of whether `rendered` above is colored or plain.
-    let target_col = (prompt.chars().count() + cursor_pos) as u16;
+    let target_col = cursor_column(prompt, buffer, cursor_pos);
     let _ = execute!(stdout, cursor::MoveToColumn(target_col));
+}
+
+fn cursor_column(prompt: &str, buffer: &[char], cursor_pos: usize) -> u16 {
+    let before_cursor: String = buffer[..cursor_pos].iter().collect();
+    prompt
+        .width()
+        .saturating_add(before_cursor.width())
+        .min(u16::MAX as usize) as u16
 }
 
 fn read_line_plain(prompt: &str) -> Option<String> {
@@ -642,7 +712,6 @@ fn read_line_plain(prompt: &str) -> Option<String> {
 }
 
 fn complete(buffer: &[char], cursor_pos: usize) -> Option<(Vec<char>, usize)> {
-    let line: String = buffer.iter().collect();
     let before_cursor: String = buffer[..cursor_pos].iter().collect();
     let token_start = before_cursor
         .rfind(char::is_whitespace)
@@ -664,13 +733,10 @@ fn complete(buffer: &[char], cursor_pos: usize) -> Option<(Vec<char>, usize)> {
         return None;
     }
 
-    let new_line = format!(
-        "{}{}{}",
-        &line[..token_start],
-        completion,
-        &line[cursor_pos..]
-    );
-    let new_cursor_pos = token_start + completion.chars().count();
+    let prefix = &before_cursor[..token_start];
+    let suffix: String = buffer[cursor_pos..].iter().collect();
+    let new_line = format!("{prefix}{completion}{suffix}");
+    let new_cursor_pos = prefix.chars().count() + completion.chars().count();
     Some((new_line.chars().collect(), new_cursor_pos))
 }
 
@@ -833,6 +899,57 @@ mod tests {
             single_line_clipboard_text("one\r\ntwo\nthree\rfour"),
             "one two three four"
         );
+    }
+
+    #[test]
+    fn grapheme_boundaries_keep_combining_emoji_flag_and_cjk_clusters_whole() {
+        let buffer: Vec<char> = "e\u{301}👩‍💻🇦🇺中文".chars().collect();
+        let boundaries = [0, 2, 5, 7, 8, 9];
+        for pair in boundaries.windows(2) {
+            assert_eq!(next_grapheme_boundary(&buffer, pair[0]), pair[1]);
+            assert_eq!(prev_grapheme_boundary(&buffer, pair[1]), pair[0]);
+        }
+    }
+
+    #[test]
+    fn backspace_and_delete_remove_complete_graphemes() {
+        let mut backward: Vec<char> = "Ae\u{301}👩‍💻🇦🇺中".chars().collect();
+        let mut cursor = backward.len();
+        for expected in ["Ae\u{301}👩‍💻🇦🇺", "Ae\u{301}👩‍💻", "Ae\u{301}", "A"] {
+            assert!(delete_previous_grapheme(&mut backward, &mut cursor));
+            assert_eq!(backward.iter().collect::<String>(), expected);
+        }
+
+        let mut forward: Vec<char> = "e\u{301}👩‍💻🇦🇺中".chars().collect();
+        for expected in ["👩‍💻🇦🇺中", "🇦🇺中", "中", ""] {
+            assert!(delete_next_grapheme(&mut forward, 0));
+            assert_eq!(forward.iter().collect::<String>(), expected);
+        }
+    }
+
+    #[test]
+    fn paste_insertion_preserves_complete_unicode_text() {
+        let mut buffer: Vec<char> = "echo \"\"".chars().collect();
+        let mut cursor = 6;
+        let mut anchor = None;
+        insert_text(
+            &mut buffer,
+            &mut cursor,
+            &mut anchor,
+            "café e\u{301} 👩‍💻 🇦🇺 中文",
+        );
+        assert_eq!(
+            buffer.iter().collect::<String>(),
+            "echo \"café e\u{301} 👩‍💻 🇦🇺 中文\""
+        );
+    }
+
+    #[test]
+    fn cursor_column_uses_terminal_display_width() {
+        let buffer: Vec<char> = "e\u{301}👩‍💻🇦🇺中文".chars().collect();
+        assert_eq!(cursor_column("ion> ", &buffer, 2), 6);
+        assert_eq!(cursor_column("ion> ", &buffer, 5), 8);
+        assert_eq!(cursor_column("ion> ", &buffer, buffer.len()), 14);
     }
 
     #[test]

@@ -353,6 +353,11 @@ pub const BUILTINS: &[Builtin] = &[
         help_display: Some("highlight on|off"),
     },
     Builtin {
+        name: "history",
+        is_keyword: false,
+        help_display: Some("history"),
+    },
+    Builtin {
         name: "cls",
         is_keyword: false,
         help_display: Some("cls"),
@@ -424,7 +429,7 @@ Commands by category
   Conditions       test  matches  bool  contains  starts-with  ends-with
                    eq/is  exists  intersects  isatty  true  false  not
   Tables           from-json  from-csv  select  where/filter  to-json  to-csv
-  State & jobs     pvar  jobs  wait  disown  which/type
+  State & jobs     pvar  history  jobs  wait  disown  which/type
   Editor           highlight  cls
 
 Examples
@@ -549,17 +554,25 @@ pub fn help_text(topic: Option<&str>) -> Result<String, String> {
             ],
         ),
         "history" => page(
-            "let HISTORY_SETTING = VALUE",
-            "History is appended immediately and shared safely across ion-win windows. Each prompt refreshes Up-arrow recall.",
+            "history [--session ID|current] [--limit N]\n        history --sessions\n        history --compact",
+            "History is appended immediately and shared safely across ion-win windows. Every shell process has a persistent session ID; each prompt refreshes Up-arrow recall.",
             &[
+                "echo $HISTORY_SESSION_ID",
+                "history --session current",
+                "history --sessions",
+                "history --limit 20",
+                "history --compact",
                 "echo $HISTFILE",
+                "let HISTORY_SIZE = 1000",
+                "let HISTFILE_SIZE = 100000",
                 "let HISTORY_TIMESTAMP = true",
                 "let HISTORY_IGNORE = [duplicates whitespace no_such_command]",
                 "let HISTFILE_ENABLED = false",
             ],
             &[
                 "Supported ignore rules: all, whitespace, duplicates, no_such_command, regex:PATTERN.",
-                "HISTFILE changes take effect live.",
+                "HISTORY_SIZE limits in-memory recall; HISTFILE_SIZE limits persisted command entries.",
+                "HISTFILE and both size limits take effect live.",
             ],
         ),
         "exit" | "quit" => page("exit", "Exits the current ion-win shell.", &[], &["`quit` is an alias."]),
