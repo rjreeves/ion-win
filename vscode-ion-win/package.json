@@ -1,0 +1,82 @@
+{
+    "name": "ion-win-language",
+    "displayName": "ion-win Language Support",
+    "description": "Syntax highlighting, editing support, snippets, and script running for ion-win.",
+    "version": "0.1.0",
+    "publisher": "rjreeves",
+    "license": "MIT",
+    "engines": {
+        "vscode": "^1.85.0"
+    },
+    "categories": [
+        "Programming Languages",
+        "Snippets",
+        "Other"
+    ],
+    "activationEvents": [
+        "onCommand:ion-win.runFile"
+    ],
+    "main": "./extension.js",
+    "contributes": {
+        "languages": [
+            {
+                "id": "ion-win",
+                "aliases": [
+                    "ion-win",
+                    "Ion"
+                ],
+                "extensions": [
+                    ".ion"
+                ],
+                "configuration": "./language-configuration.json"
+            }
+        ],
+        "grammars": [
+            {
+                "language": "ion-win",
+                "scopeName": "source.ion-win",
+                "path": "./syntaxes/ion-win.tmLanguage.json"
+            }
+        ],
+        "snippets": [
+            {
+                "language": "ion-win",
+                "path": "./snippets/ion-win.json"
+            }
+        ],
+        "commands": [
+            {
+                "command": "ion-win.runFile",
+                "title": "Run Current Ion Script",
+                "category": "Ion",
+                "icon": "$(play)"
+            }
+        ],
+        "menus": {
+            "editor/title": [
+                {
+                    "command": "ion-win.runFile",
+                    "when": "editorLangId == ion-win",
+                    "group": "navigation"
+                }
+            ],
+            "editor/context": [
+                {
+                    "command": "ion-win.runFile",
+                    "when": "editorLangId == ion-win",
+                    "group": "navigation"
+                }
+            ]
+        },
+        "configuration": {
+            "title": "ion-win",
+            "properties": {
+                "ion-win.executablePath": {
+                    "type": "string",
+                    "default": "",
+                    "description": "Path to ion-win.exe. ${workspaceFolder} is supported. When empty, the extension checks target/release/ion-win.exe and then PATH."
+                }
+            }
+        }
+    }
+}

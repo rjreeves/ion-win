@@ -1,0 +1,89 @@
+{
+    "Scalar variable": {
+        "prefix": "let",
+        "body": [
+            "let ${1:name} = ${2:value}"
+        ],
+        "description": "Define an Ion scalar"
+    },
+    "Typed variable": {
+        "prefix": "lett",
+        "body": [
+            "let ${1:name}: ${2|str,bool,int,float,date,time,datetime,duration|} = ${3:value}"
+        ],
+        "description": "Define a typed Ion scalar"
+    },
+    "Array variable": {
+        "prefix": "leta",
+        "body": [
+            "let ${1:items} = [${2:one two three}]"
+        ],
+        "description": "Define an Ion array"
+    },
+    "If block": {
+        "prefix": "if",
+        "body": [
+            "if ${1:test -e file.txt}",
+            "\t${2:echo found}",
+            "else",
+            "\t${3:echo missing}",
+            "end"
+        ],
+        "description": "Ion if/else block"
+    },
+    "While loop": {
+        "prefix": "while",
+        "body": [
+            "while ${1:test $n -lt 10}",
+            "\t${2:let n += 1}",
+            "end"
+        ],
+        "description": "Ion while loop"
+    },
+    "For loop": {
+        "prefix": "for",
+        "body": [
+            "for ${1:item} in ${2:@items}",
+            "\techo \\$${1:item}",
+            "end"
+        ],
+        "description": "Ion for loop"
+    },
+    "Function": {
+        "prefix": "fn",
+        "body": [
+            "fn ${1:name} ${2:argument}: ${3:str}",
+            "\techo \"\\$${2:argument}\"",
+            "end"
+        ],
+        "description": "Define an Ion function"
+    },
+    "Match block": {
+        "prefix": "match",
+        "body": [
+            "match ${1:$value}",
+            "case ${2:expected}",
+            "\t${3:echo matched}",
+            "case _",
+            "\t${4:echo other}",
+            "end"
+        ],
+        "description": "Ion match/case block"
+    },
+    "Table manifest": {
+        "prefix": "manifest",
+        "body": [
+            "let manifest = find ${1:.} --recurse | stat${2: --hash sha256}",
+            "echo \"Rows: $len(manifest)\"",
+            "manifest | select ${3:path size} | to-csv"
+        ],
+        "description": "Create and use a file manifest table"
+    },
+    "Formatted date": {
+        "prefix": "datefmt",
+        "body": [
+            "echo \\$date_format(${1:\\$now()} ${2:dd-MMM-yy})"
+        ],
+        "description": "Format an Ion date or datetime"
+    }
+}

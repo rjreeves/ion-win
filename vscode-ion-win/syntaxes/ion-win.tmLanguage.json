@@ -1,0 +1,128 @@
+{
+    "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+    "name": "ion-win",
+    "scopeName": "source.ion-win",
+    "patterns": [
+        {
+            "include": "#comments"
+        },
+        {
+            "include": "#strings"
+        },
+        {
+            "include": "#variables"
+        },
+        {
+            "include": "#keywords"
+        },
+        {
+            "include": "#builtins"
+        },
+        {
+            "include": "#types"
+        },
+        {
+            "include": "#constants"
+        },
+        {
+            "include": "#operators"
+        }
+    ],
+    "repository": {
+        "comments": {
+            "patterns": [
+                {
+                    "name": "comment.line.number-sign.ion-win",
+                    "match": "#.*$"
+                }
+            ]
+        },
+        "strings": {
+            "patterns": [
+                {
+                    "name": "string.quoted.double.ion-win",
+                    "begin": "\"",
+                    "end": "\"",
+                    "patterns": [
+                        {
+                            "name": "constant.character.escape.ion-win",
+                            "match": "\\\\."
+                        },
+                        {
+                            "include": "#variables"
+                        }
+                    ]
+                },
+                {
+                    "name": "string.quoted.single.ion-win",
+                    "begin": "'",
+                    "end": "'"
+                }
+            ]
+        },
+        "variables": {
+            "patterns": [
+                {
+                    "name": "support.function.method.ion-win",
+                    "match": "[$@][A-Za-z_][A-Za-z0-9_-]*(?=\\()"
+                },
+                {
+                    "name": "variable.other.environment.ion-win",
+                    "match": "\\$\\{env::[A-Za-z_][A-Za-z0-9_]*\\}"
+                },
+                {
+                    "name": "variable.other.array.ion-win",
+                    "match": "@(?:\\{[A-Za-z_][A-Za-z0-9_]*\\}|[A-Za-z_][A-Za-z0-9_]*)"
+                },
+                {
+                    "name": "variable.other.scalar.ion-win",
+                    "match": "\\$(?:\\{[A-Za-z_][A-Za-z0-9_:]*\\}|[A-Za-z_][A-Za-z0-9_]*)"
+                }
+            ]
+        },
+        "keywords": {
+            "patterns": [
+                {
+                    "name": "keyword.control.ion-win",
+                    "match": "\\b(?:let|export|drop|if|else|while|for|in|fn|match|case|end|break|continue|not|and|or)\\b"
+                }
+            ]
+        },
+        "builtins": {
+            "patterns": [
+                {
+                    "name": "support.function.builtin.ion-win",
+                    "match": "(?<![A-Za-z0-9_-])(?:exit|quit|help|read|echo|cd|pushd|popd|pwd|dirs|folders|files|find|cat|stat|copy|cp|mkdir|md|move|mv|rename|ren|compress|delete|test|matches|true|false|bool|contains|starts-with|ends-with|eq|is|exists|intersects|isatty|which|type|eval|pvar|dmark|jobs|wait|disown|source|highlight|cls|from-json|select|where|filter|to-json|from-csv|to-csv)(?![A-Za-z0-9_-])"
+                }
+            ]
+        },
+        "types": {
+            "patterns": [
+                {
+                    "name": "storage.type.ion-win",
+                    "match": "\\b(?:str|bool|int|float|date|time|datetime|timestamp|duration|interval)\\b"
+                }
+            ]
+        },
+        "constants": {
+            "patterns": [
+                {
+                    "name": "constant.language.boolean.ion-win",
+                    "match": "\\b(?:true|false)\\b"
+                },
+                {
+                    "name": "constant.numeric.ion-win",
+                    "match": "(?<![\\w.])-?\\b(?:0x[0-9A-Fa-f]+|\\d+(?:\\.\\d+)?)\\b"
+                }
+            ]
+        },
+        "operators": {
+            "patterns": [
+                {
+                    "name": "keyword.operator.ion-win",
+                    "match": "&&|\\|\\||\\^\\||&\\||>>|&>|\\^>|[|><=&+*/%-]"
+                }
+            ]
+        }
+    }
+}

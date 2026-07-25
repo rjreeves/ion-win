@@ -1,0 +1,14 @@
+{
+    "terminal.integrated.profiles.windows": {
+        "ion-win": {
+            "path": "${workspaceFolder}\\target\\release\\ion-win.exe",
+            "overrideName": true,
+            "icon": "terminal"
+        }
+    },
+    "terminal.integrated.defaultProfile.windows": "ion-win",
+    "files.associations": {
+        "*.ion": "ion-win"
+    },
+    "ion-win.executablePath": "${workspaceFolder}\\target\\release\\ion-win.exe"
+}
