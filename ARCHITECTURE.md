@@ -754,9 +754,17 @@ vanished while the surrounding Latin and Chinese text survived.
 Raw-mode editing now enables crossterm bracketed paste and inserts a complete
 paste event in one operation (normalizing embedded newlines to spaces, as the
 native Ctrl+V path already did). The mode is explicitly disabled before raw
-mode ends. Crossterm's Windows backend already joins UTF-16 surrogate pairs
-for directly entered non-BMP characters, so no second Windows-specific input
-decoder is needed.
+mode ends.
+
+A real Windows Terminal paste exposed a separate crossterm 0.27 bug:
+`ReadConsoleInputW` reports a press and release for each UTF-16 code unit, but
+crossterm fed both events into its surrogate-pair accumulator. A high-surrogate
+release was therefore paired with its own press and discarded before the low
+surrogate arrived, dropping every non-BMP character while leaving BMP text
+(including a standalone zero-width joiner) intact. `Cargo.toml` pins a minimal
+vendored crossterm 0.27 patch which ignores surrogate release records. Its
+focused regression test reproduces the exact high-press, high-release,
+low-press sequence and confirms it emits the intended scalar.
 
 The buffer remains a `Vec<char>` for compatibility with syntax highlighting,
 completion, selection, and existing tests, but every single-step movement,
@@ -772,8 +780,12 @@ its token start is a UTF-8 byte offset while the editor cursor is a scalar
 index, so prefix/suffix slicing now occurs in separately constructed strings
 rather than mixing those units.
 
-Four focused regression tests cover exact boundaries, whole-grapheme
+Four ion-win regression tests cover exact boundaries, whole-grapheme
 Backspace/Delete, lossless insertion of the reported Unicode mix, and display
-columns. The full suite contains 255 passing tests. Actual terminal event and
-font rendering still require the user-facing Windows Terminal check because
-the automated runner has no TTY.
+columns; the vendored decoder adds the Windows event-sequence regression. The
+full suite contains 255 passing tests. A user-facing Windows Terminal test
+confirmed lossless entry and execution of `café é 👩‍💻 🇦🇺 中文`. Windows
+Terminal renders the valid contiguous regional-indicator pair as a blended
+`AU` fallback on this machine, while PowerShell and VS Code show two distinct
+letters; this is glyph shaping, not data loss, so ion-win deliberately leaves
+the underlying `🇦🇺` text unchanged.
