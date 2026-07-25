@@ -7,7 +7,7 @@ Native Windows port of the [Ion shell](docs/ion-manual.pdf) (originally built fo
 ```
 cd ion-win
 cargo build              # debug build
-cargo test                # 226 tests, all passing
+cargo test                # 260 tests, all passing
 cargo run                 # interactive REPL
 cargo run -- script.ion arg1 arg2   # run a script file
 ```
@@ -18,37 +18,40 @@ No special setup needed — it's a standard Cargo binary crate. `.gitignore`/`.g
 
 A working, reasonably faithful interpreter for Ion's language (variables, control flow, functions, expansions, pipelines) plus a real interactive line editor — not a toy. It's driven entirely from the [ion-manual.pdf](docs/ion-manual.pdf) spec: nearly every feature below was implemented by reading the manual's own worked examples and writing tests that reproduce their exact output, byte-for-byte. Where the manual was ambiguous or silent, that's called out explicitly rather than guessed at.
 
-## Module map (11,920 lines across 26 files)
+## Module map (14,021 lines across 30 files)
 
 | File | Lines | Purpose |
 |---|---|---|
-| `interp.rs` | 2243 | The core: tokenizer (pipe/redirect/chain/background operators always split into their own token, even with no surrounding whitespace), `$`/`@` expansion, variable scope stack (scalars/arrays/tables), `let`/`export`/`drop`, method-call and process-expansion dispatch, `echo` output/capture. The biggest and most load-bearing file. |
-| `shell.rs` | 1815 | REPL loop and prompt rendering (`PROMPT` function support), block/control-flow execution (`if`/`while`/`for`/`fn`/`match`/`case`), directory-stack and terminal helpers, `cd`, `&&`/`||`/`and`/`or` chaining, table capture, dispatch of all builtins |
-| `pipeline_exec.rs` | 1083 | Real OS pipeline execution (`Command`/`Stdio` chaining), background-job registration, structured-pipeline and manifest stages (`from-json`/CSV, `select`/`where`, `stat`/`find`, `copy`/`move`/`compress`/`delete`), table-capturing pipeline runner |
-| `editor.rs` | 871 | Crossterm raw-mode line editor (arrow keys, shared history, Tab-completion, word-editing shortcuts, Shift-selection, live syntax highlighting) with fallback to plain stdin |
-| `ranges.rs` | 659 | Slice parsing (`[start..end]`) + brace expansion: ranges (`{1..10}`) and permutation lists (`{ext1,ext2}`, nested) |
-| `methods.rs` | 520 | String/array methods (`$len`, `@split`, Unicode graphemes, etc.) |
-| `arith.rs` | 430 | `$(( expr ))` arithmetic expansion (recursive-descent parser) |
-| `state.rs` | 302 | `redb`-backed key/value store for `pvar`/`dmark` |
-| `history.rs` | 440 | Live cross-window command history (locked append, refresh, filtering, timestamps) |
-| `builtins.rs` | 262 | `test`/`matches`/`bool`/`contains`/`starts-with`/`ends-with`/`eq`/`is`/`isatty` condition evaluators |
-| `table.rs` | 500 | Structured "table" data (`from-json`/`select`/`where`/`to-json`/`from-csv`/`to-csv`): parsing, projection, filtering, JSON/CSV round-tripping |
-| `fs_builtins.rs` | 335 | `pwd`/`dirs`/`folders`/`files`/`cat`/`find` |
-| `stat.rs` | 217 | `stat FILE... [--hash sha256]`: file metadata into a `Table`, hashing parallelized across files via `tokio::task::spawn_blocking` |
-| `copy.rs` | 440 | `copy`/`cp [--force] SRC... DEST`, and the `Table`-consuming `TABLE \| copy DEST` form: the first file-operation builtin acting on a manifest, copying every file concurrently via `spawn_blocking` |
-| `compress.rs` | 456 | `compress [--force] SRC... DEST.zip`, and the `Table`-consuming form: builds a standard WinZip-compatible `.zip`, compressing every file concurrently via `spawn_blocking` then splicing pre-compressed entries into the final archive with `raw_copy_file` |
-| `delete.rs` | 384 | Safe standalone/table deletion: Windows Recycle Bin by default; permanent removal only behind `--permanent --force`, directories behind `--recurse`, with root/current-directory and reparse-point guards |
-| `pipeline.rs` | 199 | Pipeline/redirect *parsing* (pure data, no execution) |
-| `jobctl.rs` | 160 | Ctrl+C interrupt plumbing: foreground-PID registry, `CTRL_BREAK_EVENT` forwarding, cooperative interrupt flag |
-| `fs_ops.rs` | 390 | Native `mkdir`/`move`/`rename` operations, including safe overwrite rules, same-target protection, cross-volume file fallback, and table-driven moves |
-| `builtin_names.rs` | 724 | Builtin registry for Tab-completion/highlighting plus categorized overview, focused command help, concept guides, examples, aliases, and safety notes |
-| `main.rs` | 125 | Entry point; branches to script-file mode (argv) or interactive `shell::run` |
-| `functions.rs` | 83 | `fn` parameter parsing (typed params, docstrings) |
-| `colorout.rs` | 82 | `err_println!`/`err_eprintln!` — red-on-terminal error output, `NO_COLOR`-aware |
-| `jobs.rs` | 78 | Background-job registry for `jobs`/`wait`/`disown` |
-| `types.rs` | 68 | Shared `str`/`bool`/`int`/`float` type-tag validation |
-| `temporal_column.rs` | 170 | Atomic `date-column` table transformation: parse, format, timezone, and calendar arithmetic |
-| `procexpand.rs` | 36 | `$(cmd)`/`@(cmd)` process-expansion process spawning |
+| `interp.rs` | 2116 | The core: tokenizer, `$`/`@` expansion, variable scope stacks, `let`/`export`/`drop`, and method/process-expansion dispatch |
+| `shell.rs` | 1808 | REPL, prompt rendering, block/control-flow execution, directory helpers, table capture, and builtin dispatch |
+| `pipeline_exec.rs` | 1082 | OS pipeline execution, jobs, structured stages, manifest operations, and table capture |
+| `editor.rs` | 979 | Crossterm line editor: grapheme-safe movement/editing, shared history, completion, selection, clipboard, and highlighting |
+| `history.rs` | 790 | Cross-window command history, session IDs, filtering, limits, locking, and atomic compaction |
+| `temporal.rs` | 762 | Native date/time parsing, formatting, fixed/calendar arithmetic, named zones, and DST policies |
+| `ranges.rs` | 608 | Slices, brace ranges, and nested permutation expansion |
+| `methods.rs` | 540 | String/array methods, Unicode graphemes, and temporal method dispatch |
+| `table.rs` | 460 | Table parsing, projection, filtering, and JSON/CSV round-tripping |
+| `compress.rs` | 410 | Concurrent standard-ZIP compression for explicit paths or table manifests |
+| `copy.rs` | 397 | Concurrent safe file copying for explicit paths or table manifests |
+| `arith.rs` | 394 | `$(( expr ))` recursive-descent arithmetic parser |
+| `fs_ops.rs` | 363 | Native `mkdir`/`move`/`rename`, overwrite rules, and table-driven moves |
+| `delete.rs` | 355 | Recycle-by-default and explicitly gated permanent file/table deletion |
+| `fs_builtins.rs` | 302 | `pwd`/`dirs`/`folders`/`files`/`cat`/`find` |
+| `state.rs` | 278 | `redb`-backed persistent `pvar`/`dmark` state |
+| `builtin_names.rs` | 777 | Completion/highlighting registry plus categorized and focused help |
+| `builtins.rs` | 237 | Condition evaluators such as `test`, `matches`, `contains`, `eq`, and `isatty` |
+| `temporal_column.rs` | 194 | Atomic `date-column` parsing, formatting, timezone, and calendar transforms |
+| `stat.rs` | 192 | Concurrent file metadata and optional SHA-256 table generation |
+| `pipeline.rs` | 178 | Pipeline and redirect parsing |
+| `jobctl.rs` | 141 | Foreground process groups, Ctrl+Break forwarding, and cooperative interrupts |
+| `keyboard_input.rs` | 130 | Buffered, hidden, and fixed-character `read` input modes |
+| `main.rs` | 114 | Entry point for interactive and script execution |
+| `types.rs` | 85 | Primitive and temporal typed-value validation |
+| `clipboard.rs` | 79 | Native Windows Unicode clipboard access |
+| `functions.rs` | 76 | Function parameter and docstring parsing |
+| `colorout.rs` | 72 | Terminal-aware, `NO_COLOR`-aware error output |
+| `jobs.rs` | 70 | Background job registry for `jobs`/`wait`/`disown` |
+| `procexpand.rs` | 32 | External process spawning for `$(cmd)`/`@(cmd)` |
 
 ## Implemented, verified against the manual
 
@@ -97,11 +100,11 @@ A working, reasonably faithful interpreter for Ion's language (variables, contro
 - **Quoted-array fidelity through nested and adjacent contexts** (`ARCHITECTURE.md` §31): double-quoted arrays continue to coerce to one space-joined string inside nested method arguments, and quoted segments concatenated to an unquoted prefix/suffix now remain one shell word without retaining literal quote marks. Trailing variable names are rewritten internally to Ion's braced disambiguation form (`"@arr"tail` → `@{arr}tail`) so the suffix cannot be swallowed into the variable name. Verified by focused tests and the compiled `scripts/exercise/12_language_fidelity.ion` smoke script.
 - **Real Unicode grapheme handling** (`ARCHITECTURE.md` §32): added `unicode-segmentation`; `@graphemes()` now returns extended grapheme clusters rather than aliasing `@chars()`, and user-facing string `$len`, `find` positions, `reverse`, `split_at`, and string indexing/slicing use the same boundaries. `@chars()` deliberately remains Unicode-scalar based and `@bytes()` remains UTF-8-byte based. Combining-mark text and a ZWJ emoji sequence are covered by unit and real-binary tests.
 - **Native date/time values and operations** (`ARCHITECTURE.md` §36): added typed `date`, `time`, `datetime`/`timestamp`, and `duration`/`interval` scalars with canonical ISO representations. `$today()`/`$now()`, constructors, extraction, truncation, fixed-duration arithmetic, instant-aware comparison/difference, and formatting compose with normal Ion expansion. Typed `let` accepts both `name:type` and the documented `name: type` form. Unit coverage plus `scripts/exercise/15_native_datetime.ion` exercise the compiled binary.
-- **Selection-aware clipboard editing** (`ARCHITECTURE.md` §37): Shift-selected text now works with the native Windows Unicode clipboard. `Ctrl+C` copies a selection but remains command interrupt when nothing is selected; `Ctrl+X` cuts only after a successful copy; `Ctrl+V` replaces the selection or inserts at the cursor. Multiline clipboard text is safely flattened to one editable command line. Focused tests cover selection extraction and paste normalization; the full suite contains 235 passing tests.
+- **Selection-aware clipboard editing** (`ARCHITECTURE.md` §37): Shift-selected text now works with the native Windows Unicode clipboard. `Ctrl+C` copies a selection but remains command interrupt when nothing is selected; `Ctrl+X` cuts only after a successful copy; `Ctrl+V` replaces the selection or inserts at the cursor. Multiline clipboard text is safely flattened to one editable command line. Focused tests cover selection extraction and paste normalization, and a user-facing Windows Terminal pass has confirmed selection, replacement/deletion, and all three clipboard shortcuts.
 - **Safe `delete` builtin** (`ARCHITECTURE.md` §33): `delete PATH...` and `TABLE | delete` now complete the manifest-operation family. Default deletion uses Windows `IFileOperation` with recycle-only semantics; permanent deletion requires the exact `--permanent --force` pair. Directories additionally require `--recurse`. Batch output always reports deleted/recycled, skipped, and failed counts; missing paths and table rows without `path` are skipped with warnings. Permanent recursion removes symlinks/junctions themselves without traversing their targets and refuses filesystem roots, the current directory, or its ancestors. Verified by five unit tests, the compiled `scripts/exercise/13_delete_safety.ion`, and an independent real-junction test whose external target survived.
 - **Useful topic-based `help`** (`ARCHITECTURE.md` §34): bare `help` is now a categorized landing page rather than one dense builtin line. `help COMMAND` covers every registered builtin with usage, examples, aliases, and safety notes; conceptual pages cover `syntax`, `tables`, `methods`, and `history`, while `help all` prints the complete command index. Registry-coverage tests prevent new builtins from silently missing focused help.
 - **Native Windows conveniences** (`ARCHITECTURE.md` §35): `mkdir`/`md` creates parent directories; safe `move`/`mv` supports explicit sources and table manifests without overwrite unless `--force`; `rename`/`ren` changes one name in place; `pushd`/`popd` provides a process-local directory stack; and `cls` clears through crossterm. Verified with focused unit tests and the compiled `scripts/exercise/14_windows_conveniences.ion` in an isolated working directory.
-- **Enhanced keyboard input** (`ARCHITECTURE.md` §38): `read -p PROMPT` prints an expandable prompt, `read -s` hides interactive input, and `read -n COUNT` returns after a fixed number of Unicode characters without waiting for Enter; options compose. Ordinary `read` and redirected stdin keep their buffered behavior. Option parsing and field assignment have focused tests, and a real release-binary stdin session verifies prompt expansion, multiword values, fixed-count truncation, and silent assignment. Raw no-Enter delivery and hidden echo still need the final Windows Terminal human check.
+- **Enhanced keyboard input** (`ARCHITECTURE.md` §38): `read -p PROMPT` prints an expandable prompt, `read -s` hides interactive input, and `read -n COUNT` returns after a fixed number of Unicode characters without waiting for Enter; options compose. Ordinary `read` and redirected stdin keep their buffered behavior. Option parsing and field assignment have focused tests, a real release-binary stdin session verifies prompt expansion and assignment, and a user-facing Windows Terminal pass confirms hidden echo plus immediate return after the requested Unicode-character count.
 - **Named timezone and DST conversion** (`ARCHITECTURE.md` §39): `$timezone`/`$at_timezone` converts offset-bearing instants or interprets naive wall times using IANA names such as `Australia/Sydney`. DST folds and gaps reject by default; callers explicitly choose `earlier`/`later` or `shift-forward`/`shift-backward`. The `chrono-tz` database supplies historical/seasonal offsets and exact gap widths. Four focused tests plus the compiled native datetime exercise verify summer/winter offsets and both sides of Sydney's 2026 transitions.
 - **Calendar-relative intervals** (`ARCHITECTURE.md` §42): `duration`/`interval` and `$date_add`/`$date_sub` now accept years and months as true calendar units rather than guessed day counts. Month-end results clamp to the destination's last valid day, mixed intervals apply calendar units before fixed elapsed units, and an optional IANA zone plus the existing fold/gap policies preserves local wall time through DST offset changes. Focused tests cover leap years, subtraction, canonical round-trips, DST transitions, and nonexistent target times; the native datetime smoke script exercises the public forms.
 - **Table-column temporal conversion** (`ARCHITECTURE.md` §43): `TABLE | date-column SOURCE DEST OP [ARGS...]` parses, formats, timezone-adjusts, or performs calendar add/subtract across every row. Explicit source/destination names preserve imported text by default and make in-place replacement deliberate. Missing/invalid cells reject the whole stage with a row number. Three focused tests plus `scripts/exercise/16_temporal_columns.ion` verify JSON capture, multi-stage derivation, DST-aware month arithmetic, CSV output, and canonical parsing.
@@ -117,19 +120,20 @@ Ranked roughly by how much a real user would notice:
 
 Every feature in this codebase was verified two ways, and both matter:
 
-1. **Unit tests** covering manual examples, regressions, concurrency, safety rules, and help coverage (255 passing). Fast, but they only prove the code path you thought to test.
+1. **Unit tests** covering manual examples, regressions, concurrency, safety rules, and help coverage (260 passing). Fast, but they only prove the code path you thought to test.
 2. **Interactive smoke tests** via the actual compiled binary (`cargo build` then pipe a `.ion` script into `target/debug/ion-win.exe`, or spawn it as a subprocess for anything touching real OS state like `cd`/env vars/child processes). This caught several real bugs unit tests missed — e.g. the tokenizer originally split `$(( x * x ))` into garbage tokens because of internal spaces (same bug recurred for `$(cmd)` and `@method(...)` until each was specifically fixed), and `$len([1 2 3])` was silently counting the *literal bracket text's characters* instead of the array's elements until an interactive test caught it.
 
 **Do not skip step 2.** Anything involving `std::env::set_var`, `std::env::set_current_dir`, or spawning child processes should be tested via a real subprocess invocation, never as an in-process `#[test]` — those mutate whole-process state that would race with other tests running concurrently in the same `cargo test` binary.
 
 ## Suggested next steps
 
-Nothing is mid-implementation or broken right now. The best remaining refinements are:
-
-1. Manual interactive testing of selection, clipboard shortcuts, and `read -s`/`read -n` in Windows Terminal. Unicode editing and live history have now passed their user-facing checks.
+Nothing is mid-implementation or known broken right now. All previously
+outstanding Windows Terminal checks—Unicode editing, shared history,
+Shift-selection, clipboard shortcuts, hidden `read -s`, and no-Enter
+`read -n`—have passed their user-facing tests.
 
 Whatever's picked up, follow this session's established rhythm: real-binary smoke test (not just `cargo test`) before claiming anything works, update `ARCHITECTURE.md` with a new numbered section (currently ends at §43) and add an "Implemented, verified" bullet here in `HANDOVER.md`, and don't commit/push without being asked.
 
 ## A note on the interactive line editor
 
-The sandboxed tool environment never provides a real TTY on stdin (confirmed via a direct `IsTerminal` probe), so automated checks cannot exercise raw terminal events. User-facing Windows Terminal tests have now verified Unicode paste/editing and shared-history behavior. Selection rendering, clipboard shortcuts, and raw `read -s`/`read -n` handling still need a human pass.
+The sandboxed tool environment never provides a real TTY on stdin (confirmed via a direct `IsTerminal` probe), so automated checks cannot exercise raw terminal events. User-facing Windows Terminal tests have now verified Unicode paste/editing, shared-history behavior, Shift-selection, clipboard shortcuts, hidden `read -s`, and no-Enter `read -n`; no interactive-editor validation item remains open.

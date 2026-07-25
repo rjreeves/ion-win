@@ -49,11 +49,11 @@ end
 - **Expansion**: `$name`/`@name`/`${name}`/`@{name}`, `$((arithmetic))`, `$(cmd)`/`@(cmd)` process expansion, string/array methods, grapheme-aware length/slicing, brace ranges and permutation lists (`{1..10}`, `{ext1,ext2}`, nesting)
 - **Control flow**: `if`/`else if`/`else`, `while`, `for`/`in`, `match`/`case` with guards, `break`/`continue`, `and`/`or`/`&&`/`||`
 - **Process execution**: pipelines (`|` `^|` `&|`), redirection (`>` `>>` `^>` `&>`), background/disown (`&` `&!`), `jobs`/`wait`/`disown`
-- **Shell UX**: a real interactive line editor (live history shared safely across windows, Tab-completion, word-editing shortcuts, Shift+Arrow text selection, Windows clipboard copy/cut/paste, syntax highlighting), implicit `cd`, persistent `pvar`/`dmark` state, a custom `PROMPT` function, `Ctrl+C` that interrupts the running command without killing the shell
+- **Shell UX**: a real Unicode/grapheme-safe interactive line editor (live history shared safely across windows, Tab-completion, multiline/bracketed paste, word editing, Shift-selection, Windows clipboard copy/cut/paste, syntax highlighting), enhanced `read -p`/`-s`/`-n`, implicit `cd`, persistent `pvar`/`dmark` state, a custom `PROMPT` function, and `Ctrl+C` that interrupts the running command without killing the shell
 - **Discoverable help**: categorized `help`, focused `help COMMAND` pages for every builtin, and concept guides such as `help tables`, `help methods`, and `help history`
 - **Windows conveniences**: recursive `mkdir`/`md`, safe `move`/`mv` (including table manifests), in-place `rename`/`ren`, `pushd`/`popd`, and `cls`
-- **Structured data**: table variables, JSON/CSV pipelines, `$len(table)` row counts, and `$field(row column)` scalar access during row iteration
-- **Native date/time**: validated `date`, `time`, `datetime`, and `duration` types; ISO constructors, local current values, extraction/truncation, arithmetic, instant-aware comparison, difference, and formatting
+- **Structured data**: table variables, JSON/CSV pipelines, `$len(table)` row counts, `$field(row column)` scalar access, and `date-column` transformations for parsing, formatting, timezone conversion, and calendar arithmetic across whole columns
+- **Native date/time**: validated `date`, `time`, `datetime`, and `duration`/`interval` types; ISO constructors, extraction/truncation, instant-aware comparison/difference, formatting, true month/year intervals with end-of-month clamping, and IANA timezone/DST policies
 - **Manifest operations**: `copy`, ZIP `compress`, and safe `delete` (Recycle Bin by default; permanent only with `--permanent --force`)
 - **Conditionals/builtins**: `test`, `matches`, `contains`/`starts-with`/`ends-with`, `eq`/`is`, `exists`, `which`/`type`, `eval`, and more
 

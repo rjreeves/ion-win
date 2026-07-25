@@ -614,10 +614,10 @@ The scalar method family provides `$today()` and `$now()`; `$date`, `$time`,
 `$datetime`, and `$duration` constructors; `$extract` and `$date_trunc`;
 `$date_add`/`$date_sub`; `$date_compare`/`$date_diff`; and `$date_format`.
 Durations accept PostgreSQL-like readable unit pairs such as
-`"2 days 3 hours"` while deliberately excluding calendar-relative months and
-years from this first slice: their length depends on the starting date, unlike
-weeks through milliseconds. Offset-aware datetime comparison compares actual
-instants, so `10:00+10:00` equals `00:00Z`.
+`"2 days 3 hours"`. The initial fixed-duration slice covered weeks through
+milliseconds; true calendar-relative months and years are added in §42 rather
+than approximated as a fixed day count. Offset-aware datetime comparison
+compares actual instants, so `10:00+10:00` equals `00:00Z`.
 
 Timezone behavior is intentionally explicit. `$now()` returns the host's local
 numeric UTC offset, parsed offset datetimes retain their offset through
@@ -647,10 +647,12 @@ incorrectly and could blur the boundary between editing and command execution.
 Clipboard errors ring the terminal bell and leave selected input intact.
 
 Pure editor tests cover selection extraction in both directions and safe
-single-line paste normalization. The full suite contains 235 passing tests.
+single-line paste normalization. The full suite contains 260 passing tests.
 The native clipboard calls compile into both debug and release configurations;
-interactive key delivery still requires a real Windows Terminal rather than
-the test runner's non-TTY stdin.
+the user-facing Windows Terminal pass has now confirmed Shift-selection,
+replacement/deletion, and the Ctrl+C/Ctrl+X/Ctrl+V clipboard shortcuts. The
+automated runner still cannot reproduce raw interactive key delivery because
+its stdin is not a TTY.
 
 ## 38. Enhanced keyboard input
 
@@ -671,9 +673,10 @@ does not invent one because it returns before Enter.
 
 Unit tests cover option validation and the existing last-variable-remainder
 rule. A release-binary stdin session verifies expanded prompts, multiword
-assignment, one-character truncation, and silent-mode assignment. Actual
-no-Enter delivery and hidden terminal echo require a final human check in
-Windows Terminal because automated stdin is not a TTY.
+assignment, one-character truncation, and silent-mode assignment. A
+user-facing Windows Terminal pass additionally confirms that `read -s`
+actually hides typed characters and that `read -n 3` returns immediately
+after the third Unicode character without waiting for Enter.
 
 ## 39. Named timezones and daylight-saving transitions
 
@@ -783,7 +786,7 @@ rather than mixing those units.
 Four ion-win regression tests cover exact boundaries, whole-grapheme
 Backspace/Delete, lossless insertion of the reported Unicode mix, and display
 columns; the vendored decoder adds the Windows event-sequence regression. The
-full suite contains 255 passing tests. A user-facing Windows Terminal test
+full suite contains 260 passing tests. A user-facing Windows Terminal test
 confirmed lossless entry and execution of `café é 👩‍💻 🇦🇺 中文`. Windows
 Terminal renders the valid contiguous regional-indicator pair as a blended
 `AU` fallback on this machine, while PowerShell and VS Code show two distinct
