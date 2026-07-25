@@ -39,7 +39,7 @@ pub fn datetime(value: &str) -> Result<String, String> {
 }
 
 pub fn duration(value: &str) -> Result<String, String> {
-    parse_duration(value).map(format_duration)
+    parse_interval(value).map(format_interval)
 }
 
 pub fn now() -> String {
@@ -247,33 +247,157 @@ pub fn truncate(part: &str, value: &str) -> Result<String, String> {
 }
 
 pub fn add(value: &str, interval: &str) -> Result<String, String> {
-    shift(value, parse_duration(interval)?)
+    shift(value, parse_interval(interval)?)
 }
 
 pub fn subtract(value: &str, interval: &str) -> Result<String, String> {
-    shift(value, -parse_duration(interval)?)
+    shift(value, parse_interval(interval)?.checked_neg()?)
 }
 
-fn shift(value: &str, amount: Duration) -> Result<String, String> {
+pub fn add_in_timezone(
+    value: &str,
+    interval: &str,
+    zone: &str,
+    ambiguous_policy: Option<&str>,
+    gap_policy: Option<&str>,
+) -> Result<String, String> {
+    shift_in_timezone(
+        value,
+        parse_interval(interval)?,
+        zone,
+        ambiguous_policy,
+        gap_policy,
+    )
+}
+
+pub fn subtract_in_timezone(
+    value: &str,
+    interval: &str,
+    zone: &str,
+    ambiguous_policy: Option<&str>,
+    gap_policy: Option<&str>,
+) -> Result<String, String> {
+    shift_in_timezone(
+        value,
+        parse_interval(interval)?.checked_neg()?,
+        zone,
+        ambiguous_policy,
+        gap_policy,
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Interval {
+    months: i64,
+    fixed: Duration,
+}
+
+impl Interval {
+    fn zero() -> Self {
+        Self {
+            months: 0,
+            fixed: Duration::zero(),
+        }
+    }
+
+    fn checked_neg(self) -> Result<Self, String> {
+        Ok(Self {
+            months: self
+                .months
+                .checked_neg()
+                .ok_or_else(|| "interval overflow".to_string())?,
+            fixed: self
+                .fixed
+                .checked_mul(-1)
+                .ok_or_else(|| "interval overflow".to_string())?,
+        })
+    }
+}
+
+fn shift(value: &str, amount: Interval) -> Result<String, String> {
     if let Ok(date) = NaiveDate::parse_from_str(value, "%Y-%m-%d") {
-        if amount.num_milliseconds() % 86_400_000 != 0 {
+        if amount.fixed.num_milliseconds() % 86_400_000 != 0 {
             return Err("date arithmetic requires a whole-day duration".into());
         }
-        let shifted = date
-            .checked_add_signed(amount)
+        let shifted = shift_months(date, amount.months)?
+            .checked_add_signed(amount.fixed)
             .ok_or_else(|| "date arithmetic overflow".to_string())?;
         return Ok(shifted.format("%Y-%m-%d").to_string());
     }
     match parse_datetime(value)? {
-        Timestamp::Naive(value) => value
-            .checked_add_signed(amount)
-            .map(|v| v.format("%Y-%m-%dT%H:%M:%S%.f").to_string())
-            .ok_or_else(|| "datetime arithmetic overflow".into()),
-        Timestamp::Offset(value) => value
-            .checked_add_signed(amount)
-            .map(|v| v.to_rfc3339_opts(SecondsFormat::AutoSi, false))
-            .ok_or_else(|| "datetime arithmetic overflow".into()),
+        Timestamp::Naive(value) => shift_naive(value, amount)
+            .map(|v| v.format("%Y-%m-%dT%H:%M:%S%.f").to_string()),
+        Timestamp::Offset(value) => {
+            let offset = *value.offset();
+            let local = shift_naive(value.naive_local(), amount)?;
+            offset
+                .from_local_datetime(&local)
+                .single()
+                .map(|v| v.to_rfc3339_opts(SecondsFormat::AutoSi, false))
+                .ok_or_else(|| "datetime arithmetic overflow".into())
+        }
     }
+}
+
+fn shift_naive(value: NaiveDateTime, amount: Interval) -> Result<NaiveDateTime, String> {
+    let calendar_shifted = shift_months(value.date(), amount.months)?.and_time(value.time());
+    calendar_shifted
+        .checked_add_signed(amount.fixed)
+        .ok_or_else(|| "datetime arithmetic overflow".into())
+}
+
+fn shift_in_timezone(
+    value: &str,
+    amount: Interval,
+    zone: &str,
+    ambiguous_policy: Option<&str>,
+    gap_policy: Option<&str>,
+) -> Result<String, String> {
+    let zone: Tz = zone
+        .parse()
+        .map_err(|_| format!("date arithmetic: unknown IANA timezone '{zone}'"))?;
+    let ambiguous_policy = parse_ambiguous_policy(ambiguous_policy)?;
+    let gap_policy = parse_gap_policy(gap_policy)?;
+    let start = match parse_datetime(value)? {
+        Timestamp::Offset(value) => value.with_timezone(&zone),
+        Timestamp::Naive(value) => resolve_local(value, zone, ambiguous_policy, gap_policy)?,
+    };
+    let calendar_local =
+        shift_months(start.date_naive(), amount.months)?.and_time(start.time());
+    let calendar_resolved =
+        resolve_local(calendar_local, zone, ambiguous_policy, gap_policy)?;
+    calendar_resolved
+        .checked_add_signed(amount.fixed)
+        .map(|value| value.to_rfc3339_opts(SecondsFormat::AutoSi, false))
+        .ok_or_else(|| "datetime arithmetic overflow".into())
+}
+
+fn shift_months(value: NaiveDate, months: i64) -> Result<NaiveDate, String> {
+    let month_index = i64::from(value.year())
+        .checked_mul(12)
+        .and_then(|v| v.checked_add(i64::from(value.month0())))
+        .and_then(|v| v.checked_add(months))
+        .ok_or_else(|| "calendar interval overflow".to_string())?;
+    let year = month_index.div_euclid(12);
+    let month = month_index.rem_euclid(12) as u32 + 1;
+    let year = i32::try_from(year).map_err(|_| "calendar interval overflow".to_string())?;
+    let last_day = last_day_of_month(year, month)?;
+    NaiveDate::from_ymd_opt(year, month, value.day().min(last_day))
+        .ok_or_else(|| "calendar interval overflow".to_string())
+}
+
+fn last_day_of_month(year: i32, month: u32) -> Result<u32, String> {
+    let (next_year, next_month) = if month == 12 {
+        (year.checked_add(1).ok_or_else(|| "calendar interval overflow".to_string())?, 1)
+    } else {
+        (year, month + 1)
+    };
+    let next = NaiveDate::from_ymd_opt(next_year, next_month, 1)
+        .ok_or_else(|| "calendar interval overflow".to_string())?;
+    Ok(next
+        .pred_opt()
+        .ok_or_else(|| "calendar interval overflow".to_string())?
+        .day())
 }
 
 pub fn format(value: &str, pattern: &str) -> Result<String, String> {
@@ -360,12 +484,18 @@ fn parse_datetime(value: &str) -> Result<Timestamp, String> {
     ))
 }
 
-fn parse_duration(value: &str) -> Result<Duration, String> {
+fn parse_interval(value: &str) -> Result<Interval, String> {
     let value = value.trim();
+    if value.starts_with('P') && !value.starts_with("PT") {
+        return parse_calendar_interval(value);
+    }
     if let Some(seconds) = value.strip_prefix("PT").and_then(|v| v.strip_suffix('S')) {
         return seconds
             .parse::<f64>()
-            .map(|seconds| Duration::milliseconds((seconds * 1000.0).round() as i64))
+            .map(|seconds| Interval {
+                months: 0,
+                fixed: Duration::milliseconds((seconds * 1000.0).round() as i64),
+            })
             .map_err(|_| format!("expected duration, found value '{value}'"));
     }
     let words: Vec<&str> = value.split_whitespace().collect();
@@ -374,13 +504,27 @@ fn parse_duration(value: &str) -> Result<Duration, String> {
             "expected duration such as '2 days 3 hours', found value '{value}'"
         ));
     }
-    let mut total = Duration::zero();
+    let mut total = Interval::zero();
     for pair in words.chunks_exact(2) {
         let number = pair[0]
             .parse::<i64>()
             .map_err(|_| format!("duration: invalid number '{}'", pair[0]))?;
         let unit = pair[1].trim_end_matches('s').to_ascii_lowercase();
         let amount = match unit.as_str() {
+            "year" => {
+                total.months = total
+                    .months
+                    .checked_add(number.checked_mul(12).ok_or_else(|| "interval overflow".to_string())?)
+                    .ok_or_else(|| "interval overflow".to_string())?;
+                continue;
+            }
+            "month" => {
+                total.months = total
+                    .months
+                    .checked_add(number)
+                    .ok_or_else(|| "interval overflow".to_string())?;
+                continue;
+            }
             "week" => Duration::weeks(number),
             "day" => Duration::days(number),
             "hour" => Duration::hours(number),
@@ -389,11 +533,74 @@ fn parse_duration(value: &str) -> Result<Duration, String> {
             "millisecond" => Duration::milliseconds(number),
             _ => return Err(format!("duration: unsupported unit '{}'", pair[1])),
         };
-        total = total
+        total.fixed = total
+            .fixed
             .checked_add(&amount)
-            .ok_or_else(|| "duration overflow".to_string())?;
+            .ok_or_else(|| "interval overflow".to_string())?;
     }
     Ok(total)
+}
+
+fn parse_calendar_interval(value: &str) -> Result<Interval, String> {
+    let (calendar, fixed) = value.split_once(';').unwrap_or((value, ""));
+    let mut body = calendar
+        .strip_prefix('P')
+        .ok_or_else(|| format!("expected interval, found value '{value}'"))?;
+    let mut months = 0i64;
+    if let Some(year_end) = body.find('Y') {
+        let years = body[..year_end]
+            .parse::<i64>()
+            .map_err(|_| format!("expected interval, found value '{value}'"))?;
+        months = years
+            .checked_mul(12)
+            .ok_or_else(|| "interval overflow".to_string())?;
+        body = &body[year_end + 1..];
+    }
+    if let Some(months_text) = body.strip_suffix('M') {
+        months = months
+            .checked_add(
+                months_text
+                    .parse::<i64>()
+                    .map_err(|_| format!("expected interval, found value '{value}'"))?,
+            )
+            .ok_or_else(|| "interval overflow".to_string())?;
+        body = "";
+    }
+    if !body.is_empty() || months == 0 {
+        return Err(format!("expected interval, found value '{value}'"));
+    }
+    let fixed = if fixed.is_empty() {
+        Duration::zero()
+    } else {
+        let parsed = parse_interval(fixed)?;
+        if parsed.months != 0 {
+            return Err(format!("expected fixed duration after ';', found '{fixed}'"));
+        }
+        parsed.fixed
+    };
+    Ok(Interval { months, fixed })
+}
+
+fn format_interval(value: Interval) -> String {
+    if value.months == 0 {
+        return format_duration(value.fixed);
+    }
+    let sign = if value.months < 0 { "-" } else { "" };
+    let absolute = value.months.unsigned_abs();
+    let years = absolute / 12;
+    let months = absolute % 12;
+    let mut output = "P".to_string();
+    if years != 0 {
+        output.push_str(&format!("{sign}{years}Y"));
+    }
+    if months != 0 {
+        output.push_str(&format!("{sign}{months}M"));
+    }
+    if value.fixed != Duration::zero() {
+        output.push(';');
+        output.push_str(&format_duration(value.fixed));
+    }
+    output
 }
 
 fn format_duration(value: Duration) -> String {
@@ -464,6 +671,60 @@ mod tests {
         );
         assert_eq!(duration("1500 milliseconds").unwrap(), "PT1.5S");
         assert!(add("2026-07-03", "2 hours").is_err());
+    }
+
+    #[test]
+    fn calendar_intervals_clamp_month_ends_and_round_trip() {
+        assert_eq!(duration("1 year 2 months").unwrap(), "P1Y2M");
+        assert_eq!(duration("P1Y2M").unwrap(), "P1Y2M");
+        assert_eq!(duration("-1 year -2 months").unwrap(), "P-1Y-2M");
+        assert_eq!(duration("1 month 2 days").unwrap(), "P1M;PT172800S");
+        assert_eq!(duration("P1M;PT172800S").unwrap(), "P1M;PT172800S");
+
+        assert_eq!(add("2025-01-31", "1 month").unwrap(), "2025-02-28");
+        assert_eq!(add("2024-01-31", "1 month").unwrap(), "2024-02-29");
+        assert_eq!(subtract("2024-03-31", "1 month").unwrap(), "2024-02-29");
+        assert_eq!(add("2024-02-29", "1 year").unwrap(), "2025-02-28");
+        assert_eq!(
+            add("2026-01-31T10:15:00+10:00", "1 month 2 hours").unwrap(),
+            "2026-02-28T12:15:00+10:00"
+        );
+    }
+
+    #[test]
+    fn named_zone_calendar_arithmetic_preserves_wall_clock_across_dst() {
+        assert_eq!(
+            add_in_timezone(
+                "2026-09-04T09:00:00",
+                "1 month",
+                "Australia/Sydney",
+                None,
+                None,
+            )
+            .unwrap(),
+            "2026-10-04T09:00:00+11:00"
+        );
+
+        let gap = add_in_timezone(
+            "2026-09-04T02:30:00",
+            "1 month",
+            "Australia/Sydney",
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(gap.contains("does not exist"));
+        assert_eq!(
+            add_in_timezone(
+                "2026-09-04T02:30:00",
+                "1 month",
+                "Australia/Sydney",
+                None,
+                Some("shift-forward"),
+            )
+            .unwrap(),
+            "2026-10-04T03:30:00+11:00"
+        );
     }
 
     #[test]

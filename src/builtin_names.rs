@@ -535,6 +535,8 @@ pub fn help_text(topic: Option<&str>) -> Result<String, String> {
             &[
                 "let started: datetime = $now()",
                 "let due: date = $date_add(2026-07-23 \"2 days\")",
+                "echo $date_add(2026-01-31 \"1 month\")",
+                "echo $date_add(2026-09-04T09:00:00 \"1 month\" Australia/Sydney)",
                 "echo $extract('month' $due)",
                 "echo $date_trunc('day' $started)",
                 "echo $date_compare($started $now())",
@@ -546,7 +548,9 @@ pub fn help_text(topic: Option<&str>) -> Result<String, String> {
             ],
             &[
                 "Types: date, time, datetime (alias timestamp), duration (alias interval).",
-                "Durations such as `2 days 3 hours` normalize to ISO seconds such as `PT183600S`.",
+                "Intervals accept years/months plus fixed units; month-end results clamp to the last valid day.",
+                "Fixed durations such as `2 days 3 hours` normalize to ISO seconds such as `PT183600S`.",
+                "$date_add/$date_sub optionally accept ZONE [AMBIGUOUS] [GAP] for DST-aware calendar arithmetic.",
                 "Offset datetimes preserve their numeric offset; comparisons use the actual instant.",
                 "`dd-MMM-yy` is a friendly pattern for output such as `23-Jul-26`; strftime `%` patterns remain available.",
                 "$timezone(VALUE ZONE [AMBIGUOUS] [GAP]) accepts IANA names such as Australia/Sydney.",

@@ -84,8 +84,8 @@ pub fn call_string_method(name: &str, args: &[MethodArg]) -> Option<Result<Strin
         "today" => no_arg(args, "today", crate::temporal::today),
         "extract" => temporal_binary(args, crate::temporal::extract),
         "date_trunc" => temporal_binary(args, crate::temporal::truncate),
-        "date_add" => temporal_binary(args, crate::temporal::add),
-        "date_sub" => temporal_binary(args, crate::temporal::subtract),
+        "date_add" => date_shift(args, false),
+        "date_sub" => date_shift(args, true),
         "date_format" => temporal_binary(args, crate::temporal::format),
         "date_compare" => temporal_binary(args, crate::temporal::compare),
         "date_diff" => temporal_binary(args, crate::temporal::difference),
@@ -119,6 +119,43 @@ fn timezone(args: &[MethodArg]) -> Result<String, String> {
     let ambiguous = args.get(2).map(MethodArg::as_str);
     let gap = args.get(3).map(MethodArg::as_str);
     crate::temporal::timezone(&value, &zone, ambiguous.as_deref(), gap.as_deref())
+}
+
+fn date_shift(args: &[MethodArg], subtract: bool) -> Result<String, String> {
+    if !(2..=5).contains(&args.len()) {
+        return Err(
+            "date_add/date_sub: expected VALUE INTERVAL [ZONE [AMBIGUOUS_POLICY] [GAP_POLICY]]"
+                .to_string(),
+        );
+    }
+    let value = arg_str(args, 0)?;
+    let interval = arg_str(args, 1)?;
+    let Some(zone) = args.get(2).map(MethodArg::as_str) else {
+        return if subtract {
+            crate::temporal::subtract(&value, &interval)
+        } else {
+            crate::temporal::add(&value, &interval)
+        };
+    };
+    let ambiguous = args.get(3).map(MethodArg::as_str);
+    let gap = args.get(4).map(MethodArg::as_str);
+    if subtract {
+        crate::temporal::subtract_in_timezone(
+            &value,
+            &interval,
+            &zone,
+            ambiguous.as_deref(),
+            gap.as_deref(),
+        )
+    } else {
+        crate::temporal::add_in_timezone(
+            &value,
+            &interval,
+            &zone,
+            ambiguous.as_deref(),
+            gap.as_deref(),
+        )
+    }
 }
 
 fn no_arg(args: &[MethodArg], name: &str, operation: fn() -> String) -> Result<String, String> {

@@ -789,3 +789,36 @@ Terminal renders the valid contiguous regional-indicator pair as a blended
 `AU` fallback on this machine, while PowerShell and VS Code show two distinct
 letters; this is glyph shaping, not data loss, so ion-win deliberately leaves
 the underlying `🇦🇺` text unchanged.
+
+## 42. Calendar-relative intervals
+
+Intervals now accept `year`/`years` and `month`/`months` alongside the
+existing fixed units. Internally an interval has two independent parts:
+calendar months and a fixed `chrono::Duration`. Arithmetic applies calendar
+months first, then fixed weeks/days/hours/minutes/seconds/milliseconds,
+preserving PostgreSQL's useful distinction between “one month” and “30
+days”.
+
+Month and year shifts preserve the day when possible and otherwise clamp to
+the destination month's last valid day: `2025-01-31 + 1 month` is
+`2025-02-28`, `2024-01-31 + 1 month` is `2024-02-29`, and
+`2024-02-29 + 1 year` is `2025-02-28`. The same rule applies to naive and
+offset-bearing datetimes while retaining their wall-clock time. Typed
+`duration`/`interval` values normalize calendar portions as `P1Y2M`; a mixed
+calendar/fixed value uses an explicit separator such as `P1M;PT172800S`,
+which round-trips without pretending that months have a fixed number of
+seconds.
+
+`$date_add` and `$date_sub` retain their two-argument form and additionally
+accept `ZONE [AMBIGUOUS_POLICY] [GAP_POLICY]`. With a named IANA zone, the
+calendar part is applied in local wall time and resolved using the same
+`reject`/`earlier`/`later` and `shift-forward`/`shift-backward` rules as
+`$timezone`; the fixed part is then elapsed time. Thus adding one month from
+09:00 before Sydney's spring transition remains 09:00 afterward while the
+numeric offset changes from `+10:00` to `+11:00`.
+
+Focused tests cover canonical round-tripping, ordinary and leap-year
+month-end clamping, subtraction, mixed calendar/fixed ordering, wall-clock
+preservation across DST, and a calendar result landing in a nonexistent local
+time. The compiled `scripts/exercise/15_native_datetime.ion` smoke test now
+covers the same public method forms.
