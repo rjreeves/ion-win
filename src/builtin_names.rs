@@ -383,6 +383,11 @@ pub const BUILTINS: &[Builtin] = &[
         help_display: None,
     },
     Builtin {
+        name: "date-column",
+        is_keyword: false,
+        help_display: Some("date-column SRC DEST OP..."),
+    },
+    Builtin {
         name: "to-json",
         is_keyword: false,
         help_display: Some("to-json"),
@@ -428,7 +433,8 @@ Commands by category
   Control flow     if  while  for  match  and  or  break  continue
   Conditions       test  matches  bool  contains  starts-with  ends-with
                    eq/is  exists  intersects  isatty  true  false  not
-  Tables           from-json  from-csv  select  where/filter  to-json  to-csv
+  Tables           from-json  from-csv  select  where/filter  date-column
+                   to-json  to-csv
   State & jobs     pvar  history  jobs  wait  disown  which/type
   Editor           highlight  cls
 
@@ -506,12 +512,14 @@ pub fn help_text(topic: Option<&str>) -> Result<String, String> {
             &[
                 "let manifest = find . --recurse | stat --hash sha256",
                 "manifest | where size -gt 1000000 | select path size | to-csv",
+                "events | date-column created local timezone Australia/Sydney",
                 "manifest | copy backup",
                 "for row in manifest; echo $field(row path); end",
             ],
             &[
                 "$len(manifest) returns the row count.",
                 "$field(row column) reads a scalar from an exactly-one-row table.",
+                "date-column SOURCE DEST OP transforms every row; repeat SOURCE as DEST for explicit in-place replacement.",
                 "copy and compress forward a consumed table; delete intentionally does not.",
             ],
         ),
@@ -683,6 +691,22 @@ pub fn help_text(topic: Option<&str>) -> Result<String, String> {
         "from-csv" => page("BYTES | from-csv", "Parses CSV with a header row into a table.", &["cat data.csv | from-csv | where size -gt 100"], &["Structured stages are pipeline-only."]),
         "select" => page("TABLE | select COLUMN...", "Projects selected columns from each table row.", &["manifest | select path size | to-csv"], &[]),
         "where" | "filter" => page("TABLE | where COLUMN OP VALUE", "Keeps rows whose column satisfies a test operator.", &["manifest | where size -gt 1000000"], &["`filter` is an alias. Operators match `help test`."]),
+        "date-column" => page(
+            "TABLE | date-column SOURCE DEST OP [ARGS...]",
+            "Parses, formats, timezone-adjusts, or adds/subtracts intervals across one table column.",
+            &[
+                "events | date-column created parsed datetime",
+                "events | date-column created local timezone Australia/Sydney",
+                "events | date-column created due add '1 month' Australia/Sydney",
+                "events | date-column created display format dd-MMM-yy",
+            ],
+            &[
+                "Operations: date, time, datetime/timestamp, format, timezone, add, sub.",
+                "SOURCE and DEST may be the same for explicit in-place replacement.",
+                "A missing or invalid cell rejects the whole stage and reports its row number.",
+                "timezone accepts ZONE [AMBIGUOUS] [GAP]; add/sub accept INTERVAL [ZONE [AMBIGUOUS] [GAP]].",
+            ],
+        ),
         "to-json" => page("TABLE | to-json", "Serializes a table as JSON.", &["manifest | to-json > manifest.json"], &[]),
         "to-csv" => page("TABLE | to-csv", "Serializes a table as CSV.", &["manifest | select path size | to-csv > manifest.csv"], &[]),
         _ => {
@@ -759,6 +783,7 @@ mod tests {
         assert!(all.contains(&"select"));
         assert!(all.contains(&"where"));
         assert!(all.contains(&"filter"));
+        assert!(all.contains(&"date-column"));
         assert!(all.contains(&"to-json"));
         assert!(all.contains(&"cat"));
         assert!(all.contains(&"stat"));

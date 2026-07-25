@@ -47,6 +47,7 @@ A working, reasonably faithful interpreter for Ion's language (variables, contro
 | `colorout.rs` | 82 | `err_println!`/`err_eprintln!` — red-on-terminal error output, `NO_COLOR`-aware |
 | `jobs.rs` | 78 | Background-job registry for `jobs`/`wait`/`disown` |
 | `types.rs` | 68 | Shared `str`/`bool`/`int`/`float` type-tag validation |
+| `temporal_column.rs` | 170 | Atomic `date-column` table transformation: parse, format, timezone, and calendar arithmetic |
 | `procexpand.rs` | 36 | `$(cmd)`/`@(cmd)` process-expansion process spawning |
 
 ## Implemented, verified against the manual
@@ -103,6 +104,7 @@ A working, reasonably faithful interpreter for Ion's language (variables, contro
 - **Enhanced keyboard input** (`ARCHITECTURE.md` §38): `read -p PROMPT` prints an expandable prompt, `read -s` hides interactive input, and `read -n COUNT` returns after a fixed number of Unicode characters without waiting for Enter; options compose. Ordinary `read` and redirected stdin keep their buffered behavior. Option parsing and field assignment have focused tests, and a real release-binary stdin session verifies prompt expansion, multiword values, fixed-count truncation, and silent assignment. Raw no-Enter delivery and hidden echo still need the final Windows Terminal human check.
 - **Named timezone and DST conversion** (`ARCHITECTURE.md` §39): `$timezone`/`$at_timezone` converts offset-bearing instants or interprets naive wall times using IANA names such as `Australia/Sydney`. DST folds and gaps reject by default; callers explicitly choose `earlier`/`later` or `shift-forward`/`shift-backward`. The `chrono-tz` database supplies historical/seasonal offsets and exact gap widths. Four focused tests plus the compiled native datetime exercise verify summer/winter offsets and both sides of Sydney's 2026 transitions.
 - **Calendar-relative intervals** (`ARCHITECTURE.md` §42): `duration`/`interval` and `$date_add`/`$date_sub` now accept years and months as true calendar units rather than guessed day counts. Month-end results clamp to the destination's last valid day, mixed intervals apply calendar units before fixed elapsed units, and an optional IANA zone plus the existing fold/gap policies preserves local wall time through DST offset changes. Focused tests cover leap years, subtraction, canonical round-trips, DST transitions, and nonexistent target times; the native datetime smoke script exercises the public forms.
+- **Table-column temporal conversion** (`ARCHITECTURE.md` §43): `TABLE | date-column SOURCE DEST OP [ARGS...]` parses, formats, timezone-adjusts, or performs calendar add/subtract across every row. Explicit source/destination names preserve imported text by default and make in-place replacement deliberate. Missing/invalid cells reject the whole stage with a row number. Three focused tests plus `scripts/exercise/16_temporal_columns.ion` verify JSON capture, multi-stage derivation, DST-aware month arithmetic, CSV output, and canonical parsing.
 
 ## Known gaps (deliberately not built — not oversights)
 
@@ -124,10 +126,9 @@ Every feature in this codebase was verified two ways, and both matter:
 
 Nothing is mid-implementation or broken right now. The best remaining refinements are:
 
-1. Add table-column temporal conversion.
-2. Manual interactive testing of selection, clipboard shortcuts, and `read -s`/`read -n` in Windows Terminal. Unicode editing and live history have now passed their user-facing checks.
+1. Manual interactive testing of selection, clipboard shortcuts, and `read -s`/`read -n` in Windows Terminal. Unicode editing and live history have now passed their user-facing checks.
 
-Whatever's picked up, follow this session's established rhythm: real-binary smoke test (not just `cargo test`) before claiming anything works, update `ARCHITECTURE.md` with a new numbered section (currently ends at §42) and add an "Implemented, verified" bullet here in `HANDOVER.md`, and don't commit/push without being asked.
+Whatever's picked up, follow this session's established rhythm: real-binary smoke test (not just `cargo test`) before claiming anything works, update `ARCHITECTURE.md` with a new numbered section (currently ends at §43) and add an "Implemented, verified" bullet here in `HANDOVER.md`, and don't commit/push without being asked.
 
 ## A note on the interactive line editor
 

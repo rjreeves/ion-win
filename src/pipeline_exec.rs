@@ -86,6 +86,9 @@ enum Kind {
     /// validates JSON-parseability during execution rather than
     /// classification.
     Where(Vec<String>),
+    /// `date-column SOURCE DEST OP [ARGS...]` transforms one temporal
+    /// field across every row and forwards the resulting table.
+    DateColumn(Vec<String>),
     /// `stat FILE... [--hash sha256]` (`ARCHITECTURE.md` §21) — a `Table`
     /// producer, like `FromJson`, but sourced from real file metadata
     /// instead of parsed JSON text. Raw args, validated (via
@@ -139,6 +142,7 @@ fn next_stage_needs_materialized_input(kind: Option<&Kind>) -> bool {
             | Some(Kind::Select(_))
             | Some(Kind::ToJson)
             | Some(Kind::Where(_))
+            | Some(Kind::DateColumn(_))
             | Some(Kind::Stat(_))
             | Some(Kind::FromCsv)
     )
@@ -819,6 +823,39 @@ async fn run_impl(
                     capture.as_mut().map(|s| &mut **s),
                 );
             }
+            Kind::DateColumn(args) => {
+                let table = match incoming {
+                    Carry::Table(table) => table,
+                    Carry::None => {
+                        err_println!(
+                            "ion-win: date-column: no table piped in (pipe through 'from-json'/'from-csv' first)"
+                        );
+                        unregister_spawned!();
+                        return false;
+                    }
+                    _ => {
+                        err_println!(
+                            "ion-win: date-column: expected a table (pipe through 'from-json'/'from-csv' first)"
+                        );
+                        unregister_spawned!();
+                        return false;
+                    }
+                };
+                let table = match crate::temporal_column::transform(table, args) {
+                    Ok(table) => table,
+                    Err(error) => {
+                        err_println!("ion-win: {error}");
+                        unregister_spawned!();
+                        return false;
+                    }
+                };
+                carry = finish_table_stage(
+                    table,
+                    is_last,
+                    stdout_file,
+                    capture.as_mut().map(|slot| &mut **slot),
+                );
+            }
             Kind::Stat(stat_args) => {
                 let (arg_files, hash_algo) = match crate::stat::parse_args(stat_args) {
                     Ok(v) => v,
@@ -979,6 +1016,8 @@ fn classify_stages(pipeline: &Pipeline, interp: &Interpreter) -> Vec<Kind> {
                 Kind::Select(args[1..].to_vec())
             } else if cmd == "where" || cmd == "filter" {
                 Kind::Where(args[1..].to_vec())
+            } else if cmd == "date-column" {
+                Kind::DateColumn(args[1..].to_vec())
             } else if cmd == "stat" {
                 Kind::Stat(args[1..].to_vec())
             } else if let Some(table) = interp.get_table(&cmd) {

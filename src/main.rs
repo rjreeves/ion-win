@@ -25,6 +25,7 @@ mod state;
 mod stat;
 mod table;
 mod temporal;
+mod temporal_column;
 mod types;
 
 use std::path::PathBuf;

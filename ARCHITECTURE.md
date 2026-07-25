@@ -822,3 +822,40 @@ month-end clamping, subtraction, mixed calendar/fixed ordering, wall-clock
 preservation across DST, and a calendar result landing in a nonexistent local
 time. The compiled `scripts/exercise/15_native_datetime.ion` smoke test now
 covers the same public method forms.
+
+## 43. Table-column temporal conversion
+
+`date-column SOURCE DEST OP [ARGS...]` is a structured pipeline stage that
+applies the native temporal operations to every row of a table. Supported
+operations are `date`, `time`, `datetime`/`timestamp`, `format PATTERN`,
+`timezone ZONE [AMBIGUOUS] [GAP]`, and
+`add|sub INTERVAL [ZONE [AMBIGUOUS] [GAP]]`. The stage composes with either
+JSON or CSV input, stored table variables, `select`/`where`, and both output
+adapters.
+
+Both source and destination are mandatory by design. The common form adds a
+derived column while preserving the raw source:
+
+```text
+events | date-column created local timezone Australia/Sydney
+```
+
+Repeating the name (`date-column created created datetime`) is the explicit
+in-place form. This avoids a default that silently destroys imported text and
+also avoids inventing operation-derived destination names that could collide
+with real columns.
+
+Transformation is atomic at the table level. Rows are accumulated into a new
+table and only forwarded after every source cell succeeds. A missing column or
+invalid temporal value rejects the entire stage with a one-based row number;
+there is no partly converted table to mistake for success. An existing
+destination cell is replaced in its original column position, while a new
+destination is appended to that row.
+
+`src/temporal_column.rs` owns argument validation and row transformation;
+`pipeline_exec.rs` only handles structured carry/error plumbing. Three focused
+tests cover parse/format derivation, timezone-aware calendar arithmetic across
+multiple rows, and row-numbered missing/invalid failures. The compiled
+`scripts/exercise/16_temporal_columns.ion` smoke test captures a JSON table,
+chains add-plus-format transformations, verifies `$len`, serializes selected
+columns to CSV, and canonicalizes a second raw-date table.
