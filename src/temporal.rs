@@ -3,9 +3,10 @@
 //! comparison-safe normalization, arithmetic, extraction, and truncation.
 
 use chrono::{
-    DateTime, Datelike, Duration, FixedOffset, Local, NaiveDate, NaiveDateTime, NaiveTime,
-    SecondsFormat, Timelike,
+    DateTime, Datelike, Duration, FixedOffset, Local, LocalResult, NaiveDate, NaiveDateTime,
+    NaiveTime, SecondsFormat, TimeZone, Timelike,
 };
+use chrono_tz::{GapInfo, Tz};
 
 enum Timestamp {
     Offset(DateTime<FixedOffset>),
@@ -47,6 +48,113 @@ pub fn now() -> String {
 
 pub fn today() -> String {
     Local::now().date_naive().format("%Y-%m-%d").to_string()
+}
+
+#[derive(Clone, Copy)]
+enum AmbiguousPolicy {
+    Reject,
+    Earlier,
+    Later,
+}
+
+#[derive(Clone, Copy)]
+enum GapPolicy {
+    Reject,
+    ShiftForward,
+    ShiftBackward,
+}
+
+/// Converts an offset datetime's instant into `zone`, or interprets a naive
+/// datetime as a wall clock in `zone`. DST folds and gaps reject by default;
+/// callers must explicitly choose how exceptional local times are resolved.
+pub fn timezone(
+    value: &str,
+    zone: &str,
+    ambiguous_policy: Option<&str>,
+    gap_policy: Option<&str>,
+) -> Result<String, String> {
+    let zone: Tz = zone
+        .parse()
+        .map_err(|_| format!("timezone: unknown IANA timezone '{zone}'"))?;
+    let ambiguous_policy = parse_ambiguous_policy(ambiguous_policy)?;
+    let gap_policy = parse_gap_policy(gap_policy)?;
+
+    let resolved = match parse_datetime(value)? {
+        Timestamp::Offset(value) => value.with_timezone(&zone),
+        Timestamp::Naive(value) => {
+            resolve_local(value, zone, ambiguous_policy, gap_policy)?
+        }
+    };
+    Ok(resolved.to_rfc3339_opts(SecondsFormat::AutoSi, false))
+}
+
+fn parse_ambiguous_policy(value: Option<&str>) -> Result<AmbiguousPolicy, String> {
+    match value.unwrap_or("reject").to_ascii_lowercase().as_str() {
+        "reject" => Ok(AmbiguousPolicy::Reject),
+        "earlier" => Ok(AmbiguousPolicy::Earlier),
+        "later" => Ok(AmbiguousPolicy::Later),
+        value => Err(format!(
+            "timezone: invalid ambiguous-time policy '{value}' (expected reject, earlier, or later)"
+        )),
+    }
+}
+
+fn parse_gap_policy(value: Option<&str>) -> Result<GapPolicy, String> {
+    match value.unwrap_or("reject").to_ascii_lowercase().as_str() {
+        "reject" => Ok(GapPolicy::Reject),
+        "shift-forward" | "forward" => Ok(GapPolicy::ShiftForward),
+        "shift-backward" | "backward" => Ok(GapPolicy::ShiftBackward),
+        value => Err(format!(
+            "timezone: invalid nonexistent-time policy '{value}' (expected reject, shift-forward, or shift-backward)"
+        )),
+    }
+}
+
+fn resolve_local(
+    value: NaiveDateTime,
+    zone: Tz,
+    ambiguous_policy: AmbiguousPolicy,
+    gap_policy: GapPolicy,
+) -> Result<DateTime<Tz>, String> {
+    match zone.from_local_datetime(&value) {
+        LocalResult::Single(value) => Ok(value),
+        LocalResult::Ambiguous(earlier, later) => match ambiguous_policy {
+            AmbiguousPolicy::Earlier => Ok(earlier),
+            AmbiguousPolicy::Later => Ok(later),
+            AmbiguousPolicy::Reject => Err(format!(
+                "timezone: local time '{value}' is ambiguous in {zone}; choose earlier or later"
+            )),
+        },
+        LocalResult::None => match gap_policy {
+            GapPolicy::Reject => Err(format!(
+                "timezone: local time '{value}' does not exist in {zone}; choose shift-forward or shift-backward"
+            )),
+            policy => resolve_gap(value, zone, policy),
+        },
+    }
+}
+
+fn resolve_gap(
+    value: NaiveDateTime,
+    zone: Tz,
+    policy: GapPolicy,
+) -> Result<DateTime<Tz>, String> {
+    let gap = GapInfo::new(&value, &zone)
+        .ok_or_else(|| format!("timezone: cannot resolve nonexistent local time '{value}'"))?;
+    let (Some((begin, _)), Some(end)) = (gap.begin, gap.end) else {
+        return Err(format!(
+            "timezone: transition data cannot resolve local time '{value}' in {zone}"
+        ));
+    };
+    let width = end.naive_local().signed_duration_since(begin);
+    let shifted = match policy {
+        GapPolicy::ShiftForward => value + width,
+        GapPolicy::ShiftBackward => value - width,
+        GapPolicy::Reject => unreachable!(),
+    };
+    zone.from_local_datetime(&shifted).single().ok_or_else(|| {
+        format!("timezone: shifted local time '{shifted}' is still not unique in {zone}")
+    })
 }
 
 pub fn extract(part: &str, value: &str) -> Result<String, String> {
@@ -379,5 +487,73 @@ mod tests {
     #[test]
     fn friendly_day_month_year_format_is_supported() {
         assert_eq!(format("2026-07-23", "dd-MMM-yy").unwrap(), "23-Jul-26");
+    }
+
+    #[test]
+    fn named_timezone_conversion_uses_seasonal_offsets() {
+        assert_eq!(
+            timezone("2026-01-15T00:00:00Z", "Australia/Sydney", None, None).unwrap(),
+            "2026-01-15T11:00:00+11:00"
+        );
+        assert_eq!(
+            timezone("2026-07-15T00:00:00Z", "Australia/Sydney", None, None).unwrap(),
+            "2026-07-15T10:00:00+10:00"
+        );
+    }
+
+    #[test]
+    fn ambiguous_local_time_requires_an_explicit_choice() {
+        let value = "2026-04-05T02:30:00";
+        assert!(timezone(value, "Australia/Sydney", None, None)
+            .unwrap_err()
+            .contains("ambiguous"));
+        assert_eq!(
+            timezone(value, "Australia/Sydney", Some("earlier"), None).unwrap(),
+            "2026-04-05T02:30:00+11:00"
+        );
+        assert_eq!(
+            timezone(value, "Australia/Sydney", Some("later"), None).unwrap(),
+            "2026-04-05T02:30:00+10:00"
+        );
+    }
+
+    #[test]
+    fn nonexistent_local_time_can_shift_across_the_dst_gap() {
+        let value = "2026-10-04T02:30:00";
+        assert!(timezone(value, "Australia/Sydney", None, None)
+            .unwrap_err()
+            .contains("does not exist"));
+        assert_eq!(
+            timezone(
+                value,
+                "Australia/Sydney",
+                None,
+                Some("shift-forward")
+            )
+            .unwrap(),
+            "2026-10-04T03:30:00+11:00"
+        );
+        assert_eq!(
+            timezone(
+                value,
+                "Australia/Sydney",
+                None,
+                Some("shift-backward")
+            )
+            .unwrap(),
+            "2026-10-04T01:30:00+10:00"
+        );
+    }
+
+    #[test]
+    fn unknown_zones_and_policies_are_rejected() {
+        assert!(timezone("2026-01-01T00:00:00", "Mars/Olympus", None, None).is_err());
+        assert!(timezone(
+            "2026-01-01T00:00:00",
+            "Australia/Sydney",
+            Some("guess"),
+            None
+        )
+        .is_err());
     }
 }

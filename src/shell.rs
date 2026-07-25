@@ -49,6 +49,7 @@ use crate::history;
 use crate::interp::{Interpreter, Quoting, Token};
 use crate::jobctl;
 use crate::jobs;
+use crate::keyboard_input::{self, ReadRequest};
 use crate::pipeline;
 use crate::{err_eprintln, err_println};
 use crate::pipeline_exec;
@@ -983,9 +984,8 @@ async fn dispatch(line: &str, interp: &mut Interpreter, state: &StateHandle) -> 
             handle_highlight(&args);
         }
 
-        // `let`, `export`, `drop`, and `read` operate on raw (unexpanded)
-        // tokens themselves, since the left-hand side is a name, not a
-        // value to expand.
+        // These operate on raw tokens because destination names must not
+        // expand. `read` expands only its optional `-p` prompt after parsing.
         "let" => interp.builtin_let(raw_args),
         "export" => interp.builtin_export(raw_args),
         "drop" => interp.builtin_drop(raw_args),
@@ -1618,31 +1618,132 @@ async fn call_function(
     }
 }
 
-/// `read VARIABLE...` (ion-manual page 78): reads one line from stdin and
-/// splits it by whitespace across the named scalars, with the last
-/// variable capturing any remainder — matching common shell `read`
-/// semantics for the multi-variable case.
-fn handle_read(names: &[Token], interp: &mut Interpreter) {
+#[derive(Debug, PartialEq)]
+struct ReadOptions {
+    prompt: Option<Token>,
+    silent: bool,
+    count: Option<usize>,
+    names: Vec<Token>,
+}
+
+fn parse_read_options(args: &[Token]) -> Result<ReadOptions, String> {
+    let mut prompt = None;
+    let mut silent = false;
+    let mut count = None;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].text.as_str() {
+            "--" => {
+                index += 1;
+                break;
+            }
+            "-s" | "--silent" => {
+                silent = true;
+                index += 1;
+            }
+            "-p" | "--prompt" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("option -p requires prompt text".to_string());
+                };
+                prompt = Some(value.clone());
+                index += 2;
+            }
+            "-n" | "--chars" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("option -n requires a positive character count".to_string());
+                };
+                count = Some(
+                    value.text.parse::<usize>().ok().filter(|n| *n > 0)
+                        .ok_or_else(|| format!("'{}' is not a positive character count", value.text))?
+                );
+                index += 2;
+            }
+            value if value.starts_with('-') => return Err(format!("unknown option '{value}'")),
+            _ => break,
+        }
+    }
+
+    let names = args[index..].to_vec();
     if names.is_empty() {
-        err_println!("ion-win: read: usage: read VARIABLE...");
-        return;
+        return Err("missing destination variable".to_string());
     }
+    Ok(ReadOptions { prompt, silent, count, names })
+}
 
-    let mut line = String::new();
-    if io::stdin().read_line(&mut line).unwrap_or(0) == 0 {
-        return; // EOF: leave variables untouched
-    }
-    let line = line.trim_end();
-
-    let parts: Vec<&str> = if names.len() <= 1 {
-        vec![line]
-    } else {
-        line.splitn(names.len(), char::is_whitespace).collect()
+/// Normal line input plus ion-win extensions: `-p` prints a prompt, `-s`
+/// hides input, and `-n N` returns after N characters without waiting for
+/// Enter. The last destination variable retains the unsplit remainder.
+fn handle_read(args: &[Token], interp: &mut Interpreter) {
+    let options = match parse_read_options(args) {
+        Ok(options) => options,
+        Err(error) => {
+            err_println!("ion-win: read: {error}");
+            err_println!("usage: read [-s] [-p PROMPT] [-n COUNT] VARIABLE...");
+            interp.set_previous_status(false);
+            return;
+        }
+    };
+    let prompt = options.prompt.as_ref()
+        .map(|token| interp.expand_all(std::slice::from_ref(token)).join(" "))
+        .unwrap_or_default();
+    let line = match keyboard_input::read(ReadRequest {
+        prompt: &prompt,
+        silent: options.silent,
+        count: options.count,
+    }) {
+        Ok(Some(line)) => line,
+        Ok(None) => {
+            interp.set_previous_status(false);
+            return; // EOF leaves variables untouched.
+        }
+        Err(error) => {
+            if error.kind() != io::ErrorKind::Interrupted {
+                err_println!("ion-win: read: {error}");
+            }
+            interp.set_previous_status(false);
+            return;
+        }
     };
 
-    for (i, token) in names.iter().enumerate() {
-        let value = parts.get(i).copied().unwrap_or("").to_string();
-        interp.set_scalar(token.text.clone(), value);
+    let parts = keyboard_input::split_fields(&line, options.names.len());
+    for (index, token) in options.names.iter().enumerate() {
+        interp.set_scalar(token.text.clone(), parts.get(index).cloned().unwrap_or_default());
+    }
+    interp.set_previous_status(true);
+}
+
+#[cfg(test)]
+mod read_tests {
+    use super::*;
+
+    fn tokens(line: &str) -> Vec<Token> {
+        Interpreter::tokenize(line)
+    }
+
+    #[test]
+    fn parses_prompt_silent_and_character_count() {
+        let parsed = parse_read_options(&tokens("-s -p \"Password: \" -n 3 value")).unwrap();
+        assert!(parsed.silent);
+        assert_eq!(parsed.prompt.unwrap().text, "Password: ");
+        assert_eq!(parsed.count, Some(3));
+        assert_eq!(parsed.names, tokens("value"));
+    }
+
+    #[test]
+    fn preserves_multiple_destination_names() {
+        let parsed = parse_read_options(&tokens("first last")).unwrap();
+        assert_eq!(parsed.names, tokens("first last"));
+        assert!(!parsed.silent);
+        assert_eq!(parsed.count, None);
+    }
+
+    #[test]
+    fn rejects_missing_or_invalid_option_values() {
+        assert!(parse_read_options(&tokens("-p")).is_err());
+        assert!(parse_read_options(&tokens("-n 0 key")).is_err());
+        assert!(parse_read_options(&tokens("-n nope key")).is_err());
+        assert!(parse_read_options(&tokens("--wrong key")).is_err());
     }
 }
 

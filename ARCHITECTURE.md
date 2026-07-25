@@ -620,9 +620,8 @@ instants, so `10:00+10:00` equals `00:00Z`.
 
 Timezone behavior is intentionally explicit. `$now()` returns the host's local
 numeric UTC offset, parsed offset datetimes retain their offset through
-arithmetic, and naive datetimes remain naive. Named IANA/Windows timezone
-conversion and its daylight-saving ambiguity policy are not guessed here; that
-requires a separate design and timezone database dependency.
+arithmetic, and naive datetimes remain naive until a named zone is applied.
+Named timezone conversion and daylight-saving policies are added in §39.
 
 The implementation also fixes typed `let` itself to accept both documented
 spellings (`name:type` and `name: type`). Unit tests cover canonicalization,
@@ -651,3 +650,55 @@ single-line paste normalization. The full suite contains 235 passing tests.
 The native clipboard calls compile into both debug and release configurations;
 interactive key delivery still requires a real Windows Terminal rather than
 the test runner's non-TTY stdin.
+
+## 38. Enhanced keyboard input
+
+`read` retains its original `read VARIABLE...` behavior and adds three
+composable ion-win options: `-p PROMPT` prints prompt text before reading,
+`-s` suppresses terminal echo for secrets, and `-n COUNT` returns after that
+many Unicode characters without waiting for Enter. Long aliases
+`--prompt`/`--silent`/`--chars` are accepted as well. Destination names stay
+unexpanded, while prompt text receives normal Ion expansion, so
+`read -p "$label: " value` works without turning `value` into its old contents.
+
+`src/keyboard_input.rs` deliberately uses two paths. Ordinary line input and
+all redirected stdin remain buffered, preserving scripts and pipelines.
+Hidden or fixed-count reads use crossterm raw mode only when stdin is a real
+terminal. Raw mode is disabled on every completion/error path; hidden line
+input emits the newline that the terminal suppressed, while fixed-count input
+does not invent one because it returns before Enter.
+
+Unit tests cover option validation and the existing last-variable-remainder
+rule. A release-binary stdin session verifies expanded prompts, multiword
+assignment, one-character truncation, and silent-mode assignment. Actual
+no-Enter delivery and hidden terminal echo require a final human check in
+Windows Terminal because automated stdin is not a TTY.
+
+## 39. Named timezones and daylight-saving transitions
+
+`$timezone(VALUE ZONE [AMBIGUOUS_POLICY] [GAP_POLICY])` (also available as
+`$at_timezone`) uses `chrono-tz`'s embedded IANA database. An offset-bearing
+datetime is an instant and converts directly to the named zone's correct
+seasonal offset. A naive datetime is a local wall-clock reading to be
+interpreted in that zone, so it can be unique, repeated during a fall-back
+fold, or nonexistent during a spring-forward gap.
+
+Both exceptional cases reject by default rather than guessing. A repeated
+local time requires `earlier` or `later`; the words select the earlier or
+later actual instant, not merely the smaller numeric offset. A nonexistent
+time accepts `shift-forward` or `shift-backward`. The gap width comes from
+`chrono_tz::GapInfo`, so a requested time retains its minutes and seconds
+across the transition (`02:30` in Sydney's one-hour gap becomes `03:30` or
+`01:30`) instead of being rounded to a transition boundary.
+
+The resulting scalar remains canonical RFC 3339 with a numeric offset, so it
+continues to work with `$date_compare`, `$date_diff`, `$date_format`, typed
+`datetime`, child arguments, and serialization without adding a second
+timezone-bearing scalar representation. The IANA name determines conversion
+but is not retained in the returned string.
+
+Four focused tests cover Sydney summer/winter conversion, both fall-back
+instants, both spring-forward resolutions, unknown zones, and invalid policy
+names. The release-binary exercise in
+`scripts/exercise/15_native_datetime.ion` covers the same method through the
+real parser and expansion path.

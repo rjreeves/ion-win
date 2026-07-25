@@ -89,6 +89,7 @@ pub fn call_string_method(name: &str, args: &[MethodArg]) -> Option<Result<Strin
         "date_format" => temporal_binary(args, crate::temporal::format),
         "date_compare" => temporal_binary(args, crate::temporal::compare),
         "date_diff" => temporal_binary(args, crate::temporal::difference),
+        "timezone" | "at_timezone" => timezone(args),
         _ => return None,
     })
 }
@@ -105,6 +106,19 @@ fn temporal_binary(
     operation: fn(&str, &str) -> Result<String, String>,
 ) -> Result<String, String> {
     operation(&arg_str(args, 0)?, &arg_str(args, 1)?)
+}
+
+fn timezone(args: &[MethodArg]) -> Result<String, String> {
+    if !(2..=4).contains(&args.len()) {
+        return Err(
+            "timezone: expected VALUE ZONE [AMBIGUOUS_POLICY] [GAP_POLICY]".to_string()
+        );
+    }
+    let value = arg_str(args, 0)?;
+    let zone = arg_str(args, 1)?;
+    let ambiguous = args.get(2).map(MethodArg::as_str);
+    let gap = args.get(3).map(MethodArg::as_str);
+    crate::temporal::timezone(&value, &zone, ambiguous.as_deref(), gap.as_deref())
 }
 
 fn no_arg(args: &[MethodArg], name: &str, operation: fn() -> String) -> Result<String, String> {

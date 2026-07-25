@@ -14,6 +14,7 @@ mod history;
 mod interp;
 mod jobctl;
 mod jobs;
+mod keyboard_input;
 mod methods;
 mod pipeline;
 mod pipeline_exec;
