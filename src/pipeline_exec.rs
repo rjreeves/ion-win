@@ -551,7 +551,13 @@ async fn run_impl(
                 carry = Carry::None;
             }
             Kind::External(args) => {
-                let mut command = jobctl::new_command(&args[0]);
+                let Some(resolved) = crate::command_resolver::resolve(&args[0]) else {
+                    interp.mark_command_not_found();
+                    err_println!("ion-win: command not found: {}", args[0]);
+                    unregister_spawned!();
+                    return false;
+                };
+                let mut command = jobctl::new_command(&resolved);
                 command.args(&args[1..]);
 
                 let mut post_spawn_bytes = None;

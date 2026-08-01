@@ -7,8 +7,6 @@
 //! engine; this expansion path is synchronous, matching how `interpolate`
 //! itself is synchronous).
 
-use std::process::Command;
-
 /// Runs `args[0] args[1..]` and returns its captured stdout, with a
 /// trailing newline trimmed (matching how POSIX shells strip the trailing
 /// newline from command substitution).
@@ -17,7 +15,9 @@ pub fn capture(args: &[String]) -> Result<String, String> {
         return Err("empty command in process expansion".to_string());
     };
 
-    let output = Command::new(program)
+    let resolved = crate::command_resolver::resolve(program)
+        .ok_or_else(|| format!("command not found: {program}"))?;
+    let output = std::process::Command::new(resolved)
         .args(&args[1..])
         .output()
         .map_err(|e| {

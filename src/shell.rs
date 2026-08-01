@@ -1367,39 +1367,12 @@ fn handle_which(args: &[String], interp: &Interpreter) {
             println!("{name}: builtin");
         } else if interp.get_function(name).is_some() {
             println!("{name}: function");
-        } else if let Some(path) = resolve_on_path(name) {
-            println!("{path}");
+        } else if let Some(path) = crate::command_resolver::resolve(name) {
+            println!("{}", path.display());
         } else {
             err_println!("ion: which: {name}: not found");
         }
     }
-}
-
-/// Searches `PATH` for `name`, trying each `PATHEXT` extension in turn
-/// (matching how Windows itself resolves a bare command name to an
-/// executable) unless `name` already has an extension.
-fn resolve_on_path(name: &str) -> Option<String> {
-    let path_var = std::env::var_os("PATH")?;
-    let has_ext = std::path::Path::new(name).extension().is_some();
-    let exts: Vec<String> = if has_ext {
-        vec![String::new()]
-    } else {
-        std::env::var("PATHEXT")
-            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
-            .split(';')
-            .map(str::to_string)
-            .collect()
-    };
-
-    for dir in std::env::split_paths(&path_var) {
-        for ext in &exts {
-            let candidate = dir.join(format!("{name}{ext}"));
-            if candidate.is_file() {
-                return Some(candidate.display().to_string());
-            }
-        }
-    }
-    None
 }
 
 /// `exists [EXPRESSION]` (ion-manual page 72): exit status 0 if the given
@@ -1420,7 +1393,7 @@ fn eval_exists(raw_args: &[Token], interp: &Interpreter) -> bool {
         }
         [flag, name] if flag.text == "--fn" => interp.get_function(&name.text).is_some(),
         [flag, rest @ ..] if flag.text == "-b" => {
-            resolve_on_path(&interp.expand_all(rest).join(" ")).is_some()
+            crate::command_resolver::resolve(&interp.expand_all(rest).join(" ")).is_some()
         }
         [flag, rest @ ..] if flag.text == "-d" => {
             std::path::Path::new(&interp.expand_all(rest).join(" ")).is_dir()
@@ -1784,8 +1757,15 @@ fn handle_fn_builtin(interp: &Interpreter) {
 /// the foreground job while it runs (see `jobctl.rs`), so Ctrl+C
 /// interrupts it instead of doing nothing or killing the whole shell.
 fn run_external_status(program: &str, args: &[String], interp: &mut Interpreter) -> bool {
-    match jobctl::new_command(program).args(args).spawn() {
-        Ok(child) => jobctl::wait_foreground(child).map(|s| s.success()).unwrap_or(false),
+    let Some(resolved) = crate::command_resolver::resolve(program) else {
+        interp.mark_command_not_found();
+        err_println!("ion-win: command not found: {program}");
+        return false;
+    };
+    match jobctl::new_command(&resolved).args(args).spawn() {
+        Ok(child) => jobctl::wait_foreground(child)
+            .map(|s| s.success())
+            .unwrap_or(false),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             interp.mark_command_not_found();
             err_println!("ion-win: command not found: {program}");
@@ -1802,7 +1782,12 @@ fn run_external_status(program: &str, args: &[String], interp: &mut Interpreter)
 /// a non-zero exit code, matching typical shell prompt feedback. Returns
 /// whether the process succeeded, for `previous_status` (`$?`) tracking.
 fn run_external(program: &str, args: &[String], interp: &mut Interpreter) -> bool {
-    match jobctl::new_command(program).args(args).spawn() {
+    let Some(resolved) = crate::command_resolver::resolve(program) else {
+        interp.mark_command_not_found();
+        err_println!("ion-win: command not found: {program}");
+        return false;
+    };
+    match jobctl::new_command(&resolved).args(args).spawn() {
         Ok(child) => match jobctl::wait_foreground(child) {
             Ok(status) => {
                 if !status.success() {

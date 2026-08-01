@@ -3,6 +3,7 @@ mod builtin_names;
 mod builtins;
 mod clipboard;
 mod colorout;
+mod command_resolver;
 mod compress;
 mod copy;
 mod delete;

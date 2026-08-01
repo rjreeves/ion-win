@@ -76,7 +76,7 @@ pub fn take_interrupt() -> bool {
 /// delivery, so `request_interrupt` can instead explicitly forward the
 /// event only to whichever PID(s) are currently registered as the
 /// foreground job (see `register_foreground`).
-pub fn new_command(program: &str) -> std::process::Command {
+pub fn new_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
     let mut command = std::process::Command::new(program);
     #[cfg(windows)]
     {
