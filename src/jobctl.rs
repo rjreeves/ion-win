@@ -68,6 +68,14 @@ pub fn take_interrupt() -> bool {
     INTERRUPTED.swap(false, Ordering::SeqCst)
 }
 
+/// Observes the cooperative interrupt flag without consuming it. Long-running
+/// in-process builtins use this from worker threads so every worker can notice
+/// the same Ctrl+C request; the coordinating task consumes it once cleanup is
+/// complete with `take_interrupt`.
+pub fn interrupt_requested() -> bool {
+    INTERRUPTED.load(Ordering::SeqCst)
+}
+
 /// Builds a `Command` for `program`, isolated into its own Windows process
 /// group. By default, Windows delivers a console Ctrl+C event to *every*
 /// process sharing the console — including this shell itself and every
@@ -151,6 +159,8 @@ mod tests {
         assert_eq!(*registry().lock().unwrap(), vec![4243]);
 
         request_interrupt(); // sets the flag; forwarding to a fake PID is a harmless no-op
+        assert!(interrupt_requested(), "non-consuming check should see the flag");
+        assert!(interrupt_requested(), "non-consuming check must leave the flag set");
         assert!(take_interrupt(), "request_interrupt should set the flag");
         assert!(!take_interrupt(), "flag should be consumed by the first take");
 

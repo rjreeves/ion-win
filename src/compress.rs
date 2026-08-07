@@ -13,9 +13,8 @@
 //! specific to this builtin**: unlike a file copy, DEFLATE compression is
 //! genuinely CPU-bound, so compressing many files one at a time on a
 //! single thread would waste every core but one. Each file is
-//! independently compressed, in parallel, into its own tiny one-entry
-//! in-memory `.zip` (via `tokio::task::spawn_blocking`, the same pattern
-//! `stat.rs`/`copy.rs` established) — a real, self-contained DEFLATE
+//! independently compressed, in parallel, into its own temporary one-entry
+//! `.zip` on disk (via `tokio::task::spawn_blocking`) — a real, self-contained DEFLATE
 //! stream, since separate zip entries never share compression state.
 //! Splicing those entries into the one final archive still has to happen
 //! on a single thread, sequentially, because the zip format's central
@@ -27,8 +26,9 @@
 
 use crate::table::Table;
 use std::fs;
-use std::io::{Cursor, Write};
-use std::path::{Component, Path};
+use std::io::{Read, Write};
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
@@ -122,7 +122,7 @@ fn table_row_entry_name(path: &str) -> String {
 }
 
 /// Shared by both public entry points: compresses every `(entry_name,
-/// src_path)` pair concurrently into its own in-memory mini-archive, then
+/// src_path)` pair concurrently into its own temporary mini-archive, then
 /// splices all of them into one real archive file at `dest` sequentially.
 /// `skipped` seeds the tally with anything already rejected before this
 /// point (e.g. `compress_table`'s no-`path`-column rows), so it's folded
@@ -142,28 +142,6 @@ async fn compress_entries(
         );
     }
 
-    // Parallel step: each file is read and DEFLATE-compressed into its
-    // own self-contained one-entry archive, independently of every other
-    // file — genuine concurrent CPU work across cores, not just I/O.
-    let mut handles = Vec::with_capacity(entries.len());
-    for (name, src) in entries {
-        handles.push(tokio::task::spawn_blocking(move || compress_one(&src, &name)));
-    }
-    let mut mini_archives = Vec::with_capacity(handles.len());
-    for handle in handles {
-        match handle.await {
-            Ok(Ok(mini)) => mini_archives.push(mini),
-            Ok(Err(e)) => {
-                crate::err_println!("ion-win: compress: {e}");
-                skipped += 1;
-            }
-            Err(e) => {
-                crate::err_println!("ion-win: compress: task failed: {e}");
-                skipped += 1;
-            }
-        }
-    }
-
     if let Some(parent) = dest_path.parent() {
         if !parent.as_os_str().is_empty() {
             if let Err(e) = fs::create_dir_all(parent) {
@@ -176,41 +154,117 @@ async fn compress_entries(
         Err(e) => return format!("ion-win: compress: {dest}: {e}"),
     };
 
-    // Sequential step: splice each already-compressed entry into the
-    // final archive without re-running DEFLATE on any of them.
     let mut writer = ZipWriter::new(file);
     let mut compressed = 0usize;
-    for mini in mini_archives {
-        match splice_entry(&mut writer, &mini) {
-            Ok(()) => compressed += 1,
-            Err(e) => {
-                crate::err_println!("ion-win: compress: {e}");
-                skipped += 1;
+
+    // Keep only one batch per logical CPU active. Each worker streams its
+    // input into a temporary one-entry ZIP on disk, so memory use is bounded
+    // by the ZIP library's buffers rather than the combined size of all files.
+    let concurrency = std::thread::available_parallelism().map_or(1, usize::from);
+    let temp_dir = compression_temp_dir();
+    if let Err(e) = fs::create_dir_all(&temp_dir) {
+        drop(writer);
+        let _ = fs::remove_file(dest_path);
+        return format!("ion-win: compress: could not create temporary directory: {e}");
+    }
+
+    let mut pending = entries.into_iter();
+    let mut interrupted = false;
+    loop {
+        if crate::jobctl::interrupt_requested() {
+            interrupted = true;
+            break;
+        }
+
+        let mut handles = Vec::with_capacity(concurrency);
+        for _ in 0..concurrency {
+            let Some((name, src)) = pending.next() else {
+                break;
+            };
+            let mini_path = temp_dir.join(format!("{}.zip", next_temp_id()));
+            handles.push(tokio::task::spawn_blocking(move || {
+                let result = compress_one(&src, &name, &mini_path);
+                (mini_path, result)
+            }));
+        }
+        if handles.is_empty() {
+            break;
+        }
+
+        for handle in handles {
+            let (mini_path, result) = match handle.await {
+                Ok(value) => value,
+                Err(e) => {
+                    crate::err_println!("ion-win: compress: task failed: {e}");
+                    skipped += 1;
+                    continue;
+                }
+            };
+            match result {
+                Ok(()) if !crate::jobctl::interrupt_requested() => {
+                    match splice_entry(&mut writer, &mini_path) {
+                        Ok(()) => compressed += 1,
+                        Err(e) => {
+                            crate::err_println!("ion-win: compress: {e}");
+                            skipped += 1;
+                        }
+                    }
+                }
+                Ok(()) => interrupted = true,
+                Err(e) if e == "interrupted" => interrupted = true,
+                Err(e) => {
+                    crate::err_println!("ion-win: compress: {e}");
+                    skipped += 1;
+                }
             }
+            let _ = fs::remove_file(&mini_path);
+        }
+        if interrupted {
+            break;
         }
     }
+
+    if interrupted {
+        drop(writer);
+        let _ = fs::remove_file(dest_path);
+        let _ = fs::remove_dir_all(&temp_dir);
+        let _ = crate::jobctl::take_interrupt();
+        return "ion-win: compress: interrupted".to_string();
+    }
+
     if let Err(e) = writer.finish() {
+        let _ = fs::remove_dir_all(&temp_dir);
         return format!("ion-win: compress: {dest}: {e}");
     }
+    let _ = fs::remove_dir_all(&temp_dir);
     summary(compressed, skipped)
 }
 
-/// Runs on a blocking task: reads `src` and DEFLATE-compresses it into a
-/// brand new, complete, one-entry zip archive held entirely in memory
-/// (`name` is the entry's stored name). Returns that mini-archive's raw
-/// bytes, which `splice_entry` later reads back and copies into the
-/// real, final archive without recompressing.
-fn compress_one(src: &str, name: &str) -> Result<Vec<u8>, String> {
-    let bytes = fs::read(src).map_err(|e| format!("{src}: {e}"))?;
-    let mut buf = Vec::new();
-    {
-        let mut mini = ZipWriter::new(Cursor::new(&mut buf));
-        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
-        mini.start_file(name, options).map_err(|e| format!("{src}: {e}"))?;
-        mini.write_all(&bytes).map_err(|e| format!("{src}: {e}"))?;
-        mini.finish().map_err(|e| format!("{src}: {e}"))?;
+/// Runs on a blocking task: streams `src` into a complete one-entry ZIP in
+/// temporary storage. It polls Ctrl+C between chunks, keeping both memory use
+/// and interrupt latency bounded independently of the source file's size.
+fn compress_one(src: &str, name: &str, mini_path: &Path) -> Result<(), String> {
+    let mut input = fs::File::open(src).map_err(|e| format!("{src}: {e}"))?;
+    let output = fs::File::create(mini_path).map_err(|e| format!("{src}: {e}"))?;
+    let mut mini = ZipWriter::new(output);
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    mini.start_file(name, options)
+        .map_err(|e| format!("{src}: {e}"))?;
+
+    let mut buffer = vec![0u8; 256 * 1024];
+    loop {
+        if crate::jobctl::interrupt_requested() {
+            return Err("interrupted".to_string());
+        }
+        let count = input.read(&mut buffer).map_err(|e| format!("{src}: {e}"))?;
+        if count == 0 {
+            break;
+        }
+        mini.write_all(&buffer[..count])
+            .map_err(|e| format!("{src}: {e}"))?;
     }
-    Ok(buf)
+    mini.finish().map_err(|e| format!("{src}: {e}"))?;
+    Ok(())
 }
 
 /// Reads a one-entry mini-archive back (as built by `compress_one`) and
@@ -218,10 +272,25 @@ fn compress_one(src: &str, name: &str) -> Result<Vec<u8>, String> {
 /// of the `zip` crate's public API that lets an already-compressed entry
 /// be added to a different archive without decompressing and
 /// recompressing it.
-fn splice_entry(writer: &mut ZipWriter<fs::File>, mini_bytes: &[u8]) -> Result<(), String> {
-    let mut archive = ZipArchive::new(Cursor::new(mini_bytes)).map_err(|e| e.to_string())?;
+fn splice_entry(writer: &mut ZipWriter<fs::File>, mini_path: &Path) -> Result<(), String> {
+    let mini = fs::File::open(mini_path).map_err(|e| e.to_string())?;
+    let mut archive = ZipArchive::new(mini).map_err(|e| e.to_string())?;
     let file = archive.by_index(0).map_err(|e| e.to_string())?;
     writer.raw_copy_file(file).map_err(|e| e.to_string())
+}
+
+static TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+fn next_temp_id() -> u64 {
+    TEMP_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+fn compression_temp_dir() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "ion-win-compress-{}-{}",
+        std::process::id(),
+        next_temp_id()
+    ))
 }
 
 fn summary(compressed: usize, skipped: usize) -> String {
@@ -424,6 +493,30 @@ mod tests {
             let expected = (format!("in-{i}.txt"), format!("contents-{i}"));
             assert!(entries.contains(&expected), "missing or wrong entry for file {i}");
         }
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn compression_honors_interrupt_and_removes_partial_archive() {
+        let dir = temp_dir("interrupt");
+        let src = dir.join("large-enough-to-schedule.bin");
+        fs::write(&src, vec![42u8; 1024 * 1024]).unwrap();
+        let out = dir.join("out.zip");
+
+        // Simulates the flag set by the real Ctrl+C handler. Compression must
+        // consume it, abandon the operation, and not leave a corrupt archive.
+        crate::jobctl::request_interrupt();
+        let result = compress_files(
+            &[src.to_string_lossy().into_owned()],
+            &out.to_string_lossy(),
+            false,
+        )
+        .await;
+
+        assert_eq!(result, "ion-win: compress: interrupted");
+        assert!(!out.exists(), "an interrupted archive must be removed");
+        assert!(!crate::jobctl::interrupt_requested());
 
         let _ = fs::remove_dir_all(dir);
     }
