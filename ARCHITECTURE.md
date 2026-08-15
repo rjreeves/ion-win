@@ -269,13 +269,13 @@ Implemented in `src/shell.rs` (`exec_match` plus its header-parsing helpers). Fo
 
 ## 13. Legacy shell-job compatibility: `jobs`/`wait`/`disown`, deliberately not `fg`/`bg`
 
-Implemented in `src/jobs.rs` (the current background-child registry) plus `src/pipeline_exec.rs` (registration) and `src/shell.rs` (the three builtins). This is a compatibility implementation for Ion's existing shell syntax, not the target runtime abstraction. In particular, the `Job` type and the phrase "Jobs Registry" in this section refer only to today's bookkeeping code. New platform code must use the `Execution` vocabulary and boundaries defined in §44.
+Implemented by `ExecutionManager` in `src/execution.rs`, with `src/pipeline_exec.rs` registering background executions and `src/shell.rs` exposing the three legacy builtins. These commands are compatibility adapters for Ion's existing syntax; there is no separate `Job` domain type or Jobs Registry.
 
 **The scope decision.** The manual's `fg`/`bg` semantics ("resuming it if it has stopped") assume POSIX job control — `SIGTSTP`/`SIGCONT`, a job that's been *stopped* and needs resuming. Windows has no clean equivalent (no standard signal-based process suspension), and ion-win doesn't implement job-*stopping* at all (matches the manual's own Unix-only "Suspending the Shell" page). Rather than ship an `fg`/`bg` that quietly does something smaller than what the name promises, they're skipped entirely. `jobs`, `wait`, and `disown` don't have this problem — they're pure bookkeeping (list/wait-for/stop-tracking), no signals involved.
 
-**The current compatibility registry** (`jobs.rs`) is a `Mutex<Vec<Job>>` behind a `OnceLock` holding background `Child` handles, since `wait` needs to call `.wait()` on them and `jobs` needs to `.try_wait()` them to prune finished ones. The former foreground-PID registry has already been removed from `jobctl.rs`; foreground interrupt targets now come from `ExecutionManager`. `jobs.rs` is therefore the last duplicate runtime registry and must be absorbed next, with the existing `jobs`/`wait`/`disown` commands becoming compatibility views/actions over the manager.
+**One owner.** `ExecutionManager` owns background child handles in private runtime state associated with one background `Execution` per pipeline. `jobs` calls `try_wait` through the manager and lists still-running processes as the legacy `(PID, command)` view; `wait` temporarily extracts the handle sets so it can block without holding the global manager lock, then records exit results and terminal history; `disown` explicitly releases matching handles and process records without terminating the OS processes. If every process in an execution is disowned, that live execution is removed without inventing a terminal result.
 
-**Where registration happens**: `pipeline_exec.rs`'s existing background-handling branch (`pipeline.background || pipeline.disown`), which previously just printed a count and let the `Vec<Child>` drop (silently killing ion-win's only handle to those processes, though the OS processes themselves kept running untracked). Now, plain `&` (`pipeline.background`) registers each child into `jobs::register` before that branch returns; `&!` (`pipeline.disown`) still does nothing beyond the printed count — a disowned job was never meant to be tracked in the first place, so there's nothing to register.
+**Where registration happens**: `pipeline_exec.rs` creates one background `Execution` before launching a plain-`&` pipeline, attaches every spawned PID/display string, and transfers all `Child` handles to the manager when setup completes. `&!` still creates no execution and transfers no handles—a disowned pipeline is intentionally untracked from launch.
 
 **`disown`'s exact semantics**: the manual's `-a` flag is documented as "if no job IDs were supplied, remove all jobs" — extended here to apply the same rule to a bare `disown` with no flags at all, rather than inventing bash's unrelated "disown the most recent job" default that this manual never mentions. `-h` (don't forward SIGHUP to the disowned job) is accepted but a no-op, since Windows console apps have no real SIGHUP equivalent for ion-win to forward.
 
@@ -865,7 +865,7 @@ columns to CSV, and canonicalizes a second raw-date table.
 
 ## 44. Execution platform: target architecture
 
-**Status: foundation and foreground integration implemented.** `src/execution.rs` defines the immutable spec, invocation context, lifecycle types, sanitized history record, validated transitions, and bounded in-memory `ExecutionManager` registry. Ordinary single-command foreground paths and foreground pipelines now create, start, run, wait for, and complete an `Execution`; one pipeline execution owns all of its child handles during the wait and records each PID/exit code. `jobctl` remains the Windows process-group/Ctrl+Break backend. Background commands and process expansion still use compatibility paths, so migration is incomplete. This section supersedes the old architectural idea of a general-purpose "Jobs Registry." New runtime work must evolve the compatibility code into the existing `ExecutionManager` rather than creating another registry. `Job` is not a new ion domain type: on Windows it is too easily confused with a kernel Job Object, a scheduled task, or the legacy shell `jobs` command.
+**Status: foreground and background execution ownership implemented.** `src/execution.rs` defines the immutable spec, invocation context, lifecycle types, sanitized history record, validated transitions, and bounded in-memory `ExecutionManager` registry. Ordinary foreground commands, foreground pipelines, and tracked background `&` pipelines now create executions; the manager is the only runtime owner/waiter of their child handles. `jobctl` remains the Windows process-group/Ctrl+Break backend, using an execution-derived PID view. Process expansion remains the only current external-process exception. This section supersedes the old architectural idea of a general-purpose "Jobs Registry." `Job` is not an ion domain type: on Windows it is too easily confused with a kernel Job Object, a scheduled task, or the legacy shell `jobs` command.
 
 ### Vocabulary and ownership
 
@@ -926,7 +926,7 @@ It owns ID allocation, validated state transitions, registration before launch b
 
 The initial lifecycle is `Created -> Starting -> Running -> {Completed, Failed, Cancelled}`, with `Running -> Cancelling -> Cancelled` for explicit cancellation. Launch failure is terminal and must still leave a reportable execution record. Add `TimedOut` or `Detached` only when their semantics are implemented; do not invent a `Suspended` state while Windows suspension/resume is unsupported.
 
-The existing `jobs`, `wait`, and `disown` commands should migrate onto `ExecutionManager` as legacy shell-language adapters. A future execution-native UX may expose `exec list`, `exec show ID`, `exec wait ID`, and `exec cancel ID`. Foreground PID discovery is already an execution-manager view; the remaining migration must preserve current `&`/`&!` behavior and remove or absorb `jobs.rs`'s separate `Mutex<Vec<Job>>`.
+The existing `jobs`, `wait`, and `disown` commands are now legacy shell-language adapters over `ExecutionManager`; `jobs.rs` has been deleted. A future execution-native UX may expose `exec list`, `exec show ID`, `exec wait ID`, and `exec cancel ID`.
 
 ### Windows process and Job Object policy
 
@@ -960,7 +960,7 @@ ConPTY does not replace `Process`, `JobObject`, `Execution`, or `ExecutionManage
 
 1. **Complete:** introduce domain types and validated state transitions without changing command behavior (`src/execution.rs`).
 2. **Complete:** `ExecutionManager` owns lifecycle orchestration and waiting for foreground external commands and multi-process pipelines while retaining `jobctl` as the Ctrl+Break backend.
-3. Migrate background `&`, `jobs`, `wait`, and `disown`; delete or reduce the old registry so one owner remains.
+3. **Complete:** migrate background `&`, `jobs`, `wait`, and `disown` and delete `jobs.rs`, leaving one runtime owner of managed child handles.
 4. Add the private Windows `JobObject` wrapper and managed-launch policy, with tests for containment, cleanup, cancellation, and accounting.
 5. Add persistent `Task`/`Schedule` definitions and a Windows Task Scheduler adapter above `ExecutionSpec`, not inside the manager.
 6. Add ConPTY only as a separately tested optional terminal adapter if a concrete compatibility requirement justifies it.

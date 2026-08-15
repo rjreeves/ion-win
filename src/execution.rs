@@ -297,6 +297,7 @@ pub struct Execution {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProcessRecord {
     pub pid: u32,
+    pub display: String,
     pub exit_code: Option<i32>,
 }
 
@@ -337,11 +338,16 @@ impl Execution {
     }
 
     pub fn add_process(&mut self, pid: u32) {
+        self.add_process_with_display(pid, String::new());
+    }
+
+    pub fn add_process_with_display(&mut self, pid: u32, display: String) {
         if self.root_pid.is_none() {
             self.root_pid = Some(pid);
         }
         self.processes.push(ProcessRecord {
             pid,
+            display,
             exit_code: None,
         });
     }
@@ -405,6 +411,12 @@ pub struct ExecutionManager {
     active: HashMap<ExecutionId, Execution>,
     history: VecDeque<ExecutionRecord>,
     history_limit: usize,
+    background_children: HashMap<ExecutionId, Vec<ManagedChild>>,
+}
+
+struct ManagedChild {
+    child: std::process::Child,
+    command: String,
 }
 
 const DEFAULT_HISTORY_LIMIT: usize = 1_000;
@@ -506,12 +518,16 @@ pub fn run_foreground_external(
 /// Registers a foreground pipeline as one execution before any of its child
 /// processes are launched. Individual PIDs are then attached as stages spawn.
 pub fn begin_foreground_pipeline(display: String) -> std::io::Result<ExecutionId> {
+    begin_pipeline(display, ExecutionMode::Foreground)
+}
+
+pub fn begin_background_pipeline(display: String) -> std::io::Result<ExecutionId> {
+    begin_pipeline(display, ExecutionMode::Background)
+}
+
+fn begin_pipeline(display: String, mode: ExecutionMode) -> std::io::Result<ExecutionId> {
     let cwd = std::env::current_dir()?;
-    let spec = ExecutionSpec::new(
-        ExecutionTarget::Pipeline { display },
-        cwd.clone(),
-        ExecutionMode::Foreground,
-    );
+    let spec = ExecutionSpec::new(ExecutionTarget::Pipeline { display }, cwd.clone(), mode);
     let context = ExecutionContext::new(cwd, std::env::vars().collect());
     let id = with_manager(|manager| manager.create(spec, context))?;
     with_manager(|manager| {
@@ -522,12 +538,99 @@ pub fn begin_foreground_pipeline(display: String) -> std::io::Result<ExecutionId
     Ok(id)
 }
 
-pub fn register_pipeline_process(id: ExecutionId, pid: u32) -> std::io::Result<()> {
+pub fn register_pipeline_process_with_display(
+    id: ExecutionId,
+    pid: u32,
+    display: String,
+) -> std::io::Result<()> {
     with_manager(|manager| {
         let execution = manager.get_mut(id).ok_or(ExecutionError::NotFound(id))?;
-        execution.add_process(pid);
+        execution.add_process_with_display(pid, display);
         Ok(())
     })
+}
+
+pub fn register_background_children(
+    id: ExecutionId,
+    children: Vec<std::process::Child>,
+    commands: Vec<String>,
+) -> std::io::Result<()> {
+    if children.len() != commands.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "background child/command count mismatch",
+        ));
+    }
+    with_manager(|manager| {
+        if manager.background_children.contains_key(&id) {
+            return Err(ExecutionError::InvalidTransition {
+                from: ExecutionState::Running,
+                to: ExecutionState::Running,
+            });
+        }
+        let managed = children
+            .into_iter()
+            .zip(commands)
+            .map(|(child, command)| ManagedChild { child, command })
+            .collect();
+        manager.background_children.insert(id, managed);
+        Ok(())
+    })
+}
+
+pub fn list_background_jobs() -> Vec<(u32, String)> {
+    let Ok(mut manager) = global_manager().lock() else {
+        return Vec::new();
+    };
+    manager.refresh_background_jobs()
+}
+
+pub fn wait_background_jobs() {
+    let pending = {
+        let Ok(mut manager) = global_manager().lock() else {
+            return;
+        };
+        std::mem::take(&mut manager.background_children)
+    };
+
+    for (id, children) in pending {
+        let mut final_code = None;
+        let mut final_success = true;
+        let mut failed = None;
+        let mut updates = Vec::new();
+        for mut managed in children {
+            let pid = managed.child.id();
+            match managed.child.wait() {
+                Ok(status) => {
+                    final_code = status.code();
+                    final_success = status.success();
+                    updates.push((pid, status.code()));
+                }
+                Err(error) => failed = Some(error.to_string()),
+            }
+        }
+        let _ = with_manager(|manager| {
+            if let Some(execution) = manager.get_mut(id) {
+                for (pid, code) in updates {
+                    execution.set_process_exit(pid, code);
+                }
+            }
+            let state = if failed.is_some() || !final_success {
+                ExecutionState::Failed
+            } else {
+                ExecutionState::Completed
+            };
+            manager.transition(id, state, Some(ExecutionResult::new(final_code, failed)))?;
+            Ok(())
+        });
+    }
+}
+
+pub fn disown_background_jobs(pids: &[u32]) -> usize {
+    let Ok(mut manager) = global_manager().lock() else {
+        return 0;
+    };
+    manager.disown_background_jobs(pids)
 }
 
 /// Returns a short-lived snapshot for the Ctrl+C handler. The manager lock is
@@ -539,7 +642,7 @@ pub fn foreground_process_ids() -> Vec<u32> {
         .unwrap_or_default()
 }
 
-pub fn fail_foreground_pipeline(id: ExecutionId, message: impl Into<String>) {
+pub fn fail_pipeline_execution(id: ExecutionId, message: impl Into<String>) {
     let message = message.into();
     let _ = with_manager(|manager| {
         manager.transition(
@@ -610,6 +713,7 @@ impl ExecutionManager {
             active: HashMap::new(),
             history: VecDeque::new(),
             history_limit,
+            background_children: HashMap::new(),
         }
     }
 
@@ -666,6 +770,93 @@ impl ExecutionManager {
             })
             .flat_map(|execution| execution.processes.iter().map(|process| process.pid))
             .collect()
+    }
+
+    fn refresh_background_jobs(&mut self) -> Vec<(u32, String)> {
+        let ids: Vec<_> = self.background_children.keys().copied().collect();
+        let mut listed = Vec::new();
+        let mut finished = Vec::new();
+
+        for id in ids {
+            let mut updates = Vec::new();
+            let mut final_code = None;
+            let mut final_success = true;
+            let mut failed = None;
+            if let Some(children) = self.background_children.get_mut(&id) {
+                children.retain_mut(|managed| match managed.child.try_wait() {
+                    Ok(None) => {
+                        listed.push((managed.child.id(), managed.command.clone()));
+                        true
+                    }
+                    Ok(Some(status)) => {
+                        final_code = status.code();
+                        final_success = status.success();
+                        updates.push((managed.child.id(), status.code()));
+                        false
+                    }
+                    Err(error) => {
+                        failed = Some(error.to_string());
+                        false
+                    }
+                });
+            }
+            if let Some(execution) = self.active.get_mut(&id) {
+                for (pid, code) in updates {
+                    execution.set_process_exit(pid, code);
+                }
+            }
+            if self
+                .background_children
+                .get(&id)
+                .is_some_and(|children| children.is_empty())
+            {
+                finished.push((id, final_code, final_success, failed));
+            }
+        }
+
+        for (id, final_code, final_success, failed) in finished {
+            self.background_children.remove(&id);
+            let state = if failed.is_some() || !final_success {
+                ExecutionState::Failed
+            } else {
+                ExecutionState::Completed
+            };
+            let _ = self.transition(id, state, Some(ExecutionResult::new(final_code, failed)));
+        }
+        listed
+    }
+
+    fn disown_background_jobs(&mut self, pids: &[u32]) -> usize {
+        let ids: Vec<_> = self.background_children.keys().copied().collect();
+        let mut count = 0;
+        let mut empty = Vec::new();
+        for id in ids {
+            let mut removed = Vec::new();
+            if let Some(children) = self.background_children.get_mut(&id) {
+                children.retain(|managed| {
+                    let remove = pids.is_empty() || pids.contains(&managed.child.id());
+                    if remove {
+                        removed.push(managed.child.id());
+                        count += 1;
+                    }
+                    !remove
+                });
+                if children.is_empty() {
+                    empty.push(id);
+                }
+            }
+            if let Some(execution) = self.active.get_mut(&id) {
+                execution
+                    .processes
+                    .retain(|process| !removed.contains(&process.pid));
+                execution.root_pid = execution.processes.first().map(|process| process.pid);
+            }
+        }
+        for id in empty {
+            self.background_children.remove(&id);
+            self.active.remove(&id);
+        }
+        count
     }
 
     pub fn transition(
@@ -852,10 +1043,12 @@ mod tests {
             vec![
                 ProcessRecord {
                     pid: 101,
+                    display: String::new(),
                     exit_code: Some(3)
                 },
                 ProcessRecord {
                     pid: 202,
+                    display: String::new(),
                     exit_code: Some(0)
                 }
             ]

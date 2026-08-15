@@ -3,8 +3,9 @@
 //! Supported: `|`/`^|`/`&|` piping between external commands, `>`/`>>`/
 //! `^>`/`&>` redirection to files, `echo` as a producer (writing into the
 //! next stage's stdin or a redirect target), and `&`/`&!` (spawn without
-//! waiting — `&` registers with `jobs.rs` for `jobs`/`wait`/`disown`;
-//! `&!` never does, no `fg`/`bg` — see `jobs.rs`'s module doc for why).
+//! waiting — `&` registers one background execution with `ExecutionManager`
+//! for `jobs`/`wait`/`disown`; `&!` remains untracked. There is no `fg`/`bg`
+//! because Windows has no faithful POSIX stop/resume equivalent.
 //!
 //! Not supported as a pipeline stage: most other builtins (`pvar`, `dmark`,
 //! `test`, `matches`, `read`, ...) or a user-defined `fn` —
@@ -25,7 +26,6 @@ use crate::err_println;
 use crate::execution;
 use crate::interp::Interpreter;
 use crate::jobctl;
-use crate::jobs;
 use crate::pipeline::{PipeKind, Pipeline, Redirect, Stream};
 use crate::state::StateHandle;
 use crate::table::Table;
@@ -225,13 +225,21 @@ async fn run_impl(
                 return false;
             }
         }
+    } else if pipeline.background {
+        match execution::begin_background_pipeline(pipeline_display(pipeline)) {
+            Ok(id) => Some(id),
+            Err(error) => {
+                err_println!("ion-win: could not register background pipeline: {error}");
+                return false;
+            }
+        }
     } else {
         None
     };
 
     let mut children: Vec<Child> = Vec::new();
-    // Parallel to `children` (same index), for `jobs::register`'s display
-    // text if this pipeline turns out to be backgrounded.
+    // Parallel to `children` (same index), for the execution manager's job
+    // display text if this pipeline turns out to be backgrounded.
     let mut command_texts: Vec<String> = Vec::new();
     let mut merge_threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
     let mut carry = Carry::None;
@@ -241,10 +249,8 @@ async fn run_impl(
     // the foreground registry.
     macro_rules! unregister_spawned {
         () => {
-            if is_foreground {
-                if let Some(id) = pipeline_execution {
-                    execution::fail_foreground_pipeline(id, "pipeline setup failed");
-                }
+            if let Some(id) = pipeline_execution {
+                execution::fail_pipeline_execution(id, "pipeline setup failed");
             }
         };
     }
@@ -639,13 +645,15 @@ async fn run_impl(
                         return false;
                     }
                 };
-                if is_foreground {
-                    if let Some(id) = pipeline_execution {
-                        if let Err(error) = execution::register_pipeline_process(id, child.id()) {
-                            err_println!("ion-win: could not register pipeline process: {error}");
-                            unregister_spawned!();
-                            return false;
-                        }
+                if let Some(id) = pipeline_execution {
+                    if let Err(error) = execution::register_pipeline_process_with_display(
+                        id,
+                        child.id(),
+                        args.join(" "),
+                    ) {
+                        err_println!("ion-win: could not register pipeline process: {error}");
+                        unregister_spawned!();
+                        return false;
                     }
                 }
 
@@ -983,9 +991,15 @@ async fn run_impl(
         // shell semantics of "disowned" meaning the shell doesn't manage
         // its lifecycle from the moment it's spawned.
         if pipeline.background {
-            for (child, command) in children.into_iter().zip(command_texts) {
-                let pid = child.id();
-                jobs::register(pid, command, child);
+            let Some(id) = pipeline_execution else {
+                err_println!("ion-win: background pipeline has no execution");
+                return false;
+            };
+            if let Err(error) = execution::register_background_children(id, children, command_texts)
+            {
+                execution::fail_pipeline_execution(id, error.to_string());
+                err_println!("ion-win: could not retain background pipeline: {error}");
+                return false;
             }
         }
         println!("ion-win: [bg] started {job_count} process(es)");

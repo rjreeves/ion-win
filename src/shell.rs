@@ -13,7 +13,7 @@
 //!
 //! Not yet implemented: user-defined functions as condition commands or
 //! pipeline stages, and `fg`/`bg` job control (`jobs`/`wait`/`disown` are
-//! implemented — see `jobs.rs`) — see ARCHITECTURE.md section 6 for the
+//! implemented through `ExecutionManager`) — see ARCHITECTURE.md section 6 for the
 //! upgrade roadmap.
 
 /// Execution-flow signal threaded through statement/block execution so
@@ -49,7 +49,6 @@ use crate::functions::{self, FunctionDef};
 use crate::history;
 use crate::interp::{Interpreter, Quoting, Token};
 use crate::jobctl;
-use crate::jobs;
 use crate::keyboard_input::{self, ReadRequest};
 use crate::pipeline;
 use crate::{err_eprintln, err_println};
@@ -1087,7 +1086,7 @@ async fn dispatch(line: &str, interp: &mut Interpreter, state: &StateHandle) -> 
                 "pvar" => handle_pvar(&args, state).await,
                 "dmark" => handle_dmark(&args, state).await,
                 "jobs" => handle_jobs(),
-                "wait" => jobs::wait_all(),
+                "wait" => execution::wait_background_jobs(),
                 "disown" => handle_disown(&args),
                 "source" => return handle_source(&args, interp, state).await,
                 "test" => {
@@ -1870,7 +1869,7 @@ async fn handle_dmark(args: &[String], state: &StateHandle) {
 
 /// `jobs` (ion-manual page 75): lists all tracked background jobs.
 fn handle_jobs() {
-    let jobs = jobs::list();
+    let jobs = execution::list_background_jobs();
     if jobs.is_empty() {
         println!("ion-win: no background jobs");
         return;
@@ -1906,6 +1905,6 @@ fn handle_disown(args: &[String]) {
             },
         }
     }
-    let count = jobs::disown(&pids);
+    let count = execution::disown_background_jobs(&pids);
     println!("ion-win: disowned {count} job(s)");
 }
