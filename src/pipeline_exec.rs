@@ -22,6 +22,7 @@
 //! portably by stable `std::process`.
 
 use crate::err_println;
+use crate::execution;
 use crate::interp::Interpreter;
 use crate::jobctl;
 use crate::jobs;
@@ -216,6 +217,18 @@ async fn run_impl(
     // regardless, matching real shell job-control semantics.
     let is_foreground = !pipeline.background && !pipeline.disown;
 
+    let pipeline_execution = if is_foreground {
+        match execution::begin_foreground_pipeline(pipeline_display(pipeline)) {
+            Ok(id) => Some(id),
+            Err(error) => {
+                err_println!("ion-win: could not register foreground pipeline: {error}");
+                return false;
+            }
+        }
+    } else {
+        None
+    };
+
     let mut children: Vec<Child> = Vec::new();
     // Parallel to `children` (same index), for `jobs::register`'s display
     // text if this pipeline turns out to be backgrounded.
@@ -231,6 +244,9 @@ async fn run_impl(
             if is_foreground {
                 for child in &children {
                     jobctl::unregister_foreground(child.id());
+                }
+                if let Some(id) = pipeline_execution {
+                    execution::fail_foreground_pipeline(id, "pipeline setup failed");
                 }
             }
         };
@@ -358,7 +374,9 @@ async fn run_impl(
                             return false;
                         }
                         _ => {
-                            err_println!("ion-win: copy: expected a table (pipe through 'stat' first)");
+                            err_println!(
+                                "ion-win: copy: expected a table (pipe through 'stat' first)"
+                            );
                             unregister_spawned!();
                             return false;
                         }
@@ -528,9 +546,7 @@ async fn run_impl(
                     match incoming {
                         Carry::Table(t) => crate::delete::delete_table(&t, options).await,
                         Carry::None => {
-                            err_println!(
-                                "ion-win: delete: no paths given and no table piped in"
-                            );
+                            err_println!("ion-win: delete: no paths given and no table piped in");
                             unregister_spawned!();
                             return false;
                         }
@@ -628,6 +644,14 @@ async fn run_impl(
                 };
                 if is_foreground {
                     jobctl::register_foreground(child.id());
+                    if let Some(id) = pipeline_execution {
+                        if let Err(error) = execution::register_pipeline_process(id, child.id()) {
+                            jobctl::unregister_foreground(child.id());
+                            err_println!("ion-win: could not register pipeline process: {error}");
+                            unregister_spawned!();
+                            return false;
+                        }
+                    }
                 }
 
                 if let Some(bytes) = post_spawn_bytes {
@@ -973,16 +997,38 @@ async fn run_impl(
         return true;
     }
 
-    let mut ok = true;
-    for mut child in children {
-        let pid = child.id();
-        ok = child.wait().map(|s| s.success()).unwrap_or(false);
-        jobctl::unregister_foreground(pid);
-    }
+    let ok = match pipeline_execution {
+        Some(id) => execution::wait_foreground_pipeline(id, children).unwrap_or(false),
+        None => unreachable!("background pipelines returned before foreground wait"),
+    };
     for handle in merge_threads {
         let _ = handle.join();
     }
     ok
+}
+
+fn pipeline_display(pipeline: &Pipeline) -> String {
+    let mut display = String::new();
+    for (index, stage) in pipeline.stages.iter().enumerate() {
+        if index > 0 {
+            let separator = match pipeline.pipes.get(index - 1) {
+                Some(PipeKind::Stdout) => " | ",
+                Some(PipeKind::Stderr) => " ^| ",
+                Some(PipeKind::Combined) => " &| ",
+                None => " | ",
+            };
+            display.push_str(separator);
+        }
+        display.push_str(
+            &stage
+                .tokens
+                .iter()
+                .map(|token| token.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+    }
+    display
 }
 
 fn classify_stages(pipeline: &Pipeline, interp: &Interpreter) -> Vec<Kind> {

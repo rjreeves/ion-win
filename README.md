@@ -1,6 +1,6 @@
 # ion-win
 
-A native Windows port of the [Ion shell](https://gitlab.redox-os.org/redox-os/ion) — originally built for Redox OS — written in Rust. Ion's language (typed variables, `@array`/`$string` sigils, method expansions, `and`/`or`/`&&`/`||`, `match`/`case`, functions with typed parameters, brace/range expansion, ...) is preserved as-is; what changes is everything underneath it: real Windows process spawning and job control, `Ctrl+C` handled the Windows way, a `crossterm`-based line editor, and `redb`-backed persistent state instead of Redox-specific mechanisms that don't exist here.
+A native Windows port of the [Ion shell](https://gitlab.redox-os.org/redox-os/ion) — originally built for Redox OS — written in Rust. Ion's language (typed variables, `@array`/`$string` sigils, method expansions, `and`/`or`/`&&`/`||`, `match`/`case`, functions with typed parameters, brace/range expansion, ...) is preserved as-is; what changes is everything underneath it: real Windows process spawning and execution control, `Ctrl+C` handled the Windows way, a `crossterm`-based line editor, and `redb`-backed persistent state instead of Redox-specific mechanisms that don't exist here.
 
 It's driven directly from [Ion's own manual](docs/ion-manual.pdf): almost every feature was implemented by reading the manual's worked examples and writing tests that reproduce their exact output. Where the manual is ambiguous, silent, or self-contradictory, that's called out explicitly in [ARCHITECTURE.md](ARCHITECTURE.md) rather than guessed at quietly.
 

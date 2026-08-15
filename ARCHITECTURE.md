@@ -217,7 +217,7 @@ Deliberate, documented deviations from the upstream Ion manual — not oversight
 
 Implemented in `src/jobctl.rs`, wired into `src/shell.rs` and `src/pipeline_exec.rs`. Two independent mechanisms, since Ctrl+C needs to reach two different kinds of "currently running thing" with no common substrate on Windows:
 
-1. **A foreground external process** (single command or pipeline stage) — every child is spawned via `jobctl::new_command`, which sets the Windows-specific `CREATE_NEW_PROCESS_GROUP` creation flag. This isolates the child from the default console-wide Ctrl+C broadcast (which would otherwise also hit the shell itself and every other child it's ever spawned). `jobctl::register_foreground`/`unregister_foreground` track which PIDs are the *current* foreground job (background/`&`/disowned/`&!` children are never registered, matching real shell job-control semantics). The single `ctrlc::set_handler` callback installed in `main.rs` (`jobctl::request_interrupt`) forwards a **`CTRL_BREAK_EVENT`** — not `CTRL_C_EVENT` — to every registered PID via `GenerateConsoleCtrlEvent`.
+1. **A foreground external execution** (single command or pipeline stage) — children launched through the normal shell and pipeline paths are spawned via `jobctl::new_command`, which sets the Windows-specific `CREATE_NEW_PROCESS_GROUP` creation flag. This isolates the child from the default console-wide Ctrl+C broadcast (which would otherwise also hit the shell itself and every other child it has spawned). `jobctl::register_foreground`/`unregister_foreground` currently track the PIDs in the active foreground execution (background/`&`/disowned/`&!` children are never registered). The `$()`/`@()` process-expansion path is a current exception: `src/procexpand.rs` launches directly with `std::process::Command` for synchronous output capture and therefore does not participate in this foreground registry. The module name and PID-oriented API predate the execution architecture in §44; future work should move all process-producing paths, including process expansion, behind `ExecutionManager` without changing the proven Ctrl+Break mechanism. The single `ctrlc::set_handler` callback installed in `main.rs` (`jobctl::request_interrupt`) forwards a **`CTRL_BREAK_EVENT`** — not `CTRL_C_EVENT` — to every registered PID via `GenerateConsoleCtrlEvent`.
 
    This is a hard Windows API constraint, not a design choice: `GenerateConsoleCtrlEvent` can only ever broadcast `CTRL_C_EVENT` to *every* process sharing the console (`dwProcessGroupId` must be `0`); targeting a specific process group is only supported for `CTRL_BREAK_EVENT`. Since the child's own PID doubles as its process group ID (a consequence of `CREATE_NEW_PROCESS_GROUP`), `CTRL_BREAK_EVENT` is the only way to signal *just* that child without also killing the shell. Any program with no custom console-control handler terminates on `CTRL_BREAK_EVENT` exactly as it would on `CTRL_C_EVENT` (confirmed empirically: `timeout /t N` exits with `STATUS_CONTROL_C_EXIT`, `0xC000013A` / `3221225786`, on interrupt). A minority of programs install a custom handler that gives Ctrl+Break different semantics — `ping.exe` is the textbook example: it prints an interim statistics block ("Control-Break") and keeps running, mirroring Unix ping's `SIGQUIT` vs `SIGINT` distinction. This is that program's own documented behavior, not a bug in ion-win, and there is no Windows API-level workaround for it.
 
@@ -267,13 +267,13 @@ Implemented in `src/shell.rs` (`exec_match` plus its header-parsing helpers). Fo
 
 **Body splitting.** Structurally mirrors `exec_if`'s `else`/`else if` splitting: body lines are grouped into branches at each top-level `case` line (depth-tracked via `is_block_opener`/`end`, so a nested `if`/`while`/`for` inside a case's body doesn't get mistaken for a new case boundary or the match's own closing `end`) — verified with a real nested-`if`-and-`for`-inside-a-`case` smoke test. Only one `end` closes the whole `match`, not one per `case`, matching the manual's examples exactly.
 
-## 13. Job Control: `jobs`/`wait`/`disown`, deliberately not `fg`/`bg`
+## 13. Legacy shell-job compatibility: `jobs`/`wait`/`disown`, deliberately not `fg`/`bg`
 
-Implemented in `src/jobs.rs` (the registry) plus `src/pipeline_exec.rs` (registration) and `src/shell.rs` (the three builtins). Only the half of job control that maps cleanly onto Windows.
+Implemented in `src/jobs.rs` (the current background-child registry) plus `src/pipeline_exec.rs` (registration) and `src/shell.rs` (the three builtins). This is a compatibility implementation for Ion's existing shell syntax, not the target runtime abstraction. In particular, the `Job` type and the phrase "Jobs Registry" in this section refer only to today's bookkeeping code. New platform code must use the `Execution` vocabulary and boundaries defined in §44.
 
 **The scope decision.** The manual's `fg`/`bg` semantics ("resuming it if it has stopped") assume POSIX job control — `SIGTSTP`/`SIGCONT`, a job that's been *stopped* and needs resuming. Windows has no clean equivalent (no standard signal-based process suspension), and ion-win doesn't implement job-*stopping* at all (matches the manual's own Unix-only "Suspending the Shell" page). Rather than ship an `fg`/`bg` that quietly does something smaller than what the name promises, they're skipped entirely. `jobs`, `wait`, and `disown` don't have this problem — they're pure bookkeeping (list/wait-for/stop-tracking), no signals involved.
 
-**The registry** (`jobs.rs`) is a `Mutex<Vec<Job>>` behind a `OnceLock`, the same shape as `jobctl.rs`'s foreground-PID registry but holding the actual `Child` handles (not just PIDs), since `wait` needs to call `.wait()` on them and `jobs` needs to `.try_wait()` them to prune finished ones. Deliberately a *separate* module from `jobctl.rs` rather than folded into it: `jobctl` is specifically about the *current foreground* job and Ctrl+C signal delivery; `jobs` is about *background* jobs the shell keeps a longer-lived roster of — different lifetimes, different concerns, despite both being "job-related."
+**The current compatibility registry** (`jobs.rs`) is a `Mutex<Vec<Job>>` behind a `OnceLock`, the same shape as `jobctl.rs`'s foreground-PID registry but holding the actual `Child` handles (not just PIDs), since `wait` needs to call `.wait()` on them and `jobs` needs to `.try_wait()` them to prune finished ones. It remains separate from `jobctl.rs` today because the latter tracks only the active foreground PIDs for Ctrl+C delivery. Both are transitional implementation modules: when §44 is implemented, foreground and tracked background work become managed `Execution` records owned by `ExecutionManager`; the existing `jobs`/`wait`/`disown` commands become compatibility views/actions over that manager. Do not create a second long-lived "Jobs Registry" beside it.
 
 **Where registration happens**: `pipeline_exec.rs`'s existing background-handling branch (`pipeline.background || pipeline.disown`), which previously just printed a count and let the `Vec<Child>` drop (silently killing ion-win's only handle to those processes, though the OS processes themselves kept running untracked). Now, plain `&` (`pipeline.background`) registers each child into `jobs::register` before that branch returns; `&!` (`pipeline.disown`) still does nothing beyond the printed count — a disowned job was never meant to be tracked in the first place, so there's nothing to register.
 
@@ -862,3 +862,107 @@ multiple rows, and row-numbered missing/invalid failures. The compiled
 `scripts/exercise/16_temporal_columns.ion` smoke test captures a JSON table,
 chains add-plus-format transformations, verifies `$len`, serializes selected
 columns to CSV, and canonicalizes a second raw-date table.
+
+## 44. Execution platform: target architecture
+
+**Status: foundation and foreground integration implemented.** `src/execution.rs` defines the immutable spec, invocation context, lifecycle types, sanitized history record, validated transitions, and bounded in-memory `ExecutionManager` registry. Ordinary single-command foreground paths and foreground pipelines now create, start, run, wait for, and complete an `Execution`; one pipeline execution owns all of its child handles during the wait and records each PID/exit code. `jobctl` remains the Windows process-group/Ctrl+Break backend. Background commands and process expansion still use compatibility paths, so migration is incomplete. This section supersedes the old architectural idea of a general-purpose "Jobs Registry." New runtime work must evolve the compatibility code into the existing `ExecutionManager` rather than creating another registry. `Job` is not a new ion domain type: on Windows it is too easily confused with a kernel Job Object, a scheduled task, or the legacy shell `jobs` command.
+
+### Vocabulary and ownership
+
+| Concept | Meaning | Lifetime / owner |
+|---|---|---|
+| `Task` | A named, reusable definition that produces an `ExecutionSpec`. It is something that *can be run*, not a live run. | Persistent Task Registry or configuration. |
+| `Schedule` | A trigger and policy describing when a `Task` should create an execution. It may be backed by Windows Task Scheduler. | Persistent scheduling layer; never the Execution Registry. |
+| `ExecutionSpec` | Immutable launch intent: program or builtin/pipeline, arguments, working directory, environment overrides, I/O modes, foreground/background mode, limits, timeout, and requested terminal mode. It contains no live handles or mutable state. | Created by the REPL, a `Task`, a scheduler, or a future workflow client. |
+| `ExecutionContext` | The resolved per-invocation runtime context: effective environment and cwd, variables, credentials/security context, cancellation token, policy, logging/tracing correlation, resolved I/O endpoints, and temporary secrets. | Created for one invocation and owned with that execution; secrets and handles must not enter persistent history. |
+| `Execution` | One actual invocation as ion understands it: identity, spec/context reference, lifecycle state, timestamps, processes, metrics, and result. It may contain zero processes (builtin), one process, or several (pipeline/process tree). | Owned and tracked by `ExecutionManager`. |
+| `Process` | A platform process record/wrapper: PID, process handle, primary-thread handle while needed, and exit status. It is not the user-visible unit of work. | Windows backend of an `Execution`. |
+| `JobObject` | A safe RAII wrapper around a Windows Job Object `HANDLE`, used for process-tree lifetime, cancellation, limits, accounting, and notifications where supported. | Optional, private Windows-backend detail of a managed external `Execution`. |
+| ConPTY / `PseudoConsole` | An optional terminal adapter for programs that require a console session. It supplies terminal-shaped I/O; it does not own execution lifecycle or process tracking. | Optional Windows I/O adapter selected by `ExecutionSpec`; absent from the normal path. |
+
+`ExecutionContext` is deliberately distinct from both the immutable `ExecutionSpec` and the lifecycle-oriented `Execution`. The spec says what was requested; the context records the effective runtime inputs and services used to realize it; the execution records what happened. This boundary gives credentials, temporary secrets, connection profiles, cancellation, logging/tracing, resource policy, and future security contexts a home without turning `Execution` into an unstructured bag. Persist only a sanitized `ExecutionRecord`, never the whole context.
+
+### Required flow and boundaries
+
+```text
+Task (optional) + Schedule (optional)
+                  |
+REPL / script / task runner / scheduler / future workflow
+                  |
+                  v
+            ExecutionSpec
+                  |
+          resolve effective inputs
+                  v
+          ExecutionContext
+                  |
+                  v
+          ExecutionManager
+                  |
+        create/register Execution
+                  |
+                  v
+            Windows backend
+             /     |      \
+        Process  JobObject  optional ConPTY
+```
+
+All entry points converge before process launch. A scheduled task does not bypass the execution subsystem: it loads a `Task`, produces an `ExecutionSpec`, and submits it to `ExecutionManager` exactly as a manual `task run` would. Likewise, ordinary commands must continue to work with inherited or redirected standard handles and must not require ConPTY.
+
+The boundary rule is: **the shell, task layer, scheduler, and workflows talk in terms of executions; only the Windows backend talks directly in terms of process handles, Job Objects, console-control APIs, pipes, and ConPTY.** Raw Windows handles must not leak into the parser, language model, Task Registry, command UX, or persisted records.
+
+### `ExecutionManager` and Execution Registry
+
+`ExecutionManager` is the service/API; its registry is internal state, not a competing top-level component. A suitable shape is:
+
+```rust
+struct ExecutionManager {
+    active: HashMap<ExecutionId, Execution>,
+    history: VecDeque<ExecutionRecord>,
+}
+```
+
+It owns ID allocation, validated state transitions, registration before launch becomes externally observable, waiting, cancellation, metrics snapshots, completion, bounded/sanitized history, and removal/disown policy. At most one authoritative runtime registry may own an execution and its handles. `ExecutionRecord` should contain only reportable data such as ID, display command/task origin, state, timestamps, root PID, aggregate metrics, and result; a live `JobObject` handle belongs in private backend state, not in the record or public API.
+
+The initial lifecycle is `Created -> Starting -> Running -> {Completed, Failed, Cancelled}`, with `Running -> Cancelling -> Cancelled` for explicit cancellation. Launch failure is terminal and must still leave a reportable execution record. Add `TimedOut` or `Detached` only when their semantics are implemented; do not invent a `Suspended` state while Windows suspension/resume is unsupported.
+
+The existing `jobs`, `wait`, and `disown` commands should migrate onto `ExecutionManager` as legacy shell-language adapters. A future execution-native UX may expose `exec list`, `exec show ID`, `exec wait ID`, and `exec cancel ID`. This migration must preserve the current `&`/`&!` behavior and tested Ctrl+C behavior; it must remove or absorb the separate `Mutex<Vec<Job>>` and foreground-PID registry rather than leaving three authorities for process lifetime.
+
+### Windows process and Job Object policy
+
+The simplest valid external execution is still `CreateProcessW` (or `std::process::Command`) plus ordinary standard-handle wiring and wait. A Windows Job Object is optional at the abstraction boundary. The backend should attach one when ion needs reliable descendant cleanup, aggregate accounting, limits, or lifecycle notifications and the host/nesting constraints permit it.
+
+For a managed launch that requires guaranteed containment, create the root process suspended, assign it to the configured Job Object, then resume its primary thread so it cannot create descendants before assignment. Use a safe `JobObject` wrapper to centralize `CreateJobObjectW`, `SetInformationJobObject`, `AssignProcessToJobObject`, `QueryInformationJobObject`, completion-port association, termination, and handle closure. Query snapshots provide current accounting; an I/O completion port may later provide lifecycle events. Neither mechanism changes the public `Execution` contract.
+
+Cancellation is requested on the execution, never directly on an arbitrary `Process` from higher layers. The Windows backend applies policy: attempt the established cooperative console interrupt for a foreground console execution, wait any configured grace period, then terminate the Job Object/process tree when required. Job Object kill-on-close and detached/disowned semantics must be explicit so dropping a Rust value cannot accidentally change user-visible lifetime.
+
+### Scheduling is definition-time state, not runtime state
+
+Keep these stores separate:
+
+```text
+Task Registry                  Execution Registry
+  nightly-backup                 #101 Running
+  rebuild-index                  #102 Completed
+       |
+   Schedule(s) ----trigger----> new ExecutionSpec -> Execution #103
+```
+
+`Task` and `Schedule` definitions may persist across ion processes and reboots. Executions are individual attempts with their own identity and result. Windows Task Scheduler answers *when and under which OS account the launcher runs*; ion's execution subsystem answers *how that invocation is launched, observed, controlled, and reported*. Do not store schedules in `ExecutionManager`, and do not treat a Windows Task Scheduler registration as a live `Execution`.
+
+### ConPTY is an optional edge adapter
+
+ConPTY is not part of the core launch pipeline and must not be required for ordinary foreground commands, background commands, redirection, pipelines, capture, tasks, or scheduled runs. Model terminal choice on the spec/context (for example `Inherit`, `Redirected`, or `PseudoConsole`) and let the Windows backend select the corresponding I/O adapter. `PseudoConsole` is created only for the explicit mode or a narrowly documented compatibility policy.
+
+ConPTY does not replace `Process`, `JobObject`, `Execution`, or `ExecutionManager`; it only changes how terminal input/output is connected. Its resize and teardown logic stays behind the terminal adapter boundary. The first implementation milestone must work without ConPTY, preserving the current crossterm-based shell UI and inherited/redirected standard-handle execution.
+
+### Implementation order and acceptance criteria
+
+1. **Complete:** introduce domain types and validated state transitions without changing command behavior (`src/execution.rs`).
+2. **Complete:** `ExecutionManager` owns lifecycle orchestration and waiting for foreground external commands and multi-process pipelines while retaining `jobctl` as the Ctrl+Break backend.
+3. Migrate background `&`, `jobs`, `wait`, and `disown`; delete or reduce the old registry so one owner remains.
+4. Add the private Windows `JobObject` wrapper and managed-launch policy, with tests for containment, cleanup, cancellation, and accounting.
+5. Add persistent `Task`/`Schedule` definitions and a Windows Task Scheduler adapter above `ExecutionSpec`, not inside the manager.
+6. Add ConPTY only as a separately tested optional terminal adapter if a concrete compatibility requirement justifies it.
+
+Codex should consider the migration complete only when every process-producing path (plain external command, pipeline, background execution, `$()`/`@()` process expansion, and task-triggered run) creates an `Execution`; public/runtime code no longer introduces a generic ion `Job` domain type; Windows Job Object and ConPTY handles remain backend-private; scheduled definitions survive independently of execution history; and no duplicate registry can own or wait on the same process handle.

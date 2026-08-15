@@ -43,6 +43,7 @@ enum Flow {
 use crate::builtin_names;
 use crate::builtins;
 use crate::editor::{self, EditorOutcome, LineEditor};
+use crate::execution;
 use crate::fs_builtins;
 use crate::functions::{self, FunctionDef};
 use crate::history;
@@ -1762,10 +1763,8 @@ fn run_external_status(program: &str, args: &[String], interp: &mut Interpreter)
         err_println!("ion-win: command not found: {program}");
         return false;
     };
-    match jobctl::new_command(&resolved).args(args).spawn() {
-        Ok(child) => jobctl::wait_foreground(child)
-            .map(|s| s.success())
-            .unwrap_or(false),
+    match execution::run_foreground_external(&resolved, args) {
+        Ok(status) => status.success(),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             interp.mark_command_not_found();
             err_println!("ion-win: command not found: {program}");
@@ -1787,18 +1786,15 @@ fn run_external(program: &str, args: &[String], interp: &mut Interpreter) -> boo
         err_println!("ion-win: command not found: {program}");
         return false;
     };
-    match jobctl::new_command(&resolved).args(args).spawn() {
-        Ok(child) => match jobctl::wait_foreground(child) {
-            Ok(status) => {
-                if !status.success() {
-                    if let Some(code) = status.code() {
-                        err_eprintln!("ion-win: '{program}' exited with status {code}");
-                    }
+    match execution::run_foreground_external(&resolved, args) {
+        Ok(status) => {
+            if !status.success() {
+                if let Some(code) = status.code() {
+                    err_eprintln!("ion-win: '{program}' exited with status {code}");
                 }
-                status.success()
             }
-            Err(_) => false,
-        },
+            status.success()
+        }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             interp.mark_command_not_found();
             err_println!("ion-win: command not found: {program}");

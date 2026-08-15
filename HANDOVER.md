@@ -18,40 +18,41 @@ No special setup needed — it's a standard Cargo binary crate. `.gitignore`/`.g
 
 A working, reasonably faithful interpreter for Ion's language (variables, control flow, functions, expansions, pipelines) plus a real interactive line editor — not a toy. It's driven entirely from the [ion-manual.pdf](docs/ion-manual.pdf) spec: nearly every feature below was implemented by reading the manual's own worked examples and writing tests that reproduce their exact output, byte-for-byte. Where the manual was ambiguous or silent, that's called out explicitly rather than guessed at.
 
-## Module map (14,021 lines across 30 files)
+## Module map (16,212 lines across 31 files)
 
 | File | Lines | Purpose |
 |---|---|---|
-| `interp.rs` | 2116 | The core: tokenizer, `$`/`@` expansion, variable scope stacks, `let`/`export`/`drop`, and method/process-expansion dispatch |
-| `shell.rs` | 1808 | REPL, prompt rendering, block/control-flow execution, directory helpers, table capture, and builtin dispatch |
-| `pipeline_exec.rs` | 1082 | OS pipeline execution, jobs, structured stages, manifest operations, and table capture |
-| `editor.rs` | 979 | Crossterm line editor: grapheme-safe movement/editing, shared history, completion, selection, clipboard, and highlighting |
-| `history.rs` | 790 | Cross-window command history, session IDs, filtering, limits, locking, and atomic compaction |
-| `temporal.rs` | 762 | Native date/time parsing, formatting, fixed/calendar arithmetic, named zones, and DST policies |
-| `ranges.rs` | 608 | Slices, brace ranges, and nested permutation expansion |
-| `methods.rs` | 540 | String/array methods, Unicode graphemes, and temporal method dispatch |
-| `table.rs` | 460 | Table parsing, projection, filtering, and JSON/CSV round-tripping |
-| `compress.rs` | 410 | Concurrent standard-ZIP compression for explicit paths or table manifests |
-| `copy.rs` | 397 | Concurrent safe file copying for explicit paths or table manifests |
-| `arith.rs` | 394 | `$(( expr ))` recursive-descent arithmetic parser |
-| `fs_ops.rs` | 363 | Native `mkdir`/`move`/`rename`, overwrite rules, and table-driven moves |
-| `delete.rs` | 355 | Recycle-by-default and explicitly gated permanent file/table deletion |
-| `fs_builtins.rs` | 302 | `pwd`/`dirs`/`folders`/`files`/`cat`/`find` |
-| `state.rs` | 278 | `redb`-backed persistent `pvar`/`dmark` state |
-| `builtin_names.rs` | 777 | Completion/highlighting registry plus categorized and focused help |
-| `builtins.rs` | 237 | Condition evaluators such as `test`, `matches`, `contains`, `eq`, and `isatty` |
-| `temporal_column.rs` | 194 | Atomic `date-column` parsing, formatting, timezone, and calendar transforms |
-| `stat.rs` | 192 | Concurrent file metadata and optional SHA-256 table generation |
-| `pipeline.rs` | 178 | Pipeline and redirect parsing |
-| `jobctl.rs` | 141 | Foreground process groups, Ctrl+Break forwarding, and cooperative interrupts |
-| `keyboard_input.rs` | 130 | Buffered, hidden, and fixed-character `read` input modes |
-| `main.rs` | 114 | Entry point for interactive and script execution |
-| `types.rs` | 85 | Primitive and temporal typed-value validation |
-| `clipboard.rs` | 79 | Native Windows Unicode clipboard access |
-| `functions.rs` | 76 | Function parameter and docstring parsing |
-| `colorout.rs` | 72 | Terminal-aware, `NO_COLOR`-aware error output |
-| `jobs.rs` | 70 | Background job registry for `jobs`/`wait`/`disown` |
-| `procexpand.rs` | 32 | External process spawning for `$(cmd)`/`@(cmd)` |
+| `interp.rs` | 2291 | The core: tokenizer, `$`/`@` expansion, variable scope stacks, `let`/`export`/`drop`, and method/process-expansion dispatch |
+| `shell.rs` | 1911 | REPL, prompt rendering, block/control-flow execution, directory helpers, table capture, and builtin dispatch |
+| `pipeline_exec.rs` | 1174 | OS pipeline execution, execution-managed foreground pipelines, legacy background-job wiring, structured stages, manifest operations, and table capture |
+| `editor.rs` | 1059 | Crossterm line editor: grapheme-safe movement/editing, shared history, completion, selection, clipboard, and highlighting |
+| `execution.rs` | 924 | Execution domain model, validated lifecycle transitions, multi-process records, sanitized bounded history, and foreground command/pipeline orchestration |
+| `history.rs` | 851 | Cross-window command history, session IDs, filtering, limits, locking, and atomic compaction |
+| `temporal.rs` | 820 | Native date/time parsing, formatting, fixed/calendar arithmetic, named zones, and DST policies |
+| `ranges.rs` | 659 | Slices, brace ranges, and nested permutation expansion |
+| `methods.rs` | 606 | String/array methods, Unicode graphemes, and temporal method dispatch |
+| `table.rs` | 500 | Table parsing, projection, filtering, and JSON/CSV round-tripping |
+| `compress.rs` | 549 | Concurrent standard-ZIP compression for explicit paths or table manifests |
+| `copy.rs` | 440 | Concurrent safe file copying for explicit paths or table manifests |
+| `arith.rs` | 430 | `$(( expr ))` recursive-descent arithmetic parser |
+| `fs_ops.rs` | 390 | Native `mkdir`/`move`/`rename`, overwrite rules, and table-driven moves |
+| `delete.rs` | 384 | Recycle-by-default and explicitly gated permanent file/table deletion |
+| `fs_builtins.rs` | 335 | `pwd`/`dirs`/`folders`/`files`/`cat`/`find` |
+| `state.rs` | 302 | `redb`-backed persistent `pvar`/`dmark` state |
+| `builtin_names.rs` | 798 | Completion/highlighting registry plus categorized and focused help |
+| `builtins.rs` | 262 | Condition evaluators such as `test`, `matches`, `contains`, `eq`, and `isatty` |
+| `temporal_column.rs` | 208 | Atomic `date-column` parsing, formatting, timezone, and calendar transforms |
+| `stat.rs` | 217 | Concurrent file metadata and optional SHA-256 table generation |
+| `pipeline.rs` | 199 | Pipeline and redirect parsing |
+| `jobctl.rs` | 170 | Current foreground-PID tracking, Ctrl+Break forwarding, and cooperative interrupts; migrate behind `ExecutionManager` per `ARCHITECTURE.md` §44 |
+| `keyboard_input.rs` | 145 | Buffered, hidden, and fixed-character `read` input modes |
+| `main.rs` | 131 | Entry point for interactive and script execution |
+| `types.rs` | 92 | Primitive and temporal typed-value validation |
+| `clipboard.rs` | 86 | Native Windows Unicode clipboard access |
+| `functions.rs` | 83 | Function parameter and docstring parsing |
+| `colorout.rs` | 82 | Terminal-aware, `NO_COLOR`-aware error output |
+| `jobs.rs` | 78 | Transitional background-child registry for legacy `jobs`/`wait`/`disown`; replace/absorb into `ExecutionManager`, not a second registry |
+| `procexpand.rs` | 36 | External process spawning for `$(cmd)`/`@(cmd)` |
 
 ## Implemented, verified against the manual
 
@@ -77,7 +78,10 @@ A working, reasonably faithful interpreter for Ion's language (variables, contro
 - **`match`/`case` pattern matching** (pp.56-57; `ARCHITECTURE.md` §12): the last big control-flow gap, now closed — `match EXPR / case PATTERN [if GUARD]; STMT|BLOCK / case _ / end`. All three of the manual's worked examples reproduced exactly (string-vs-string equality, string-subject-vs-array-case, array-subject-vs-string-case), plus match guards (`case PATTERN if CONDITION`) and the single-line inline form (`case _; echo ...`). Array-vs-array case matching has no worked example in the manual, so it's an inferred (documented as such) extension of the same "shared element" rule. Caught a real, separate bug along the way: array literals (`[ ... ]`) were being silently mishandled by plain `expand_all` — needed `array_from_token` instead.
 - **`intersects ARRAY1 ARRAY2`**: ion-win extension (unchecked/unimplemented even in upstream Ion — no real behavior to verify against, same situation as bitwise NOT). Product decision: exit status 0 if the two named arrays share at least one element.
 - **`commandx` removed** (`ARCHITECTURE.md` §4): the Cartesian-product macro-expansion builtin never gained the ability to run what it generated (see the removed "commandx doesn't execute what it generates" gap that used to be here) and was dropped by product decision rather than finished. `src/commandx.rs` deleted; all dispatch/pipeline/completion wiring removed.
-- **`jobs`/`wait`/`disown`** (pp.69,75,83; `ARCHITECTURE.md` §13): the bookkeeping half of job control — `&` (background) now registers into a real registry (`src/jobs.rs`) instead of the spawned `Child` being dropped immediately. `fg`/`bg` deliberately skipped — see §13 for why. `&!` (disown) still never gets tracked at all, matching real shell semantics. Verified via a real-binary test: start a background job, list it, disown it, confirm `&!` jobs never appear, and confirm `wait` genuinely blocks (via a marker-file race, not just "didn't error").
+- **`jobs`/`wait`/`disown`** (pp.69,75,83; `ARCHITECTURE.md` §13): the bookkeeping half of legacy shell-job compatibility — `&` (background) registers each spawned `Child` in today's transitional `src/jobs.rs` registry. `fg`/`bg` deliberately skipped — see §13 for why. `&!` (disown) remains untracked. Verified via a real-binary test: start a background job, list it, disown it, confirm `&!` jobs never appear, and confirm `wait` genuinely blocks (via a marker-file race, not just "didn't error"). This describes current code, not the target platform architecture: §44 requires migration to one `ExecutionManager`/Execution Registry, with these commands retained as compatibility adapters.
+- **Execution platform foundation** (`ARCHITECTURE.md` §44): `src/execution.rs` defines immutable `ExecutionSpec`, invocation-only `ExecutionContext` (including redacted temporary secrets and cancellation), `Execution`, lifecycle/result/history types, and an `ExecutionManager` with monotonic IDs, one active registry, bounded sanitized history, and validated `Created -> Starting -> Running -> terminal` / cancellation transitions. Five focused tests cover success, launch failure, cancellation, invalid transitions, secret exclusion, and history bounds. The manager is now live for ordinary single-process foreground commands; the remaining launch paths migrate incrementally.
+- **Foreground execution-manager integration** (`ARCHITECTURE.md` §44): both single-process external-command paths in `shell.rs` now resolve the executable and delegate launch/wait lifecycle to `execution::run_foreground_external`. It records `Created -> Starting -> Running -> Completed/Failed`, root PID, exit result, cwd, and effective environment while continuing to use `jobctl::new_command` and `jobctl::wait_foreground`, preserving the proven Windows process-group and Ctrl+Break mechanism. Real-binary smoke tests verified successful inherited output and nonzero exit reporting; foreground pipelines now use the same manager as described below.
+- **Foreground pipeline execution integration** (`ARCHITECTURE.md` §44): every foreground pipeline is now one `Execution`, registered before stage launch. Each external stage attaches its PID to that execution, while `ExecutionManager` takes ownership of all child handles for the final wait and records every available exit code; the final stage still determines pipeline success. Existing per-PID `jobctl` registration/unregistration remains intact, so Ctrl+Break continues to target every foreground stage. A focused test verifies two process records under one execution, a compiled two-external-process smoke pipeline produced the expected output, and all 270 tests pass serially. Background/disowned pipelines remain on the compatibility registry path.
 - **`&&`/`||` as literal symbols** (p.51; `ARCHITECTURE.md` §14): `cmd1 && cmd2` now works inline, not just the word-form `and`/`or`. Confirmed against upstream's real parser that this is exactly the same mechanism as `and`/`or` with a different spelling, so no new runtime logic was needed, only two small splitters (a raw-string one for `dispatch`, a token one for `eval_condition_tokens`/`if`/`while` headers — reproducing the manual's own `if test ... && test ...` example exactly). Along the way, found and fixed a real bug in the *existing* `and`/`or`/`previous_status` design: statements with no tracked failure mode (`echo`, `let`, etc.) left `$?` stale instead of resetting it, so `false || echo "recovered" && echo "also this"` silently dropped the second half. Fixed by defaulting every statement to "succeeded" up front instead of only setting status for a curated allowlist.
 - **Brace *permutation* expansion** (pp.29-30; `ARCHITECTURE.md` §15): `{ext1,ext2}`-style comma lists, multiple groups per word (`job_{01,02}.{ext1,ext2}`), and nesting (`job_{01_{out,err},02_{out,err}}.txt`) — the general case brace *ranges* were always a subset of. Previously only bare whole-token `{range}` worked; brace expansion is now general, working as an infix attached to surrounding literal text (the manual's primary documented form) with any number of groups per word, each cross-producted together. Verified against both the manual's own examples and, since the manual has no worked example beyond simple cases, upstream Ion's actual brace-expansion test suite (`Linux/ion-master/tests/braces.ion`/`.out`) for deeper nesting and empty-branch edge cases (`It{{em,alic}iz,erat}e{d,}` → `Itemized Itemize Italicized Italicize Iterated Iterate`), reproduced exactly. Required guarding against a real collision: `${name}`/`@{name}` (existing variable-name disambiguation syntax) would otherwise be misparsed as a single-element permutation group, silently dropping the braces and merging the name with any following suffix (`${name}suffix` → wrongly `$namesuffix` instead of `${name}` + `suffix`) — fixed by never opening a group on a `{` immediately preceded by `$`/`@`.
 - **`PROMPT` function** (repl.md's "Prompt Function", p.6; `ARCHITECTURE.md` §16): the last remaining manual-documented-but-missing feature. `fn PROMPT ... end`'s `echo` output becomes the interactive prompt, re-rendered fresh before every line read so it reflects live state (e.g. the current directory after a `cd`). Reproduces the manual's own worked example exactly: `fn PROMPT; echo -n "${PWD}# "; end` now renders as `C:\actual\cwd# `. Two prerequisites this required, both real gaps of their own: `echo -n` (the trailing-newline-suppression flag) wasn't implemented anywhere in the codebase at all, and `$PWD`/`${PWD}` didn't exist as a variable. Since real Ion forks a subprocess and captures its stdout to build the prompt string, and ion-win doesn't fork, `Interpreter` gained an in-process echo-capture mode instead (`begin_echo_capture`/`end_echo_capture`/`echo_output`) — narrower than a full stdout redirect (only `echo`'s output is captured, not every builtin's), matching the one documented use case and the same scope decision already made for `$(cmd)`/`@(cmd)` process expansion's own `echo` shortcut.
@@ -113,7 +117,7 @@ A working, reasonably faithful interpreter for Ion's language (variables, contro
 
 Ranked roughly by how much a real user would notice:
 
-1. **No `fg`/`bg`** — `jobs`/`wait`/`disown` are implemented (see "Implemented, verified" above and `ARCHITECTURE.md` §13), but `fg`/`bg` are deliberately skipped: their real value ("resume a job I stopped with Ctrl+Z") has no clean Windows equivalent, since there's no POSIX-style `SIGTSTP`/`SIGCONT` and ion-win doesn't implement job-stopping at all (matches the manual's own Unix-only "Suspending the Shell" section) — shipping a half-faithful `fg`/`bg` that doesn't really do what the name implies was judged worse than not having them.
+1. **No `fg`/`bg`** — `jobs`/`wait`/`disown` are implemented as legacy compatibility commands (see "Implemented, verified" above and `ARCHITECTURE.md` §13), but `fg`/`bg` are deliberately skipped: their real value ("resume a job I stopped with Ctrl+Z") has no clean Windows equivalent, since there's no POSIX-style `SIGTSTP`/`SIGCONT` and ion-win doesn't implement job-stopping at all (matches the manual's own Unix-only "Suspending the Shell" section). Do not use this gap to introduce a generic `Job` platform type; the forward architecture is `ExecutionManager` in §44.
 2. **The five Polish-notation comparison operators** (`<`, `<=`, `>`, `>=`, `=`) on the manual's "Complete List of Conditional Builtins" checklist (p.51) are unchecked in upstream Ion too, i.e. not even real Ion has them — don't implement those. (`isatty`/`intersects` — also on that checklist — are now implemented; see "Implemented, verified" above.)
 3. **No Vi keybindings.** Genuinely documented with a worked example (p.6, alongside `PROMPT`, which is now implemented — see "Implemented, verified" above), but skipped by deliberate choice: even in real shells this is a niche opt-in for users with existing vi muscle memory, and it's a much bigger lift than an incremental addition (real modal editing — insert/normal mode switching, motions — comparable in scope to a small vim clone, not a few new keybindings in `editor.rs`). By contrast, `alias` and `${c::color}` — previously listed here too — turned out NOT to be verifiably documented Ion features at all after a full read-through of the manual's 87 pages: `alias` is mentioned only twice in passing (an initrc use-case, and in `which`'s description) with no dedicated syntax section or worked example anywhere, and `${c::color}` doesn't appear anywhere. Both were carried over from generic shell assumptions rather than manual verification and were wrongly listed as "not yet built" — don't implement guessed syntax for either without a concrete documented spec to check against. (`initrc`, `which`/`type`, and standalone `true`/`false`/`bool` — also previously listed here — are now implemented; see "Implemented, verified" above.)
 ## Testing philosophy (worth preserving)
@@ -132,7 +136,9 @@ outstanding Windows Terminal checks—Unicode editing, shared history,
 Shift-selection, clipboard shortcuts, hidden `read -s`, and no-Enter
 `read -n`—have passed their user-facing tests.
 
-Whatever's picked up, follow this session's established rhythm: real-binary smoke test (not just `cargo test`) before claiming anything works, update `ARCHITECTURE.md` with a new numbered section (currently ends at §43) and add an "Implemented, verified" bullet here in `HANDOVER.md`, and don't commit/push without being asked.
+The next architectural track is specified in `ARCHITECTURE.md` §44. Evolve the current background-child and foreground-PID registries into one `ExecutionManager`/Execution Registry; define `Task`, `Schedule`, `ExecutionSpec`, `ExecutionContext`, `Execution`, `Process`, and a private Windows `JobObject` wrapper; keep scheduled definitions outside runtime execution state; and leave ConPTY out of the core path. Preserve the current command semantics and Ctrl+C behavior while migrating incrementally—do not create a parallel registry that leaves two owners for the same child handle.
+
+Whatever's picked up, follow this session's established rhythm: real-binary smoke test (not just `cargo test`) before claiming anything works, update `ARCHITECTURE.md` with a new numbered section (currently ends at §44) and add an "Implemented, verified" bullet here in `HANDOVER.md`, and don't commit/push without being asked.
 
 ## A note on the interactive line editor
 
