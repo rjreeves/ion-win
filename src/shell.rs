@@ -2109,7 +2109,7 @@ fn print_execution(item: &execution::ExecutionSnapshot) {
 }
 
 async fn handle_task(args: &[String], state: &StateHandle) -> bool {
-    const USAGE: &str = "task create [--force] NAME [--] COMMAND [ARG...]\n\
+    const USAGE: &str = "task create [--force] [--timeout DURATION] [--memory SIZE] [--max-processes N] NAME [--] COMMAND [ARG...]\n\
 task list\n\
 task show NAME\n\
 task delete NAME\n\
@@ -2125,11 +2125,55 @@ task run NAME";
             true
         }
         "create" => {
-            let mut rest = &args[1..];
-            let replace = rest.first().is_some_and(|arg| arg == "--force");
-            if replace {
-                rest = &rest[1..];
+            let mut index = 1;
+            let mut replace = false;
+            let mut timeout = None;
+            let mut memory_bytes = None;
+            let mut max_processes = None;
+            while let Some(option) = args.get(index).map(String::as_str) {
+                match option {
+                    "--force" => {
+                        replace = true;
+                        index += 1;
+                    }
+                    "--timeout" | "--memory" | "--max-processes" => {
+                        let Some(value) = args.get(index + 1) else {
+                            err_println!("ion-win: task create: {option} requires a value");
+                            return false;
+                        };
+                        let parsed = match option {
+                            "--timeout" => crate::task::parse_timeout(value).map(|value| {
+                                timeout = Some(value);
+                            }),
+                            "--memory" => crate::task::parse_memory(value).map(|value| {
+                                memory_bytes = Some(value);
+                            }),
+                            _ => value
+                                .parse::<u32>()
+                                .map_err(|_| format!("invalid process limit '{value}'"))
+                                .and_then(|value| {
+                                    if value == 0 {
+                                        Err("process limit must be greater than zero".into())
+                                    } else {
+                                        max_processes = Some(value);
+                                        Ok(())
+                                    }
+                                }),
+                        };
+                        if let Err(error) = parsed {
+                            err_println!("ion-win: task create: {error}");
+                            return false;
+                        }
+                        index += 2;
+                    }
+                    value if value.starts_with("--") => {
+                        err_println!("ion-win: task create: unknown option '{value}'");
+                        return false;
+                    }
+                    _ => break,
+                }
             }
+            let mut rest = &args[index..];
             let Some(name) = rest.first() else {
                 err_println!("ion-win: task create: missing NAME");
                 return false;
@@ -2154,7 +2198,9 @@ task run NAME";
                 command.clone(),
                 rest[1..].to_vec(),
                 cwd,
-            ) {
+            )
+            .and_then(|task| task.with_policy(timeout, memory_bytes, max_processes))
+            {
                 Ok(task) => task,
                 Err(error) => {
                     err_println!("ion-win: task create: {error}");
@@ -2193,6 +2239,24 @@ task run NAME";
                 println!("name: {}", task.name());
                 println!("command: {}", task.display_command());
                 println!("cwd: {}", task.cwd().display());
+                println!(
+                    "timeout: {}",
+                    task.timeout()
+                        .map(|value| format!("{} ms", value.as_millis()))
+                        .unwrap_or_else(|| "-".into())
+                );
+                println!(
+                    "memory: {}",
+                    task.memory_bytes()
+                        .map(|value| format!("{value} bytes"))
+                        .unwrap_or_else(|| "-".into())
+                );
+                println!(
+                    "max-processes: {}",
+                    task.max_processes()
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".into())
+                );
                 true
             }
             Ok(None) => {

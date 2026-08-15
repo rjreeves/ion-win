@@ -698,10 +698,10 @@ pub fn help_text(topic: Option<&str>) -> Result<String, String> {
         "pvar" => page("pvar set KEY = VALUE\n        pvar get KEY\n        pvar list\n        pvar delete KEY", "Stores persistent scalar values in the ion-win state database.", &["pvar set project = ion-win", "pvar get project"], &[]),
         "dmark" => page("dmark add NAME [PATH]\n        dmark list\n        dmark jump NAME", "Stores and revisits persistent directory bookmarks.", &["dmark add repo .", "dmark jump repo"], &[]),
         "task" | "tasks" => page(
-            "task create [--force] NAME [--] COMMAND [ARG...]\n        task list\n        task show NAME\n        task delete NAME\n        task run NAME",
+            "task create [--force] [--timeout DURATION] [--memory SIZE] [--max-processes N] NAME [--] COMMAND [ARG...]\n        task list\n        task show NAME\n        task delete NAME\n        task run NAME",
             "Stores named external-command definitions independently from runtime executions, then runs them through ExecutionManager.",
             &["task create backup -- robocopy source backup", "task show backup", "task run backup"],
-            &["Creation captures the current working directory.", "Use --force to replace an existing task."],
+            &["Creation captures the current working directory.", "Timeout units: ms, s, m, h (bare values are seconds). Memory units: B, KB, MB, GB, KiB, MiB, GiB.", "Policies are persisted into scheduled snapshots and enforced by ExecutionManager.", "Use --force to replace an existing task."],
         ),
         "schedule" | "schedules" => page(
             "schedule create [--force] [--disabled] NAME TASK TRIGGER...\n        schedule list\n        schedule show NAME\n        schedule delete [--force] NAME\n        schedule enable|disable|run NAME",

@@ -1000,3 +1000,52 @@ Verified with focused lifecycle/sanitization tests and a compiled real-binary
 script: a background execution appeared as running in list/show, targeted wait
 recorded its completed process status, and a second background execution moved
 through cancelling to a retained cancelled record after targeted Ctrl+Break.
+
+## 46. Execution policy backend foundation
+
+Windows Job Object limits are configured before the first process is assigned.
+`ExecutionManager` reads `ExecutionSpec.limits`, creates the private Job Object,
+applies aggregate job-memory and active-process-count limits with
+`SetInformationJobObject`, and only then calls `AssignProcessToJobObject`.
+Zero-valued limits and memory sizes that cannot fit the platform are rejected.
+
+The existing best-effort attachment policy remains for executions that request
+no limits, preserving compatibility with hosts that reject nested Job Objects.
+Once an execution explicitly requests a limit, creation, configuration, or
+assignment failure is instead a launch failure: the just-spawned root process
+is terminated and the execution records `Failed`, so a constrained task can
+never silently run unconstrained. A Windows test configures a one-process Job
+Object before assignment, verifies the first child is accepted and the second
+is rejected, and separately verifies invalid zero limits.
+
+Timeout enforcement now uses the same lifecycle boundary. Each managed launch
+path arms `ExecutionSpec.timeout` only after entering `Running`; the detached
+deadline watcher owns no handles and is harmless if the execution has already
+finished. On expiry the manager records the timeout cause, moves
+`Running -> Cancelling`, sets the invocation token, sends the existing targeted
+Ctrl+Break, and escalates the mandatory private Job Object after the normal
+grace period. Wait completion then records the distinct terminal state
+`TimedOut` and a stable `timed out after N ms` result instead of conflating the
+policy with user-requested `Cancelled`.
+
+A requested timeout makes Job Object attachment fail-closed even when no memory
+or process limit is present, ensuring a child that ignores Ctrl+Break can still
+be terminated as a tree. Focused lifecycle tests distinguish timeout from user
+cancellation, and a real Windows-process test applies a 100 ms spec timeout to
+a long-running command, observes termination in under five seconds, and
+verifies the retained `TimedOut` record.
+
+Persistent task policies complete the path into `ExecutionSpec`.
+`task create` accepts `--timeout DURATION`, `--memory SIZE`, and
+`--max-processes N`; timeout units are `ms`/`s`/`m`/`h` (bare values are
+seconds), while memory accepts decimal and binary byte units. `TaskDefinition`
+version 2 stores normalized milliseconds, bytes, and process count, validates
+nonzero values, and applies them through `with_timeout`/`with_limits` whenever
+it produces a spec. Version-1 definitions remain readable with no policies.
+Because Task Scheduler snapshots use the same versioned task JSON and
+`execution_spec()` method, scheduled and manual task runs enforce identical
+policies without scheduler-specific fields or launch logic.
+
+Verified through serialization/parser compatibility tests and a compiled
+real-binary script that created and displayed a persisted 100 ms / 256 MiB /
+two-process task, ran it, and observed a retained `TimedOut` execution.

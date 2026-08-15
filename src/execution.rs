@@ -251,11 +251,15 @@ pub enum ExecutionState {
     Completed,
     Failed,
     Cancelled,
+    TimedOut,
 }
 
 impl ExecutionState {
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Cancelled | Self::TimedOut
+        )
     }
 
     fn can_transition_to(self, next: Self) -> bool {
@@ -267,7 +271,7 @@ impl ExecutionState {
                     Self::Running,
                     Self::Completed | Self::Failed | Self::Cancelling
                 )
-                | (Self::Cancelling, Self::Cancelled)
+                | (Self::Cancelling, Self::Cancelled | Self::TimedOut)
         )
     }
 }
@@ -296,6 +300,7 @@ pub struct Execution {
     root_pid: Option<u32>,
     processes: Vec<ProcessRecord>,
     result: Option<ExecutionResult>,
+    timeout_triggered: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -558,7 +563,7 @@ pub fn run_foreground_spec(spec: ExecutionSpec) -> std::io::Result<std::process:
         Ok(())
     })?;
 
-    let child = match crate::jobctl::new_command(&program)
+    let mut child = match crate::jobctl::new_command(&program)
         .args(&args)
         .current_dir(cwd)
         .envs(environment_overrides)
@@ -579,7 +584,20 @@ pub fn run_foreground_spec(spec: ExecutionSpec) -> std::io::Result<std::process:
         }
     };
 
-    try_assign_job_object(id, &child);
+    if let Err(error) = try_assign_job_object(id, &child) {
+        let _ = child.kill();
+        let _ = child.wait();
+        let message = format!("could not apply execution policy: {error}");
+        with_manager(|manager| {
+            manager.transition(
+                id,
+                ExecutionState::Failed,
+                Some(ExecutionResult::new(None, Some(message))),
+            )?;
+            Ok(())
+        })?;
+        return Err(error);
+    }
 
     let pid = child.id();
     with_manager(|manager| {
@@ -588,6 +606,7 @@ pub fn run_foreground_spec(spec: ExecutionSpec) -> std::io::Result<std::process:
         manager.transition(id, ExecutionState::Running, None)?;
         Ok(())
     })?;
+    arm_timeout(id);
 
     let wait_result = crate::jobctl::wait_foreground(child);
     if let Ok(status) = &wait_result {
@@ -661,7 +680,7 @@ pub fn run_captured_external(
         }
     };
 
-    try_assign_job_object(id, &child);
+    let _ = try_assign_job_object(id, &child);
     let pid = child.id();
     with_manager(|manager| {
         let execution = manager.get_mut(id).ok_or(ExecutionError::NotFound(id))?;
@@ -669,6 +688,7 @@ pub fn run_captured_external(
         manager.transition(id, ExecutionState::Running, None)?;
         Ok(())
     })?;
+    arm_timeout(id);
 
     let output = child.wait_with_output();
     if let Ok(output) = &output {
@@ -719,6 +739,7 @@ fn begin_pipeline(display: String, mode: ExecutionMode) -> std::io::Result<Execu
         manager.transition(id, ExecutionState::Running, None)?;
         Ok(())
     })?;
+    arm_timeout(id);
     Ok(id)
 }
 
@@ -737,13 +758,22 @@ pub fn register_pipeline_process_with_display(
 /// Best-effort attachment to a private Windows Job Object. Assignment can be
 /// rejected when the host applies incompatible nesting policy; that must not
 /// turn a successfully spawned command into a shell launch failure.
-pub fn try_assign_job_object(id: ExecutionId, child: &std::process::Child) {
+pub fn try_assign_job_object(
+    id: ExecutionId,
+    child: &std::process::Child,
+) -> std::io::Result<()> {
     #[cfg(windows)]
-    if let Ok(mut manager) = global_manager().lock() {
-        manager.try_assign_job_object(id, child);
+    {
+        let mut manager = global_manager()
+            .lock()
+            .map_err(|_| std::io::Error::other("execution manager lock was poisoned"))?;
+        manager.try_assign_job_object(id, child)
     }
     #[cfg(not(windows))]
-    let _ = (id, child);
+    {
+        let _ = (id, child);
+        Ok(())
+    }
 }
 
 pub fn register_background_children(
@@ -887,6 +917,33 @@ pub fn request_cancellation(id: ExecutionId) -> Result<CancellationRequest, Stri
     }
     manager
         .request_cancellation(id)
+        .map_err(|error| error.to_string())
+}
+
+/// Arms the immutable timeout after launch reaches Running. The detached
+/// watcher owns no process handles and becomes a no-op if the execution
+/// finishes before its deadline.
+fn arm_timeout(id: ExecutionId) {
+    let timeout = global_manager().lock().ok().and_then(|manager| {
+        manager
+            .active
+            .get(&id)
+            .and_then(|execution| execution.spec.timeout)
+    });
+    if let Some(timeout) = timeout {
+        std::thread::spawn(move || {
+            std::thread::sleep(timeout);
+            let _ = crate::jobctl::timeout_execution(id);
+        });
+    }
+}
+
+pub fn request_timeout(id: ExecutionId) -> Result<CancellationRequest, String> {
+    let mut manager = global_manager()
+        .lock()
+        .map_err(|_| "execution manager lock was poisoned".to_string())?;
+    manager
+        .request_timeout(id)
         .map_err(|error| error.to_string())
 }
 
@@ -1035,6 +1092,7 @@ impl ExecutionManager {
                 root_pid: None,
                 processes: Vec::new(),
                 result: None,
+                timeout_triggered: false,
             },
         );
         Ok(id)
@@ -1116,6 +1174,37 @@ impl ExecutionManager {
         })
     }
 
+    fn request_timeout(
+        &mut self,
+        id: ExecutionId,
+    ) -> Result<CancellationRequest, ExecutionError> {
+        let state = self
+            .active
+            .get(&id)
+            .map(|execution| execution.state)
+            .ok_or(ExecutionError::NotFound(id))?;
+        if state != ExecutionState::Running {
+            return Err(ExecutionError::InvalidTransition {
+                from: state,
+                to: ExecutionState::Cancelling,
+            });
+        }
+        if let Some(execution) = self.active.get_mut(&id) {
+            execution.timeout_triggered = true;
+            execution.context.cancellation.cancel();
+        }
+        self.transition(id, ExecutionState::Cancelling, None)?;
+        let execution = self.active.get(&id).ok_or(ExecutionError::NotFound(id))?;
+        Ok(CancellationRequest {
+            execution_ids: vec![id],
+            process_ids: execution
+                .processes
+                .iter()
+                .map(|process| process.pid)
+                .collect(),
+        })
+    }
+
     fn finish_after_wait(
         &mut self,
         id: ExecutionId,
@@ -1127,12 +1216,28 @@ impl ExecutionManager {
             .get(&id)
             .is_some_and(|execution| execution.state == ExecutionState::Cancelling)
         {
+            let timed_out = self
+                .active
+                .get(&id)
+                .is_some_and(|execution| execution.timeout_triggered);
+            let timeout = self
+                .active
+                .get(&id)
+                .and_then(|execution| execution.spec.timeout);
             self.transition(
                 id,
-                ExecutionState::Cancelled,
+                if timed_out {
+                    ExecutionState::TimedOut
+                } else {
+                    ExecutionState::Cancelled
+                },
                 Some(ExecutionResult::new(
                     natural_result.exit_code,
-                    Some("cancelled".into()),
+                    Some(if let Some(timeout) = timeout.filter(|_| timed_out) {
+                        format!("timed out after {} ms", timeout.as_millis())
+                    } else {
+                        "cancelled".into()
+                    }),
                 )),
             )
         } else {
@@ -1141,27 +1246,46 @@ impl ExecutionManager {
     }
 
     #[cfg(windows)]
-    fn try_assign_job_object(&mut self, id: ExecutionId, child: &std::process::Child) {
-        if !self.active.contains_key(&id) {
-            return;
-        }
+    fn try_assign_job_object(
+        &mut self,
+        id: ExecutionId,
+        child: &std::process::Child,
+    ) -> std::io::Result<()> {
+        let (limits, timeout) = self
+            .active
+            .get(&id)
+            .map(|execution| (execution.spec.limits.clone(), execution.spec.timeout))
+            .ok_or_else(|| manager_error(ExecutionError::NotFound(id)))?;
+        let required =
+            timeout.is_some() || limits.memory_bytes.is_some() || limits.process_count.is_some();
         let newly_created = !self.job_objects.contains_key(&id);
         if newly_created {
-            let Ok(job) = crate::job_object::JobObject::new(
+            let job = match crate::job_object::JobObject::new(
                 crate::job_object::ClosePolicy::PreserveProcesses,
-            ) else {
-                return;
+            ) {
+                Ok(job) => job,
+                Err(error) if required => return Err(error),
+                Err(_) => return Ok(()),
             };
+            if let Err(error) = job.set_limits(limits.memory_bytes, limits.process_count) {
+                if required {
+                    return Err(error);
+                }
+                return Ok(());
+            }
             self.job_objects.insert(id, job);
         }
-        if self
-            .job_objects
-            .get(&id)
-            .is_some_and(|job| job.assign(child).is_err())
-            && newly_created
-        {
-            self.job_objects.remove(&id);
+        if let Some(job) = self.job_objects.get(&id) {
+            if let Err(error) = job.assign(child) {
+                if newly_created {
+                    self.job_objects.remove(&id);
+                }
+                if required {
+                    return Err(error);
+                }
+            }
         }
+        Ok(())
     }
 
     fn refresh_background_jobs(&mut self) -> Vec<(u32, String)> {
@@ -1600,6 +1724,66 @@ mod tests {
         let finished = ExecutionManager::snapshot_record(&record);
         assert_eq!(finished.state, ExecutionState::Cancelled);
         assert!(finished.finished_at.is_some());
+    }
+
+    #[test]
+    fn timeout_cause_finalizes_as_timed_out() {
+        let mut manager = ExecutionManager::new(10);
+        let (spec, context) = fixture();
+        let spec = spec.with_timeout(Duration::from_millis(250));
+        let id = manager.create(spec, context).unwrap();
+        manager
+            .transition(id, ExecutionState::Starting, None)
+            .unwrap();
+        manager
+            .transition(id, ExecutionState::Running, None)
+            .unwrap();
+        manager.get_mut(id).unwrap().add_process(404);
+
+        let request = manager.request_timeout(id).unwrap();
+        assert_eq!(request.process_ids, vec![404]);
+        let record = manager
+            .finish_after_wait(
+                id,
+                ExecutionState::Failed,
+                ExecutionResult::new(Some(1), None),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.state, ExecutionState::TimedOut);
+        assert_eq!(
+            record.result.unwrap().message.as_deref(),
+            Some("timed out after 250 ms")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn foreground_spec_timeout_terminates_real_process() {
+        let cwd = std::env::current_dir().unwrap();
+        let spec = ExecutionSpec::new(
+            ExecutionTarget::External {
+                program: PathBuf::from("cmd.exe"),
+                args: vec![
+                    "/D".into(),
+                    "/C".into(),
+                    "ping 127.0.0.1 -n 30 > nul".into(),
+                ],
+            },
+            cwd,
+            ExecutionMode::Foreground,
+        )
+        .with_timeout(Duration::from_millis(100));
+        let started = std::time::Instant::now();
+        let status = run_foreground_spec(spec).unwrap();
+        assert!(!status.success());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let latest = list_executions().into_iter().max_by_key(|item| item.id).unwrap();
+        assert_eq!(latest.state, ExecutionState::TimedOut);
+        assert_eq!(
+            latest.result.unwrap().message.as_deref(),
+            Some("timed out after 100 ms")
+        );
     }
 
     #[test]

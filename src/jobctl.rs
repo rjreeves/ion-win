@@ -33,15 +33,7 @@ pub fn request_interrupt() {
     INTERRUPTED.store(true, Ordering::SeqCst);
 
     let cancellation = crate::execution::request_foreground_cancellation();
-    for pid in cancellation.process_ids {
-        forward_ctrl_c(pid);
-    }
-    if !cancellation.execution_ids.is_empty() {
-        std::thread::spawn(move || {
-            std::thread::sleep(CANCELLATION_GRACE);
-            crate::execution::escalate_cancellation(&cancellation.execution_ids);
-        });
-    }
+    signal_cancellation(cancellation);
 }
 
 /// Cancels one execution selected by the user-facing `exec cancel` command.
@@ -49,6 +41,19 @@ pub fn request_interrupt() {
 /// policy as an interactive Ctrl+C, without setting the pure-Ion loop flag.
 pub fn cancel_execution(id: crate::execution::ExecutionId) -> Result<(), String> {
     let cancellation = crate::execution::request_cancellation(id)?;
+    signal_cancellation(cancellation);
+    Ok(())
+}
+
+/// Deadline expiry shares the OS signalling policy with cancellation while
+/// preserving a distinct lifecycle cause inside ExecutionManager.
+pub fn timeout_execution(id: crate::execution::ExecutionId) -> Result<(), String> {
+    let cancellation = crate::execution::request_timeout(id)?;
+    signal_cancellation(cancellation);
+    Ok(())
+}
+
+fn signal_cancellation(cancellation: crate::execution::CancellationRequest) {
     for pid in cancellation.process_ids {
         forward_ctrl_c(pid);
     }
@@ -58,7 +63,6 @@ pub fn cancel_execution(id: crate::execution::ExecutionId) -> Result<(), String>
             crate::execution::escalate_cancellation(&cancellation.execution_ids);
         });
     }
-    Ok(())
 }
 
 /// Checks (and clears) the cooperative interrupt flag. `while`/`for` loop

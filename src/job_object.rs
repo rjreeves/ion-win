@@ -15,6 +15,7 @@ use windows_sys::Win32::System::JobObjects::{
     JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
     TerminateJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_JOB_MEMORY,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,6 +68,56 @@ impl JobObject {
         let process = child.as_raw_handle() as HANDLE;
         let assigned = unsafe { AssignProcessToJobObject(self.handle, process) };
         if assigned == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Configures execution limits before the first process is assigned. This
+    /// ordering ensures a constrained process cannot create descendants or
+    /// allocate beyond its policy before the Job Object begins enforcing it.
+    pub fn set_limits(
+        &self,
+        memory_bytes: Option<u64>,
+        process_count: Option<u32>,
+    ) -> io::Result<()> {
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
+        if let Some(memory_bytes) = memory_bytes {
+            let memory_bytes = usize::try_from(memory_bytes).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "memory limit exceeds platform size")
+            })?;
+            if memory_bytes == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "memory limit must be greater than zero",
+                ));
+            }
+            limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
+            limits.JobMemoryLimit = memory_bytes;
+        }
+        if let Some(process_count) = process_count {
+            if process_count == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "process-count limit must be greater than zero",
+                ));
+            }
+            limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+            limits.BasicLimitInformation.ActiveProcessLimit = process_count;
+        }
+        if limits.BasicLimitInformation.LimitFlags == 0 {
+            return Ok(());
+        }
+        let configured = unsafe {
+            SetInformationJobObject(
+                self.handle,
+                JobObjectExtendedLimitInformation,
+                &limits as *const _ as *const _,
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if configured == 0 {
             Err(io::Error::last_os_error())
         } else {
             Ok(())
@@ -153,5 +204,26 @@ mod tests {
         job.assign(&child).unwrap();
         job.terminate(1).unwrap();
         child.wait().unwrap();
+    }
+
+    #[test]
+    fn limits_are_configured_before_process_assignment() {
+        let mut first = sleeping_child();
+        let mut second = sleeping_child();
+        let job = JobObject::new(ClosePolicy::PreserveProcesses).unwrap();
+        job.set_limits(Some(256 * 1024 * 1024), Some(1)).unwrap();
+        job.assign(&first).unwrap();
+        assert!(job.assign(&second).is_err());
+        job.terminate(1).unwrap();
+        first.wait().unwrap();
+        second.kill().unwrap();
+        second.wait().unwrap();
+    }
+
+    #[test]
+    fn zero_limits_are_rejected() {
+        let job = JobObject::new(ClosePolicy::PreserveProcesses).unwrap();
+        assert!(job.set_limits(Some(0), None).is_err());
+        assert!(job.set_limits(None, Some(0)).is_err());
     }
 }
