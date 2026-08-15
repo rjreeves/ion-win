@@ -646,6 +646,9 @@ async fn run_impl(
                     }
                 };
                 if let Some(id) = pipeline_execution {
+                    execution::try_assign_job_object(id, &child);
+                }
+                if let Some(id) = pipeline_execution {
                     if let Err(error) = execution::register_pipeline_process_with_display(
                         id,
                         child.id(),

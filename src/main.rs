@@ -15,6 +15,8 @@ mod functions;
 mod history;
 mod interp;
 mod jobctl;
+#[cfg(windows)]
+mod job_object;
 mod keyboard_input;
 mod methods;
 mod pipeline;

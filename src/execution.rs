@@ -412,6 +412,8 @@ pub struct ExecutionManager {
     history: VecDeque<ExecutionRecord>,
     history_limit: usize,
     background_children: HashMap<ExecutionId, Vec<ManagedChild>>,
+    #[cfg(windows)]
+    job_objects: HashMap<ExecutionId, crate::job_object::JobObject>,
 }
 
 struct ManagedChild {
@@ -478,6 +480,8 @@ pub fn run_foreground_external(
         }
     };
 
+    try_assign_job_object(id, &child);
+
     let pid = child.id();
     with_manager(|manager| {
         let execution = manager.get_mut(id).ok_or(ExecutionError::NotFound(id))?;
@@ -515,6 +519,93 @@ pub fn run_foreground_external(
     wait_result
 }
 
+/// Launches one foreground external process with captured stdout/stderr.
+/// This is the synchronous execution boundary used by `$()` / `@()`.
+pub fn run_captured_external(
+    program: &Path,
+    args: &[String],
+) -> std::io::Result<std::process::Output> {
+    let cwd = std::env::current_dir()?;
+    let spec = ExecutionSpec::new(
+        ExecutionTarget::External {
+            program: program.to_path_buf(),
+            args: args.to_vec(),
+        },
+        cwd.clone(),
+        ExecutionMode::Foreground,
+    )
+    .with_io(IoMode::Redirected, IoMode::Capture, IoMode::Capture)
+    .with_terminal(TerminalMode::Redirected);
+    let context = ExecutionContext::new(cwd, std::env::vars().collect());
+    let id = with_manager(|manager| manager.create(spec, context))?;
+    with_manager(|manager| {
+        manager.transition(id, ExecutionState::Starting, None)?;
+        Ok(())
+    })?;
+
+    let child = match crate::jobctl::new_command(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            let message = error.to_string();
+            with_manager(|manager| {
+                manager.transition(
+                    id,
+                    ExecutionState::Failed,
+                    Some(ExecutionResult::new(None, Some(message))),
+                )?;
+                Ok(())
+            })?;
+            return Err(error);
+        }
+    };
+
+    try_assign_job_object(id, &child);
+    let pid = child.id();
+    with_manager(|manager| {
+        let execution = manager.get_mut(id).ok_or(ExecutionError::NotFound(id))?;
+        execution.add_process(pid);
+        manager.transition(id, ExecutionState::Running, None)?;
+        Ok(())
+    })?;
+
+    let output = child.wait_with_output();
+    if let Ok(output) = &output {
+        with_manager(|manager| {
+            let execution = manager.get_mut(id).ok_or(ExecutionError::NotFound(id))?;
+            execution.set_process_exit(pid, output.status.code());
+            Ok(())
+        })?;
+    }
+    let (state, result) = match &output {
+        Ok(output) if output.status.success() => (
+            ExecutionState::Completed,
+            ExecutionResult::new(output.status.code(), None),
+        ),
+        Ok(output) => (
+            ExecutionState::Failed,
+            ExecutionResult::new(
+                output.status.code(),
+                Some("process exited unsuccessfully".into()),
+            ),
+        ),
+        Err(error) => (
+            ExecutionState::Failed,
+            ExecutionResult::new(None, Some(format!("failed to wait for process: {error}"))),
+        ),
+    };
+    with_manager(|manager| {
+        manager.transition(id, state, Some(result))?;
+        Ok(())
+    })?;
+    output
+}
+
 /// Registers a foreground pipeline as one execution before any of its child
 /// processes are launched. Individual PIDs are then attached as stages spawn.
 pub fn begin_foreground_pipeline(display: String) -> std::io::Result<ExecutionId> {
@@ -548,6 +639,18 @@ pub fn register_pipeline_process_with_display(
         execution.add_process_with_display(pid, display);
         Ok(())
     })
+}
+
+/// Best-effort attachment to a private Windows Job Object. Assignment can be
+/// rejected when the host applies incompatible nesting policy; that must not
+/// turn a successfully spawned command into a shell launch failure.
+pub fn try_assign_job_object(id: ExecutionId, child: &std::process::Child) {
+    #[cfg(windows)]
+    if let Ok(mut manager) = global_manager().lock() {
+        manager.try_assign_job_object(id, child);
+    }
+    #[cfg(not(windows))]
+    let _ = (id, child);
 }
 
 pub fn register_background_children(
@@ -714,6 +817,8 @@ impl ExecutionManager {
             history: VecDeque::new(),
             history_limit,
             background_children: HashMap::new(),
+            #[cfg(windows)]
+            job_objects: HashMap::new(),
         }
     }
 
@@ -770,6 +875,30 @@ impl ExecutionManager {
             })
             .flat_map(|execution| execution.processes.iter().map(|process| process.pid))
             .collect()
+    }
+
+    #[cfg(windows)]
+    fn try_assign_job_object(&mut self, id: ExecutionId, child: &std::process::Child) {
+        if !self.active.contains_key(&id) {
+            return;
+        }
+        let newly_created = !self.job_objects.contains_key(&id);
+        if newly_created {
+            let Ok(job) = crate::job_object::JobObject::new(
+                crate::job_object::ClosePolicy::PreserveProcesses,
+            ) else {
+                return;
+            };
+            self.job_objects.insert(id, job);
+        }
+        if self
+            .job_objects
+            .get(&id)
+            .is_some_and(|job| job.assign(child).is_err())
+            && newly_created
+        {
+            self.job_objects.remove(&id);
+        }
     }
 
     fn refresh_background_jobs(&mut self) -> Vec<(u32, String)> {
@@ -851,10 +980,19 @@ impl ExecutionManager {
                     .retain(|process| !removed.contains(&process.pid));
                 execution.root_pid = execution.processes.first().map(|process| process.pid);
             }
+            // Windows cannot remove an individual process from a Job Object.
+            // Releasing the preserve-on-close object for the whole execution
+            // ensures later tree cancellation cannot reach a disowned stage.
+            #[cfg(windows)]
+            if !removed.is_empty() {
+                self.job_objects.remove(&id);
+            }
         }
         for id in empty {
             self.background_children.remove(&id);
             self.active.remove(&id);
+            #[cfg(windows)]
+            self.job_objects.remove(&id);
         }
         count
     }
@@ -889,6 +1027,8 @@ impl ExecutionManager {
             execution.finished_at = Some(now);
             execution.result = result;
             let finished = self.active.remove(&id).expect("execution was just found");
+            #[cfg(windows)]
+            self.job_objects.remove(&id);
             let record = Self::sanitize(finished);
             if self.history_limit > 0 {
                 self.history.push_back(record.clone());
