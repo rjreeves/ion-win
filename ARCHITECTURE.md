@@ -975,3 +975,28 @@ ConPTY does not replace `Process`, `JobObject`, `Execution`, or `ExecutionManage
 7. Add ConPTY only as a separately tested optional terminal adapter if a concrete compatibility requirement justifies it.
 
 Codex should consider the migration complete only when every process-producing path (plain external command, pipeline, background execution, `$()`/`@()` process expansion, and task-triggered run) creates an `Execution`; public/runtime code no longer introduces a generic ion `Job` domain type; Windows Job Object and ConPTY handles remain backend-private; scheduled definitions survive independently of execution history; and no duplicate registry can own or wait on the same process handle.
+
+## 45. Execution inspection and control UX
+
+`exec list`, `exec show ID`, `exec wait ID`, and `exec cancel ID` are the
+execution-native view over `ExecutionManager`. They introduce no second
+registry: list/show take sanitized snapshots of active executions and bounded
+recent history; wait temporarily extracts only the selected manager-owned
+background child handles and blocks without holding the manager lock; cancel
+transitions the selected running execution to `Cancelling`, sets its invocation
+token, sends the existing per-process-group Ctrl+Break, and retains the same
+750 ms optional Job Object escalation policy as interactive Ctrl+C.
+
+Snapshots expose execution ID, lifecycle state, display command, root PID,
+per-process PID/display/exit status, timestamps, and terminal result. They
+deliberately exclude effective environment, temporary secrets, cancellation
+tokens, child handles, and Job Object handles. `exec wait` returns immediately
+for a retained terminal record and refuses to steal a foreground wait owned by
+the submitting path. Completed background detection and targeted waits both
+finalize through `finish_after_wait`, so a cancelling run always records a
+`Cancelled` result consistently.
+
+Verified with focused lifecycle/sanitization tests and a compiled real-binary
+script: a background execution appeared as running in list/show, targeted wait
+recorded its completed process status, and a second background execution moved
+through cancelling to a retained cancelled record after targeted Ctrl+Break.

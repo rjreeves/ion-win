@@ -338,6 +338,11 @@ pub const BUILTINS: &[Builtin] = &[
         help_display: Some("schedule create|list|show|delete|enable|disable|run"),
     },
     Builtin {
+        name: "exec",
+        is_keyword: false,
+        help_display: Some("exec list|show|wait|cancel"),
+    },
+    Builtin {
         name: "jobs",
         is_keyword: false,
         help_display: Some("jobs"),
@@ -445,7 +450,8 @@ Commands by category
                    eq/is  exists  intersects  isatty  true  false  not
   Tables           from-json  from-csv  select  where/filter  date-column
                    to-json  to-csv
-  State & jobs     pvar  task  schedule  history  jobs  wait  disown  which/type
+  State & jobs     pvar  task  schedule  exec  history  jobs  wait  disown
+                   which/type
   Editor           highlight  cls
 
 Examples
@@ -703,6 +709,12 @@ pub fn help_text(topic: Option<&str>) -> Result<String, String> {
             &["schedule create nightly backup daily 23:30 Australia/Sydney", "schedule create login-sync sync at-logon", "schedule run nightly"],
             &["Triggers: once RFC3339, daily HH:MM TIMEZONE, at-logon, at-startup.", "Scheduled launches re-enter ion-win through ExecutionManager.", "Forced deletion removes a stale definition when its OS registration is already missing."],
         ),
+        "exec" | "executions" => page(
+            "exec list\n        exec show ID\n        exec wait ID\n        exec cancel ID",
+            "Inspects active and recent executions and controls manager-owned runs.",
+            &["exec list", "exec show 42", "exec cancel 42", "exec wait 42"],
+            &["Cancellation uses Ctrl+Break first and may escalate through the execution's private Job Object.", "Completed history is bounded and contains no environment values or temporary secrets."],
+        ),
         "jobs" => page("jobs", "Lists tracked background processes.", &["long-command &", "jobs"], &[]),
         "wait" => page("wait", "Waits for all tracked background processes.", &[], &[]),
         "disown" => page("disown [-a | PID...]", "Stops tracking selected or all background processes without terminating them.", &["disown -a"], &[]),
@@ -816,5 +828,6 @@ mod tests {
         assert!(all.contains(&"cp"));
         assert!(all.contains(&"compress"));
         assert!(all.contains(&"delete"));
+        assert!(all.contains(&"exec"));
     }
 }

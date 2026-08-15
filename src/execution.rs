@@ -17,6 +17,10 @@ use std::time::{Duration, SystemTime};
 pub struct ExecutionId(u64);
 
 impl ExecutionId {
+    pub fn new(value: u64) -> Option<Self> {
+        (value != 0).then_some(Self(value))
+    }
+
     pub fn get(self) -> u64 {
         self.0
     }
@@ -367,6 +371,22 @@ pub struct ExecutionRecord {
     pub created_at: SystemTime,
     pub started_at: Option<SystemTime>,
     pub finished_at: SystemTime,
+    pub root_pid: Option<u32>,
+    pub processes: Vec<ProcessRecord>,
+    pub result: Option<ExecutionResult>,
+}
+
+/// Sanitized user-facing view of either an active execution or a completed
+/// history record. Invocation context, environment values, secrets, and OS
+/// handles deliberately never cross this boundary.
+#[derive(Clone, Debug)]
+pub struct ExecutionSnapshot {
+    pub id: ExecutionId,
+    pub display: String,
+    pub state: ExecutionState,
+    pub created_at: SystemTime,
+    pub started_at: Option<SystemTime>,
+    pub finished_at: Option<SystemTime>,
     pub root_pid: Option<u32>,
     pub processes: Vec<ProcessRecord>,
     pub result: Option<ExecutionResult>,
@@ -761,6 +781,115 @@ pub fn list_background_jobs() -> Vec<(u32, String)> {
     manager.refresh_background_jobs()
 }
 
+/// Returns active executions followed by bounded history, newest ID first.
+/// Refreshing background children first makes naturally completed jobs appear
+/// as terminal records before the snapshot is taken.
+pub fn list_executions() -> Vec<ExecutionSnapshot> {
+    let Ok(mut manager) = global_manager().lock() else {
+        return Vec::new();
+    };
+    manager.refresh_background_jobs();
+    let mut executions: Vec<_> = manager
+        .active
+        .values()
+        .map(ExecutionManager::snapshot_active)
+        .chain(manager.history.iter().map(ExecutionManager::snapshot_record))
+        .collect();
+    executions.sort_by_key(|execution| std::cmp::Reverse(execution.id));
+    executions
+}
+
+pub fn get_execution(id: ExecutionId) -> Option<ExecutionSnapshot> {
+    let Ok(mut manager) = global_manager().lock() else {
+        return None;
+    };
+    manager.refresh_background_jobs();
+    manager
+        .active
+        .get(&id)
+        .map(ExecutionManager::snapshot_active)
+        .or_else(|| {
+            manager
+                .history
+                .iter()
+                .find(|record| record.id == id)
+                .map(ExecutionManager::snapshot_record)
+        })
+}
+
+/// Waits for one execution whose child handles are owned by the manager.
+/// Terminal history returns immediately. Foreground executions are waited by
+/// their submitting call and therefore cannot be stolen by this API.
+pub fn wait_execution(id: ExecutionId) -> Result<ExecutionSnapshot, String> {
+    let children = {
+        let mut manager = global_manager()
+            .lock()
+            .map_err(|_| "execution manager lock was poisoned".to_string())?;
+        manager.refresh_background_jobs();
+        if let Some(record) = manager.history.iter().find(|record| record.id == id) {
+            return Ok(ExecutionManager::snapshot_record(record));
+        }
+        if !manager.active.contains_key(&id) {
+            return Err(format!("execution {} was not found", id.get()));
+        }
+        manager.background_children.remove(&id).ok_or_else(|| {
+            format!(
+                "execution {} is active but is not a waitable background execution",
+                id.get()
+            )
+        })?
+    };
+
+    let mut final_code = None;
+    let mut final_success = true;
+    let mut failed = None;
+    let mut updates = Vec::new();
+    for mut managed in children {
+        let pid = managed.child.id();
+        match managed.child.wait() {
+            Ok(status) => {
+                final_code = status.code();
+                final_success = status.success();
+                updates.push((pid, status.code()));
+            }
+            Err(error) => failed = Some(error.to_string()),
+        }
+    }
+
+    let record = with_manager(|manager| {
+        if let Some(execution) = manager.get_mut(id) {
+            for (pid, code) in updates {
+                execution.set_process_exit(pid, code);
+            }
+        }
+        let state = if failed.is_some() || !final_success {
+            ExecutionState::Failed
+        } else {
+            ExecutionState::Completed
+        };
+        manager
+            .finish_after_wait(id, state, ExecutionResult::new(final_code, failed))?
+            .ok_or(ExecutionError::NotFound(id))
+    })
+    .map_err(|error| error.to_string())?;
+    Ok(ExecutionManager::snapshot_record(&record))
+}
+
+/// Transitions one running execution to Cancelling and returns a signalling
+/// snapshot for the Windows backend. Terminal records are not cancellable.
+pub fn request_cancellation(id: ExecutionId) -> Result<CancellationRequest, String> {
+    let mut manager = global_manager()
+        .lock()
+        .map_err(|_| "execution manager lock was poisoned".to_string())?;
+    manager.refresh_background_jobs();
+    if manager.history.iter().any(|record| record.id == id) {
+        return Err(format!("execution {} has already finished", id.get()));
+    }
+    manager
+        .request_cancellation(id)
+        .map_err(|error| error.to_string())
+}
+
 pub fn wait_background_jobs() {
     let pending = {
         let Ok(mut manager) = global_manager().lock() else {
@@ -796,7 +925,7 @@ pub fn wait_background_jobs() {
             } else {
                 ExecutionState::Completed
             };
-            manager.transition(id, state, Some(ExecutionResult::new(final_code, failed)))?;
+            manager.finish_after_wait(id, state, ExecutionResult::new(final_code, failed))?;
             Ok(())
         });
     }
@@ -956,6 +1085,37 @@ impl ExecutionManager {
         request
     }
 
+    fn request_cancellation(
+        &mut self,
+        id: ExecutionId,
+    ) -> Result<CancellationRequest, ExecutionError> {
+        let state = self
+            .active
+            .get(&id)
+            .map(|execution| execution.state)
+            .ok_or(ExecutionError::NotFound(id))?;
+        if state == ExecutionState::Running {
+            if let Some(execution) = self.active.get(&id) {
+                execution.context.cancellation.cancel();
+            }
+            self.transition(id, ExecutionState::Cancelling, None)?;
+        } else if state != ExecutionState::Cancelling {
+            return Err(ExecutionError::InvalidTransition {
+                from: state,
+                to: ExecutionState::Cancelling,
+            });
+        }
+        let execution = self.active.get(&id).ok_or(ExecutionError::NotFound(id))?;
+        Ok(CancellationRequest {
+            execution_ids: vec![id],
+            process_ids: execution
+                .processes
+                .iter()
+                .map(|process| process.pid)
+                .collect(),
+        })
+    }
+
     fn finish_after_wait(
         &mut self,
         id: ExecutionId,
@@ -1053,7 +1213,7 @@ impl ExecutionManager {
             } else {
                 ExecutionState::Completed
             };
-            let _ = self.transition(id, state, Some(ExecutionResult::new(final_code, failed)));
+            let _ = self.finish_after_wait(id, state, ExecutionResult::new(final_code, failed));
         }
         listed
     }
@@ -1146,19 +1306,7 @@ impl ExecutionManager {
     }
 
     fn sanitize(execution: Execution) -> ExecutionRecord {
-        let display = match &execution.spec.target {
-            ExecutionTarget::External { program, args } => {
-                std::iter::once(program.to_string_lossy().into_owned())
-                    .chain(args.iter().cloned())
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            }
-            ExecutionTarget::Pipeline { display } => display.clone(),
-            ExecutionTarget::Builtin { name, args } => std::iter::once(name.clone())
-                .chain(args.iter().cloned())
-                .collect::<Vec<_>>()
-                .join(" "),
-        };
+        let display = Self::display_for(&execution);
         ExecutionRecord {
             id: execution.id,
             display,
@@ -1171,6 +1319,50 @@ impl ExecutionManager {
             root_pid: execution.root_pid,
             processes: execution.processes,
             result: execution.result,
+        }
+    }
+
+    fn display_for(execution: &Execution) -> String {
+        match &execution.spec.target {
+            ExecutionTarget::External { program, args } => {
+                std::iter::once(program.to_string_lossy().into_owned())
+                    .chain(args.iter().cloned())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            }
+            ExecutionTarget::Pipeline { display } => display.clone(),
+            ExecutionTarget::Builtin { name, args } => std::iter::once(name.clone())
+                .chain(args.iter().cloned())
+                .collect::<Vec<_>>()
+                .join(" "),
+        }
+    }
+
+    fn snapshot_active(execution: &Execution) -> ExecutionSnapshot {
+        ExecutionSnapshot {
+            id: execution.id,
+            display: Self::display_for(execution),
+            state: execution.state,
+            created_at: execution.created_at,
+            started_at: execution.started_at,
+            finished_at: execution.finished_at,
+            root_pid: execution.root_pid,
+            processes: execution.processes.clone(),
+            result: execution.result.clone(),
+        }
+    }
+
+    fn snapshot_record(record: &ExecutionRecord) -> ExecutionSnapshot {
+        ExecutionSnapshot {
+            id: record.id,
+            display: record.display.clone(),
+            state: record.state,
+            created_at: record.created_at,
+            started_at: record.started_at,
+            finished_at: Some(record.finished_at),
+            root_pid: record.root_pid,
+            processes: record.processes.clone(),
+            result: record.result.clone(),
         }
     }
 }
@@ -1362,6 +1554,52 @@ mod tests {
             .unwrap();
         assert_eq!(record.state, ExecutionState::Cancelled);
         assert_eq!(record.result.unwrap().message.as_deref(), Some("cancelled"));
+    }
+
+    #[test]
+    fn targeted_cancellation_includes_background_execution_and_snapshot_is_sanitized() {
+        let mut manager = ExecutionManager::new(10);
+        let cwd = PathBuf::from(r"C:\work");
+        let spec = ExecutionSpec::new(
+            ExecutionTarget::Pipeline {
+                display: "slow | worker".into(),
+            },
+            cwd.clone(),
+            ExecutionMode::Background,
+        );
+        let context = ExecutionContext::new(cwd, BTreeMap::new())
+            .with_secret("token", SecretValue::new("do-not-show"));
+        let id = manager.create(spec, context).unwrap();
+        manager
+            .transition(id, ExecutionState::Starting, None)
+            .unwrap();
+        manager
+            .transition(id, ExecutionState::Running, None)
+            .unwrap();
+        manager
+            .get_mut(id)
+            .unwrap()
+            .add_process_with_display(303, "slow".into());
+
+        let request = manager.request_cancellation(id).unwrap();
+        assert_eq!(request.execution_ids, vec![id]);
+        assert_eq!(request.process_ids, vec![303]);
+        let active = ExecutionManager::snapshot_active(manager.get(id).unwrap());
+        assert_eq!(active.state, ExecutionState::Cancelling);
+        assert_eq!(active.display, "slow | worker");
+        assert!(!format!("{active:?}").contains("do-not-show"));
+
+        let record = manager
+            .finish_after_wait(
+                id,
+                ExecutionState::Failed,
+                ExecutionResult::new(Some(1), None),
+            )
+            .unwrap()
+            .unwrap();
+        let finished = ExecutionManager::snapshot_record(&record);
+        assert_eq!(finished.state, ExecutionState::Cancelled);
+        assert!(finished.finished_at.is_some());
     }
 
     #[test]

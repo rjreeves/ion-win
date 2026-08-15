@@ -1101,6 +1101,10 @@ async fn dispatch(line: &str, interp: &mut Interpreter, state: &StateHandle) -> 
                 "jobs" => handle_jobs(),
                 "wait" => execution::wait_background_jobs(),
                 "disown" => handle_disown(&args),
+                "exec" => {
+                    let ok = handle_exec(&args);
+                    interp.set_previous_status(ok);
+                }
                 "task" => {
                     let ok = handle_task(&args, state).await;
                     interp.set_previous_status(ok);
@@ -1950,6 +1954,158 @@ fn handle_disown(args: &[String]) {
     }
     let count = execution::disown_background_jobs(&pids);
     println!("ion-win: disowned {count} job(s)");
+}
+
+fn handle_exec(args: &[String]) -> bool {
+    const USAGE: &str = "exec list\n\
+exec show ID\n\
+exec wait ID\n\
+exec cancel ID";
+
+    let Some(subcommand) = args.first().map(String::as_str) else {
+        err_println!("ion-win: exec: usage:\n{USAGE}");
+        return false;
+    };
+    if matches!(subcommand, "-h" | "--help") {
+        println!("{USAGE}");
+        return true;
+    }
+
+    match subcommand {
+        "list" if args.len() == 1 => {
+            let executions = execution::list_executions();
+            if executions.is_empty() {
+                println!("ion-win: no executions");
+                return true;
+            }
+            println!("ID\tSTATE\tPID\tCOMMAND");
+            for item in executions {
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    item.id.get(),
+                    execution_state_name(item.state),
+                    item.root_pid
+                        .map(|pid| pid.to_string())
+                        .unwrap_or_else(|| "-".into()),
+                    item.display
+                );
+            }
+            true
+        }
+        "show" if args.len() == 2 => {
+            let Some(id) = parse_execution_id(&args[1]) else {
+                return false;
+            };
+            let Some(item) = execution::get_execution(id) else {
+                err_println!("ion-win: exec: execution {} was not found", id.get());
+                return false;
+            };
+            print_execution(&item);
+            true
+        }
+        "wait" if args.len() == 2 => {
+            let Some(id) = parse_execution_id(&args[1]) else {
+                return false;
+            };
+            match execution::wait_execution(id) {
+                Ok(item) => {
+                    print_execution(&item);
+                    item.state == execution::ExecutionState::Completed
+                }
+                Err(error) => {
+                    err_println!("ion-win: exec: {error}");
+                    false
+                }
+            }
+        }
+        "cancel" if args.len() == 2 => {
+            let Some(id) = parse_execution_id(&args[1]) else {
+                return false;
+            };
+            match crate::jobctl::cancel_execution(id) {
+                Ok(()) => {
+                    println!("ion-win: execution {} is cancelling", id.get());
+                    true
+                }
+                Err(error) => {
+                    err_println!("ion-win: exec: {error}");
+                    false
+                }
+            }
+        }
+        _ => {
+            err_println!("ion-win: exec: usage:\n{USAGE}");
+            false
+        }
+    }
+}
+
+fn parse_execution_id(value: &str) -> Option<execution::ExecutionId> {
+    let id = value
+        .parse::<u64>()
+        .ok()
+        .and_then(execution::ExecutionId::new);
+    if id.is_none() {
+        err_println!("ion-win: exec: '{value}': not a valid execution ID");
+    }
+    id
+}
+
+fn execution_state_name(state: execution::ExecutionState) -> String {
+    format!("{state:?}").to_ascii_lowercase()
+}
+
+fn format_execution_time(value: Option<std::time::SystemTime>) -> String {
+    value
+        .map(|time| chrono::DateTime::<chrono::Local>::from(time).to_rfc3339())
+        .unwrap_or_else(|| "-".into())
+}
+
+fn print_execution(item: &execution::ExecutionSnapshot) {
+    println!("id: {}", item.id.get());
+    println!("state: {}", execution_state_name(item.state));
+    println!("command: {}", item.display);
+    println!(
+        "root-pid: {}",
+        item.root_pid
+            .map(|pid| pid.to_string())
+            .unwrap_or_else(|| "-".into())
+    );
+    println!("created: {}", format_execution_time(Some(item.created_at)));
+    println!("started: {}", format_execution_time(item.started_at));
+    println!("finished: {}", format_execution_time(item.finished_at));
+    if item.processes.is_empty() {
+        println!("processes: -");
+    } else {
+        println!("processes:");
+        for process in &item.processes {
+            let exit = process
+                .exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "-".into());
+            if process.display.is_empty() {
+                println!("  {} exit={exit}", process.pid);
+            } else {
+                println!("  {} exit={exit} {}", process.pid, process.display);
+            }
+        }
+    }
+    if let Some(result) = &item.result {
+        println!(
+            "result: exit={}{}",
+            result
+                .exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "-".into()),
+            result
+                .message
+                .as_deref()
+                .map(|message| format!(" message={message}"))
+                .unwrap_or_default()
+        );
+    } else {
+        println!("result: -");
+    }
 }
 
 async fn handle_task(args: &[String], state: &StateHandle) -> bool {

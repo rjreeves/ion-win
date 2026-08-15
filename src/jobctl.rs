@@ -44,6 +44,23 @@ pub fn request_interrupt() {
     }
 }
 
+/// Cancels one execution selected by the user-facing `exec cancel` command.
+/// This uses the same cooperative Ctrl+Break-first and Job Object escalation
+/// policy as an interactive Ctrl+C, without setting the pure-Ion loop flag.
+pub fn cancel_execution(id: crate::execution::ExecutionId) -> Result<(), String> {
+    let cancellation = crate::execution::request_cancellation(id)?;
+    for pid in cancellation.process_ids {
+        forward_ctrl_c(pid);
+    }
+    if !cancellation.execution_ids.is_empty() {
+        std::thread::spawn(move || {
+            std::thread::sleep(CANCELLATION_GRACE);
+            crate::execution::escalate_cancellation(&cancellation.execution_ids);
+        });
+    }
+    Ok(())
+}
+
 /// Checks (and clears) the cooperative interrupt flag. `while`/`for` loop
 /// bodies in `shell.rs` poll this once per iteration; a `true` result
 /// means "stop looping and unwind back to the prompt," analogous to how a
