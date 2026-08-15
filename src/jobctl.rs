@@ -7,7 +7,8 @@
 //!
 //! 1. **A foreground external process** (or several, for a pipeline) —
 //!    reached by forwarding a real console control event to it. See
-//!    `register_foreground`/`interrupt`.
+//!    PID targets are read from active foreground executions in
+//!    `ExecutionManager` and signalled here.
 //! 2. **A pure-Ion loop with no external process at all** (`while true;
 //!    end` with only builtins/expansions inside) — there's no OS-level
 //!    signal target for that; the running Rust code has to periodically
@@ -20,42 +21,16 @@
 //! blocked in a tight loop or a `Child::wait()`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
-
-static FOREGROUND_PIDS: OnceLock<Mutex<Vec<u32>>> = OnceLock::new();
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
-fn registry() -> &'static Mutex<Vec<u32>> {
-    FOREGROUND_PIDS.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-/// Marks a spawned child's PID as part of the current foreground job, so
-/// Ctrl+C will forward to it. Don't call this for backgrounded (`&`) or
-/// disowned (`&!`) processes — only the foreground job should be
-/// interruptible.
-pub fn register_foreground(pid: u32) {
-    if let Ok(mut pids) = registry().lock() {
-        pids.push(pid);
-    }
-}
-
-/// Unregisters a child once it's been waited on (or will never be waited
-/// on, e.g. it failed to spawn a sibling stage).
-pub fn unregister_foreground(pid: u32) {
-    if let Ok(mut pids) = registry().lock() {
-        pids.retain(|&p| p != pid);
-    }
-}
-
 /// Called from the Ctrl+C handler thread: forwards a console interrupt to
-/// every registered foreground PID and sets the cooperative flag for
+/// every active foreground execution PID and sets the cooperative flag for
 /// pure-Ion loops to notice. Never panics — this runs on a signal-handling
 /// thread where a panic would be especially unwelcome.
 pub fn request_interrupt() {
     INTERRUPTED.store(true, Ordering::SeqCst);
 
-    let Ok(pids) = registry().lock() else { return };
-    for &pid in pids.iter() {
+    for pid in crate::execution::foreground_process_ids() {
         forward_ctrl_c(pid);
     }
 }
@@ -83,7 +58,7 @@ pub fn interrupt_requested() -> bool {
 /// Putting each child in its own process group opts it out of that blanket
 /// delivery, so `request_interrupt` can instead explicitly forward the
 /// event only to whichever PID(s) are currently registered as the
-/// foreground job (see `register_foreground`).
+/// foreground execution (tracked by `ExecutionManager`).
 pub fn new_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
     let mut command = std::process::Command::new(program);
     #[cfg(windows)]
@@ -94,17 +69,12 @@ pub fn new_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Comman
     command
 }
 
-/// Registers a freshly-spawned child as the foreground job, waits for it,
-/// then unregisters it — shared by every single-process external-command
-/// spawn site. Pipeline stages (potentially several children at once)
-/// register/unregister themselves individually instead; see
-/// `pipeline_exec.rs`.
-pub fn wait_foreground(mut child: std::process::Child) -> std::io::Result<std::process::ExitStatus> {
-    let pid = child.id();
-    register_foreground(pid);
-    let result = child.wait();
-    unregister_foreground(pid);
-    result
+/// Waits for a foreground child. PID discovery for Ctrl+C now comes from
+/// `ExecutionManager`; this remains the process-wait backend entry point.
+pub fn wait_foreground(
+    mut child: std::process::Child,
+) -> std::io::Result<std::process::ExitStatus> {
+    child.wait()
 }
 
 #[cfg(windows)]
@@ -140,31 +110,23 @@ fn forward_ctrl_c(_pid: u32) {
 mod tests {
     use super::*;
 
-    // These tests share the module's global statics, so they're combined
-    // into one #[test] rather than run in parallel — otherwise one test's
-    // register/unregister could interleave with another's flag check.
     #[test]
-    fn registry_and_interrupt_flag_behave() {
-        // Start clean regardless of test execution order.
+    fn interrupt_flag_behaves() {
         take_interrupt();
-        while registry().lock().unwrap().pop().is_some() {}
-
         assert!(!take_interrupt(), "flag should start clear");
-
-        register_foreground(4242);
-        register_foreground(4243);
-        assert_eq!(*registry().lock().unwrap(), vec![4242, 4243]);
-
-        unregister_foreground(4242);
-        assert_eq!(*registry().lock().unwrap(), vec![4243]);
-
-        request_interrupt(); // sets the flag; forwarding to a fake PID is a harmless no-op
-        assert!(interrupt_requested(), "non-consuming check should see the flag");
-        assert!(interrupt_requested(), "non-consuming check must leave the flag set");
+        request_interrupt();
+        assert!(
+            interrupt_requested(),
+            "non-consuming check should see the flag"
+        );
+        assert!(
+            interrupt_requested(),
+            "non-consuming check must leave the flag set"
+        );
         assert!(take_interrupt(), "request_interrupt should set the flag");
-        assert!(!take_interrupt(), "flag should be consumed by the first take");
-
-        unregister_foreground(4243);
-        assert!(registry().lock().unwrap().is_empty());
+        assert!(
+            !take_interrupt(),
+            "flag should be consumed by the first take"
+        );
     }
 }

@@ -530,6 +530,15 @@ pub fn register_pipeline_process(id: ExecutionId, pid: u32) -> std::io::Result<(
     })
 }
 
+/// Returns a short-lived snapshot for the Ctrl+C handler. The manager lock is
+/// released before `jobctl` calls the Windows console-control API.
+pub fn foreground_process_ids() -> Vec<u32> {
+    global_manager()
+        .lock()
+        .map(|manager| manager.foreground_process_ids())
+        .unwrap_or_default()
+}
+
 pub fn fail_foreground_pipeline(id: ExecutionId, message: impl Into<String>) {
     let message = message.into();
     let _ = with_manager(|manager| {
@@ -556,7 +565,6 @@ pub fn wait_foreground_pipeline(
     for mut child in children {
         let pid = child.id();
         let waited = child.wait();
-        crate::jobctl::unregister_foreground(pid);
         match waited {
             Ok(status) => {
                 final_success = status.success();
@@ -644,6 +652,20 @@ impl ExecutionManager {
     }
     pub fn history(&self) -> impl Iterator<Item = &ExecutionRecord> {
         self.history.iter()
+    }
+
+    pub fn foreground_process_ids(&self) -> Vec<u32> {
+        self.active
+            .values()
+            .filter(|execution| {
+                execution.spec.mode == ExecutionMode::Foreground
+                    && matches!(
+                        execution.state,
+                        ExecutionState::Running | ExecutionState::Cancelling
+                    )
+            })
+            .flat_map(|execution| execution.processes.iter().map(|process| process.pid))
+            .collect()
     }
 
     pub fn transition(
@@ -839,6 +861,51 @@ mod tests {
             ]
         );
         assert_eq!(record.state, ExecutionState::Completed);
+    }
+
+    #[test]
+    fn interrupt_snapshot_contains_only_running_foreground_processes() {
+        let mut manager = ExecutionManager::new(10);
+        let cwd = PathBuf::from(r"C:\work");
+        let make = |mode| {
+            ExecutionSpec::new(
+                ExecutionTarget::Pipeline {
+                    display: "pipeline".into(),
+                },
+                cwd.clone(),
+                mode,
+            )
+        };
+
+        let foreground = manager
+            .create(
+                make(ExecutionMode::Foreground),
+                ExecutionContext::new(cwd.clone(), BTreeMap::new()),
+            )
+            .unwrap();
+        manager
+            .transition(foreground, ExecutionState::Starting, None)
+            .unwrap();
+        manager
+            .transition(foreground, ExecutionState::Running, None)
+            .unwrap();
+        manager.get_mut(foreground).unwrap().add_process(101);
+
+        let background = manager
+            .create(
+                make(ExecutionMode::Background),
+                ExecutionContext::new(cwd, BTreeMap::new()),
+            )
+            .unwrap();
+        manager
+            .transition(background, ExecutionState::Starting, None)
+            .unwrap();
+        manager
+            .transition(background, ExecutionState::Running, None)
+            .unwrap();
+        manager.get_mut(background).unwrap().add_process(202);
+
+        assert_eq!(manager.foreground_process_ids(), vec![101]);
     }
 
     #[test]

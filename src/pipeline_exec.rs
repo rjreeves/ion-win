@@ -242,9 +242,6 @@ async fn run_impl(
     macro_rules! unregister_spawned {
         () => {
             if is_foreground {
-                for child in &children {
-                    jobctl::unregister_foreground(child.id());
-                }
                 if let Some(id) = pipeline_execution {
                     execution::fail_foreground_pipeline(id, "pipeline setup failed");
                 }
@@ -643,10 +640,8 @@ async fn run_impl(
                     }
                 };
                 if is_foreground {
-                    jobctl::register_foreground(child.id());
                     if let Some(id) = pipeline_execution {
                         if let Err(error) = execution::register_pipeline_process(id, child.id()) {
-                            jobctl::unregister_foreground(child.id());
                             err_println!("ion-win: could not register pipeline process: {error}");
                             unregister_spawned!();
                             return false;
