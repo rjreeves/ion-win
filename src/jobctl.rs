@@ -21,7 +21,9 @@
 //! blocked in a tight loop or a `Child::wait()`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+const CANCELLATION_GRACE: Duration = Duration::from_millis(750);
 
 /// Called from the Ctrl+C handler thread: forwards a console interrupt to
 /// every active foreground execution PID and sets the cooperative flag for
@@ -30,8 +32,15 @@ static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 pub fn request_interrupt() {
     INTERRUPTED.store(true, Ordering::SeqCst);
 
-    for pid in crate::execution::foreground_process_ids() {
+    let cancellation = crate::execution::request_foreground_cancellation();
+    for pid in cancellation.process_ids {
         forward_ctrl_c(pid);
+    }
+    if !cancellation.execution_ids.is_empty() {
+        std::thread::spawn(move || {
+            std::thread::sleep(CANCELLATION_GRACE);
+            crate::execution::escalate_cancellation(&cancellation.execution_ids);
+        });
     }
 }
 

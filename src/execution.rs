@@ -421,6 +421,12 @@ struct ManagedChild {
     command: String,
 }
 
+#[derive(Debug, Default)]
+pub struct CancellationRequest {
+    pub execution_ids: Vec<ExecutionId>,
+    pub process_ids: Vec<u32>,
+}
+
 const DEFAULT_HISTORY_LIMIT: usize = 1_000;
 static MANAGER: OnceLock<Mutex<ExecutionManager>> = OnceLock::new();
 
@@ -439,6 +445,49 @@ fn with_manager<T>(
         .lock()
         .map_err(|_| std::io::Error::other("execution manager lock was poisoned"))?;
     action(&mut manager).map_err(manager_error)
+}
+
+/// Marks every active foreground execution as cancelling and returns a
+/// short-lived OS signalling snapshot. No Windows API is called while the
+/// manager lock is held.
+pub fn request_foreground_cancellation() -> CancellationRequest {
+    global_manager()
+        .lock()
+        .map(|mut manager| manager.request_foreground_cancellation())
+        .unwrap_or_default()
+}
+
+/// Escalates only executions that are still cancelling after the cooperative
+/// interrupt grace period. Executions without an assigned Job Object retain
+/// the cooperative Ctrl+Break-only behavior.
+pub fn escalate_cancellation(ids: &[ExecutionId]) {
+    #[cfg(windows)]
+    if let Ok(manager) = global_manager().lock() {
+        for id in ids {
+            if manager
+                .active
+                .get(id)
+                .is_some_and(|execution| execution.state == ExecutionState::Cancelling)
+            {
+                if let Some(job) = manager.job_objects.get(id) {
+                    let _ = job.terminate(0xC000_013A);
+                }
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = ids;
+}
+
+fn finish_after_wait(
+    id: ExecutionId,
+    natural_state: ExecutionState,
+    natural_result: ExecutionResult,
+) -> std::io::Result<()> {
+    with_manager(|manager| {
+        manager.finish_after_wait(id, natural_state, natural_result)?;
+        Ok(())
+    })
 }
 
 /// Launches and waits for one foreground external process through the
@@ -512,10 +561,7 @@ pub fn run_foreground_external(
             ExecutionResult::new(None, Some(format!("failed to wait for process: {error}"))),
         ),
     };
-    with_manager(|manager| {
-        manager.transition(id, state, Some(result))?;
-        Ok(())
-    })?;
+    finish_after_wait(id, state, result)?;
     wait_result
 }
 
@@ -599,10 +645,7 @@ pub fn run_captured_external(
             ExecutionResult::new(None, Some(format!("failed to wait for process: {error}"))),
         ),
     };
-    with_manager(|manager| {
-        manager.transition(id, state, Some(result))?;
-        Ok(())
-    })?;
+    finish_after_wait(id, state, result)?;
     output
 }
 
@@ -736,22 +779,13 @@ pub fn disown_background_jobs(pids: &[u32]) -> usize {
     manager.disown_background_jobs(pids)
 }
 
-/// Returns a short-lived snapshot for the Ctrl+C handler. The manager lock is
-/// released before `jobctl` calls the Windows console-control API.
-pub fn foreground_process_ids() -> Vec<u32> {
-    global_manager()
-        .lock()
-        .map(|manager| manager.foreground_process_ids())
-        .unwrap_or_default()
-}
-
 pub fn fail_pipeline_execution(id: ExecutionId, message: impl Into<String>) {
     let message = message.into();
     let _ = with_manager(|manager| {
-        manager.transition(
+        manager.finish_after_wait(
             id,
             ExecutionState::Failed,
-            Some(ExecutionResult::new(None, Some(message))),
+            ExecutionResult::new(None, Some(message)),
         )?;
         Ok(())
     });
@@ -797,10 +831,7 @@ pub fn wait_foreground_pipeline(
     let message = wait_error
         .as_ref()
         .map(|error| format!("failed to wait for pipeline process: {error}"));
-    with_manager(|manager| {
-        manager.transition(id, state, Some(ExecutionResult::new(final_code, message)))?;
-        Ok(())
-    })?;
+    finish_after_wait(id, state, ExecutionResult::new(final_code, message))?;
 
     if let Some(error) = wait_error {
         Err(error)
@@ -863,18 +894,60 @@ impl ExecutionManager {
         self.history.iter()
     }
 
-    pub fn foreground_process_ids(&self) -> Vec<u32> {
-        self.active
-            .values()
-            .filter(|execution| {
-                execution.spec.mode == ExecutionMode::Foreground
+    fn request_foreground_cancellation(&mut self) -> CancellationRequest {
+        let ids: Vec<_> = self
+            .active
+            .iter()
+            .filter_map(|(id, execution)| {
+                (execution.spec.mode == ExecutionMode::Foreground
                     && matches!(
                         execution.state,
                         ExecutionState::Running | ExecutionState::Cancelling
-                    )
+                    ))
+                .then_some(*id)
             })
-            .flat_map(|execution| execution.processes.iter().map(|process| process.pid))
-            .collect()
+            .collect();
+        let mut request = CancellationRequest::default();
+        for id in ids {
+            let state = self.active.get(&id).map(|execution| execution.state);
+            if state == Some(ExecutionState::Running) {
+                if let Some(execution) = self.active.get(&id) {
+                    execution.context.cancellation.cancel();
+                }
+                let _ = self.transition(id, ExecutionState::Cancelling, None);
+            }
+            if let Some(execution) = self.active.get(&id) {
+                request.execution_ids.push(id);
+                request
+                    .process_ids
+                    .extend(execution.processes.iter().map(|process| process.pid));
+            }
+        }
+        request
+    }
+
+    fn finish_after_wait(
+        &mut self,
+        id: ExecutionId,
+        natural_state: ExecutionState,
+        natural_result: ExecutionResult,
+    ) -> Result<Option<ExecutionRecord>, ExecutionError> {
+        if self
+            .active
+            .get(&id)
+            .is_some_and(|execution| execution.state == ExecutionState::Cancelling)
+        {
+            self.transition(
+                id,
+                ExecutionState::Cancelled,
+                Some(ExecutionResult::new(
+                    natural_result.exit_code,
+                    Some("cancelled".into()),
+                )),
+            )
+        } else {
+            self.transition(id, natural_state, Some(natural_result))
+        }
     }
 
     #[cfg(windows)]
@@ -1197,7 +1270,7 @@ mod tests {
     }
 
     #[test]
-    fn interrupt_snapshot_contains_only_running_foreground_processes() {
+    fn cancellation_request_targets_only_foreground_and_finalizes_cancelled() {
         let mut manager = ExecutionManager::new(10);
         let cwd = PathBuf::from(r"C:\work");
         let make = |mode| {
@@ -1238,7 +1311,27 @@ mod tests {
             .unwrap();
         manager.get_mut(background).unwrap().add_process(202);
 
-        assert_eq!(manager.foreground_process_ids(), vec![101]);
+        let request = manager.request_foreground_cancellation();
+        assert_eq!(request.execution_ids, vec![foreground]);
+        assert_eq!(request.process_ids, vec![101]);
+        let foreground_execution = manager.get(foreground).unwrap();
+        assert_eq!(foreground_execution.state(), ExecutionState::Cancelling);
+        assert!(foreground_execution.context.cancellation.is_cancelled());
+        assert_eq!(
+            manager.get(background).unwrap().state(),
+            ExecutionState::Running
+        );
+
+        let record = manager
+            .finish_after_wait(
+                foreground,
+                ExecutionState::Failed,
+                ExecutionResult::new(Some(1), Some("process exited unsuccessfully".into())),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.state, ExecutionState::Cancelled);
+        assert_eq!(record.result.unwrap().message.as_deref(), Some("cancelled"));
     }
 
     #[test]
