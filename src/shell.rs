@@ -51,11 +51,11 @@ use crate::interp::{Interpreter, Quoting, Token};
 use crate::jobctl;
 use crate::keyboard_input::{self, ReadRequest};
 use crate::pipeline;
-use crate::{err_eprintln, err_println};
 use crate::pipeline_exec;
 use crate::state::StateHandle;
 use crate::table::Table;
 use crate::types;
+use crate::{err_eprintln, err_println};
 use std::future::Future;
 use std::io;
 use std::path::PathBuf;
@@ -154,16 +154,16 @@ pub async fn run(state: StateHandle) {
             block.push("end".to_string());
             (exec_block(&block, &mut interp, &state).await, accepted)
         } else {
-            (dispatch(&line, &mut interp, &state).await, vec![line.clone()])
+            (
+                dispatch(&line, &mut interp, &state).await,
+                vec![line.clone()],
+            )
         };
 
         // A block records several separate input lines, so there is no
         // single latest entry that safely represents the failed command.
         // Simple inputs are exact: remove only the line just executed.
-        if !is_block
-            && interp.command_not_found()
-            && history::ignores_no_such_command(&interp)
-        {
+        if !is_block && interp.command_not_found() && history::ignores_no_such_command(&interp) {
             editor.remove_last_history_if(&line);
         } else {
             history::append(&interp, &accepted_lines);
@@ -177,7 +177,6 @@ pub async fn run(state: StateHandle) {
             Flow::Normal => {}
         }
     }
-
 }
 
 /// Runs a script file non-interactively (ion-manual "Script Executions"):
@@ -494,7 +493,11 @@ async fn exec_match(
             if let Some(stmt) = inline_stmt {
                 lines.push(stmt);
             }
-            current = Some(CaseBranch { pattern, guard, lines });
+            current = Some(CaseBranch {
+                pattern,
+                guard,
+                lines,
+            });
             continue;
         }
 
@@ -539,7 +542,10 @@ async fn exec_match(
 /// the one that understands `[ ... ]` array literals; `@array`
 /// references and bare scalars already work the same either way.
 fn expand_match_operand(tokens: &[Token], interp: &Interpreter) -> Vec<String> {
-    tokens.iter().flat_map(|t| interp.array_from_token(t)).collect()
+    tokens
+        .iter()
+        .flat_map(|t| interp.array_from_token(t))
+        .collect()
 }
 
 /// Parses everything after a `case` line's literal `case ` prefix into
@@ -712,7 +718,11 @@ fn split_chain_op_tokens(tokens: &[Token]) -> Option<(&[Token], ChainOp, &[Token
     let i = tokens
         .iter()
         .position(|t| t.quoting == Quoting::None && (t.text == "&&" || t.text == "||"))?;
-    let op = if tokens[i].text == "&&" { ChainOp::And } else { ChainOp::Or };
+    let op = if tokens[i].text == "&&" {
+        ChainOp::And
+    } else {
+        ChainOp::Or
+    };
     Some((&tokens[..i], op, &tokens[i + 1..]))
 }
 
@@ -846,8 +856,7 @@ fn is_table_producing_command(cmd: &str, interp: &Interpreter) -> bool {
     matches!(
         cmd,
         "from-json" | "select" | "where" | "filter" | "stat" | "from-csv" | "date-column"
-    )
-        || interp.get_table(cmd).is_some()
+    ) || interp.get_table(cmd).is_some()
 }
 
 /// Intercepts `let NAME = PIPELINE` — where `PIPELINE`'s *last* stage
@@ -946,7 +955,11 @@ async fn dispatch(line: &str, interp: &mut Interpreter, state: &StateHandle) -> 
     // not a freshly-reset one.
     if cmd == "and" || cmd == "or" {
         let rest = line.trim_start()[cmd.len()..].trim_start();
-        let run = if cmd == "and" { interp.previous_status() } else { !interp.previous_status() };
+        let run = if cmd == "and" {
+            interp.previous_status()
+        } else {
+            !interp.previous_status()
+        };
         return if run {
             Box::pin(dispatch(rest, interp, state)).await
         } else {
@@ -1023,7 +1036,7 @@ async fn dispatch(line: &str, interp: &mut Interpreter, state: &StateHandle) -> 
         "source" => {
             let args = interp.expand_all(raw_args);
             return handle_source(&args, interp, state).await;
-        },
+        }
 
         "end" => {
             // A stray `end` with no matching opener (e.g. mismatched block).
@@ -1088,6 +1101,14 @@ async fn dispatch(line: &str, interp: &mut Interpreter, state: &StateHandle) -> 
                 "jobs" => handle_jobs(),
                 "wait" => execution::wait_background_jobs(),
                 "disown" => handle_disown(&args),
+                "task" => {
+                    let ok = handle_task(&args, state).await;
+                    interp.set_previous_status(ok);
+                }
+                "schedule" => {
+                    let ok = handle_schedule(&args, state).await;
+                    interp.set_previous_status(ok);
+                }
                 "source" => return handle_source(&args, interp, state).await,
                 "test" => {
                     let ok = builtins::eval_test(&args);
@@ -1161,7 +1182,9 @@ fn handle_cd(args: &[String]) -> bool {
         None => match home_dir() {
             Some(home) => home,
             None => {
-                err_println!("ion-win: cd: could not determine home directory (%USERPROFILE% not set)");
+                err_println!(
+                    "ion-win: cd: could not determine home directory (%USERPROFILE% not set)"
+                );
                 return false;
             }
         },
@@ -1338,7 +1361,11 @@ async fn handle_stat(args: &[String]) {
 fn handle_highlight(args: &[String]) {
     match args.first().map(String::as_str) {
         None => {
-            let state = if editor::highlight_enabled() { "on" } else { "off" };
+            let state = if editor::highlight_enabled() {
+                "on"
+            } else {
+                "off"
+            };
             println!("highlight: {state}");
         }
         Some("on") => {
@@ -1641,8 +1668,14 @@ fn parse_read_options(args: &[Token]) -> Result<ReadOptions, String> {
                     return Err("option -n requires a positive character count".to_string());
                 };
                 count = Some(
-                    value.text.parse::<usize>().ok().filter(|n| *n > 0)
-                        .ok_or_else(|| format!("'{}' is not a positive character count", value.text))?
+                    value
+                        .text
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|n| *n > 0)
+                        .ok_or_else(|| {
+                            format!("'{}' is not a positive character count", value.text)
+                        })?,
                 );
                 index += 2;
             }
@@ -1655,7 +1688,12 @@ fn parse_read_options(args: &[Token]) -> Result<ReadOptions, String> {
     if names.is_empty() {
         return Err("missing destination variable".to_string());
     }
-    Ok(ReadOptions { prompt, silent, count, names })
+    Ok(ReadOptions {
+        prompt,
+        silent,
+        count,
+        names,
+    })
 }
 
 /// Normal line input plus ion-win extensions: `-p` prints a prompt, `-s`
@@ -1671,7 +1709,9 @@ fn handle_read(args: &[Token], interp: &mut Interpreter) {
             return;
         }
     };
-    let prompt = options.prompt.as_ref()
+    let prompt = options
+        .prompt
+        .as_ref()
         .map(|token| interp.expand_all(std::slice::from_ref(token)).join(" "))
         .unwrap_or_default();
     let line = match keyboard_input::read(ReadRequest {
@@ -1695,7 +1735,10 @@ fn handle_read(args: &[Token], interp: &mut Interpreter) {
 
     let parts = keyboard_input::split_fields(&line, options.names.len());
     for (index, token) in options.names.iter().enumerate() {
-        interp.set_scalar(token.text.clone(), parts.get(index).cloned().unwrap_or_default());
+        interp.set_scalar(
+            token.text.clone(),
+            parts.get(index).cloned().unwrap_or_default(),
+        );
     }
     interp.set_previous_status(true);
 }
@@ -1907,4 +1950,403 @@ fn handle_disown(args: &[String]) {
     }
     let count = execution::disown_background_jobs(&pids);
     println!("ion-win: disowned {count} job(s)");
+}
+
+async fn handle_task(args: &[String], state: &StateHandle) -> bool {
+    const USAGE: &str = "task create [--force] NAME [--] COMMAND [ARG...]\n\
+task list\n\
+task show NAME\n\
+task delete NAME\n\
+task run NAME";
+
+    let Some(subcommand) = args.first().map(String::as_str) else {
+        err_println!("ion-win: task: usage:\n{USAGE}");
+        return false;
+    };
+    match subcommand {
+        "-h" | "--help" => {
+            println!("{USAGE}");
+            true
+        }
+        "create" => {
+            let mut rest = &args[1..];
+            let replace = rest.first().is_some_and(|arg| arg == "--force");
+            if replace {
+                rest = &rest[1..];
+            }
+            let Some(name) = rest.first() else {
+                err_println!("ion-win: task create: missing NAME");
+                return false;
+            };
+            rest = &rest[1..];
+            if rest.first().is_some_and(|arg| arg == "--") {
+                rest = &rest[1..];
+            }
+            let Some(command) = rest.first() else {
+                err_println!("ion-win: task create: missing COMMAND");
+                return false;
+            };
+            let cwd = match std::env::current_dir() {
+                Ok(cwd) => cwd,
+                Err(error) => {
+                    err_println!("ion-win: task create: {error}");
+                    return false;
+                }
+            };
+            let task = match crate::task::TaskDefinition::new(
+                name.clone(),
+                command.clone(),
+                rest[1..].to_vec(),
+                cwd,
+            ) {
+                Ok(task) => task,
+                Err(error) => {
+                    err_println!("ion-win: task create: {error}");
+                    return false;
+                }
+            };
+            match state.put_task(task, replace).await {
+                Ok(()) => {
+                    println!("ion-win: task '{name}' saved");
+                    true
+                }
+                Err(error) => {
+                    err_println!("ion-win: task create: {error}");
+                    false
+                }
+            }
+        }
+        "list" if args.len() == 1 => match state.list_tasks().await {
+            Ok(tasks) if tasks.is_empty() => {
+                println!("ion-win: no tasks");
+                true
+            }
+            Ok(tasks) => {
+                for task in tasks {
+                    println!("{}\t{}", task.name(), task.display_command());
+                }
+                true
+            }
+            Err(error) => {
+                err_println!("ion-win: task list: {error}");
+                false
+            }
+        },
+        "show" if args.len() == 2 => match state.get_task(args[1].clone()).await {
+            Ok(Some(task)) => {
+                println!("name: {}", task.name());
+                println!("command: {}", task.display_command());
+                println!("cwd: {}", task.cwd().display());
+                true
+            }
+            Ok(None) => {
+                err_println!("ion-win: task show: task '{}' was not found", args[1]);
+                false
+            }
+            Err(error) => {
+                err_println!("ion-win: task show: {error}");
+                false
+            }
+        },
+        "delete" if args.len() == 2 => match state.delete_task(args[1].clone()).await {
+            Ok(true) => {
+                println!("ion-win: task '{}' deleted", args[1]);
+                true
+            }
+            Ok(false) => {
+                err_println!("ion-win: task delete: task '{}' was not found", args[1]);
+                false
+            }
+            Err(error) => {
+                err_println!("ion-win: task delete: {error}");
+                false
+            }
+        },
+        "run" if args.len() == 2 => {
+            let task = match state.get_task(args[1].clone()).await {
+                Ok(Some(task)) => task,
+                Ok(None) => {
+                    err_println!("ion-win: task run: task '{}' was not found", args[1]);
+                    return false;
+                }
+                Err(error) => {
+                    err_println!("ion-win: task run: {error}");
+                    return false;
+                }
+            };
+            let spec = match task.execution_spec() {
+                Ok(spec) => spec,
+                Err(error) => {
+                    err_println!("ion-win: task run: {error}");
+                    return false;
+                }
+            };
+            match execution::run_foreground_spec(spec) {
+                Ok(status) => status.success(),
+                Err(error) => {
+                    err_println!("ion-win: task run: {error}");
+                    false
+                }
+            }
+        }
+        _ => {
+            err_println!("ion-win: task: usage:\n{USAGE}");
+            false
+        }
+    }
+}
+
+async fn handle_schedule(args: &[String], state: &StateHandle) -> bool {
+    const USAGE: &str = "schedule create [--force] [--disabled] NAME TASK once RFC3339\n\
+schedule create [--force] [--disabled] NAME TASK daily HH:MM TIMEZONE\n\
+schedule create [--force] [--disabled] NAME TASK at-logon|at-startup\n\
+schedule list\n\
+schedule show NAME\n\
+schedule delete [--force] NAME\n\
+schedule enable|disable|run NAME";
+    let Some(subcommand) = args.first().map(String::as_str) else {
+        err_println!("ion-win: schedule: usage:\n{USAGE}");
+        return false;
+    };
+    match subcommand {
+        "-h" | "--help" => {
+            println!("{USAGE}");
+            true
+        }
+        "create" => {
+            let mut rest = &args[1..];
+            let mut replace = false;
+            let mut enabled = true;
+            while let Some(flag) = rest.first().map(String::as_str) {
+                match flag {
+                    "--force" => replace = true,
+                    "--disabled" => enabled = false,
+                    _ => break,
+                }
+                rest = &rest[1..];
+            }
+            if rest.len() < 3 {
+                err_println!("ion-win: schedule create: usage:\n{USAGE}");
+                return false;
+            }
+            let name = &rest[0];
+            let task_name = &rest[1];
+            let trigger = match rest[2].as_str() {
+                "once" if rest.len() == 4 => crate::schedule::ScheduleTrigger::Once {
+                    at: rest[3].clone(),
+                },
+                "daily" if rest.len() == 5 => crate::schedule::ScheduleTrigger::Daily {
+                    at: rest[3].clone(),
+                    timezone: rest[4].clone(),
+                },
+                "at-logon" if rest.len() == 3 => crate::schedule::ScheduleTrigger::AtLogon,
+                "at-startup" if rest.len() == 3 => crate::schedule::ScheduleTrigger::AtStartup,
+                _ => {
+                    err_println!("ion-win: schedule create: invalid trigger; usage:\n{USAGE}");
+                    return false;
+                }
+            };
+            let schedule = match crate::schedule::ScheduleDefinition::new(
+                name.clone(),
+                task_name.clone(),
+                trigger,
+                enabled,
+            ) {
+                Ok(schedule) => schedule,
+                Err(error) => {
+                    err_println!("ion-win: schedule create: {error}");
+                    return false;
+                }
+            };
+            let task = match state.get_task(task_name.clone()).await {
+                Ok(Some(task)) => task,
+                Ok(None) => {
+                    err_println!("ion-win: schedule create: task '{task_name}' was not found");
+                    return false;
+                }
+                Err(error) => {
+                    err_println!("ion-win: schedule create: {error}");
+                    return false;
+                }
+            };
+            let previous = match state.get_schedule(name.clone()).await {
+                Ok(Some(_)) if !replace => {
+                    err_println!("ion-win: schedule create: schedule '{name}' already exists");
+                    return false;
+                }
+                Ok(value) => value,
+                Err(error) => {
+                    err_println!("ion-win: schedule create: {error}");
+                    return false;
+                }
+            };
+            let previous_task = if let Some(previous) = &previous {
+                state
+                    .get_task(previous.task_name().to_string())
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+            if let Err(error) = crate::task_scheduler::register(&schedule, &task) {
+                err_println!("ion-win: schedule create: {error}");
+                return false;
+            }
+            if let Err(error) = state.put_schedule(schedule, replace).await {
+                if let (Some(previous), Some(previous_task)) = (&previous, previous_task.as_ref()) {
+                    let _ = crate::task_scheduler::register(previous, previous_task);
+                } else {
+                    let _ = crate::task_scheduler::delete(name);
+                }
+                err_println!("ion-win: schedule create: {error}");
+                return false;
+            }
+            println!("ion-win: schedule '{name}' saved");
+            true
+        }
+        "list" if args.len() == 1 => match state.list_schedules().await {
+            Ok(schedules) if schedules.is_empty() => {
+                println!("ion-win: no schedules");
+                true
+            }
+            Ok(schedules) => {
+                for schedule in schedules {
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        schedule.name(),
+                        if schedule.enabled() {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        },
+                        schedule.task_name(),
+                        schedule.display_trigger()
+                    );
+                }
+                true
+            }
+            Err(error) => {
+                err_println!("ion-win: schedule list: {error}");
+                false
+            }
+        },
+        "show" if args.len() == 2 => match state.get_schedule(args[1].clone()).await {
+            Ok(Some(schedule)) => {
+                println!("name: {}", schedule.name());
+                println!("task: {}", schedule.task_name());
+                println!("trigger: {}", schedule.display_trigger());
+                println!("enabled: {}", schedule.enabled());
+                true
+            }
+            Ok(None) => {
+                err_println!(
+                    "ion-win: schedule show: schedule '{}' was not found",
+                    args[1]
+                );
+                false
+            }
+            Err(error) => {
+                err_println!("ion-win: schedule show: {error}");
+                false
+            }
+        },
+        "delete" if args.len() == 2 || (args.len() == 3 && args[1] == "--force") => {
+            let force = args.len() == 3;
+            let name = if force { &args[2] } else { &args[1] };
+            let schedule = match state.get_schedule(name.clone()).await {
+                Ok(Some(schedule)) => schedule,
+                Ok(None) => {
+                    err_println!(
+                        "ion-win: schedule delete: schedule '{}' was not found",
+                        name
+                    );
+                    return false;
+                }
+                Err(error) => {
+                    err_println!("ion-win: schedule delete: {error}");
+                    return false;
+                }
+            };
+            let task = state
+                .get_task(schedule.task_name().to_string())
+                .await
+                .ok()
+                .flatten();
+            if let Err(error) = crate::task_scheduler::delete(schedule.name()) {
+                if !force {
+                    err_println!("ion-win: schedule delete: {error}");
+                    return false;
+                }
+                crate::task_scheduler::forget_snapshot(schedule.name());
+            }
+            match state.delete_schedule(schedule.name().to_string()).await {
+                Ok(true) => {
+                    println!("ion-win: schedule '{}' deleted", schedule.name());
+                    true
+                }
+                Ok(false) => false,
+                Err(error) => {
+                    if let Some(task) = task {
+                        let _ = crate::task_scheduler::register(&schedule, &task);
+                    }
+                    err_println!("ion-win: schedule delete: {error}");
+                    false
+                }
+            }
+        }
+        "enable" | "disable" if args.len() == 2 => {
+            let enabled = subcommand == "enable";
+            let schedule = match state.get_schedule(args[1].clone()).await {
+                Ok(Some(schedule)) => schedule,
+                Ok(None) => {
+                    err_println!(
+                        "ion-win: schedule {subcommand}: schedule '{}' was not found",
+                        args[1]
+                    );
+                    return false;
+                }
+                Err(error) => {
+                    err_println!("ion-win: schedule {subcommand}: {error}");
+                    return false;
+                }
+            };
+            if let Err(error) = crate::task_scheduler::set_enabled(schedule.name(), enabled) {
+                err_println!("ion-win: schedule {subcommand}: {error}");
+                return false;
+            }
+            let updated = schedule.with_enabled(enabled);
+            if let Err(error) = state.put_schedule(updated, true).await {
+                let _ = crate::task_scheduler::set_enabled(schedule.name(), !enabled);
+                err_println!("ion-win: schedule {subcommand}: {error}");
+                return false;
+            }
+            println!("ion-win: schedule '{}' {subcommand}d", schedule.name());
+            true
+        }
+        "run" if args.len() == 2 => match state.get_schedule(args[1].clone()).await {
+            Ok(Some(_)) => match crate::task_scheduler::run(&args[1]) {
+                Ok(()) => true,
+                Err(error) => {
+                    err_println!("ion-win: schedule run: {error}");
+                    false
+                }
+            },
+            Ok(None) => {
+                err_println!(
+                    "ion-win: schedule run: schedule '{}' was not found",
+                    args[1]
+                );
+                false
+            }
+            Err(error) => {
+                err_println!("ion-win: schedule run: {error}");
+                false
+            }
+        },
+        _ => {
+            err_println!("ion-win: schedule: usage:\n{USAGE}");
+            false
+        }
+    }
 }

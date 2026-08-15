@@ -23,10 +23,13 @@ mod pipeline;
 mod pipeline_exec;
 mod procexpand;
 mod ranges;
+mod schedule;
+mod task_scheduler;
 mod shell;
 mod state;
 mod stat;
 mod table;
+mod task;
 mod temporal;
 mod temporal_column;
 mod types;
@@ -45,6 +48,14 @@ async fn main() {
 
     let cli_args: Vec<String> = std::env::args().collect();
     adjust_interactive_startup_dir(&cli_args);
+
+    if cli_args.get(1).map(String::as_str) == Some("--run-scheduled-task") {
+        let exit_code = run_scheduled_task(cli_args.get(2)).unwrap_or_else(|error| {
+            eprintln!("ion-win: scheduled task: {error}");
+            1
+        });
+        std::process::exit(exit_code);
+    }
 
     let db_path = state_db_path();
     if let Some(parent) = db_path.parent() {
@@ -73,6 +84,17 @@ async fn main() {
     }
 
     shell::run(state_handle).await;
+}
+
+fn run_scheduled_task(snapshot: Option<&String>) -> Result<i32, String> {
+    let snapshot = snapshot.ok_or_else(|| "missing task snapshot path".to_string())?;
+    let encoded = std::fs::read_to_string(snapshot)
+        .map_err(|error| format!("could not read task snapshot: {error}"))?;
+    let task = task::TaskDefinition::from_json(&encoded)?;
+    let spec = task.execution_spec()?;
+    let status = execution::run_foreground_spec(spec)
+        .map_err(|error| format!("could not run '{}': {error}", task.name()))?;
+    Ok(status.code().unwrap_or(if status.success() { 0 } else { 1 }))
 }
 
 /// Windows sometimes starts a double-clicked console program in a generic

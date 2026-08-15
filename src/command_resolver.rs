@@ -11,11 +11,18 @@ use std::path::{Path, PathBuf};
 /// Resolves `name` to the file Ion will execute.
 pub fn resolve(name: &str) -> Option<PathBuf> {
     let cwd = std::env::current_dir().ok()?;
+    resolve_in(name, &cwd)
+}
+
+/// Resolves a command using an explicit working directory. Persistent tasks
+/// use their captured directory rather than whichever directory the caller
+/// happens to occupy when the task is run.
+pub fn resolve_in(name: &str, cwd: &Path) -> Option<PathBuf> {
     let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|value| std::env::split_paths(&value).collect())
         .unwrap_or_default();
     let extensions = pathext();
-    resolve_from(name, &cwd, &path_dirs, &extensions)
+    resolve_from(name, cwd, &path_dirs, &extensions)
 }
 
 fn pathext() -> Vec<String> {

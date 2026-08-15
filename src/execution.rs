@@ -506,14 +506,44 @@ pub fn run_foreground_external(
         cwd.clone(),
         ExecutionMode::Foreground,
     );
-    let context = ExecutionContext::new(cwd, std::env::vars().collect());
+    run_foreground_spec(spec)
+}
+
+/// Submits an immutable foreground external specification through the same
+/// lifecycle as an interactive command. Task definitions use this boundary.
+pub fn run_foreground_spec(spec: ExecutionSpec) -> std::io::Result<std::process::ExitStatus> {
+    let (program, args) = match spec.target() {
+        ExecutionTarget::External { program, args } => (program.clone(), args.clone()),
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "foreground task execution requires an external target",
+            ));
+        }
+    };
+    if spec.mode() != ExecutionMode::Foreground {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "foreground task execution requires foreground mode",
+        ));
+    }
+    let cwd = spec.cwd().to_path_buf();
+    let environment_overrides = spec.environment_overrides().clone();
+    let mut effective_environment: BTreeMap<String, String> = std::env::vars().collect();
+    effective_environment.extend(environment_overrides.clone());
+    let context = ExecutionContext::new(cwd.clone(), effective_environment);
     let id = with_manager(|manager| manager.create(spec, context))?;
     with_manager(|manager| {
         manager.transition(id, ExecutionState::Starting, None)?;
         Ok(())
     })?;
 
-    let child = match crate::jobctl::new_command(program).args(args).spawn() {
+    let child = match crate::jobctl::new_command(&program)
+        .args(&args)
+        .current_dir(cwd)
+        .envs(environment_overrides)
+        .spawn()
+    {
         Ok(child) => child,
         Err(error) => {
             let message = error.to_string();

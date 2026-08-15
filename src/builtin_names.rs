@@ -328,6 +328,16 @@ pub const BUILTINS: &[Builtin] = &[
         help_display: Some("dmark add|list|jump"),
     },
     Builtin {
+        name: "task",
+        is_keyword: false,
+        help_display: Some("task create|list|show|delete|run"),
+    },
+    Builtin {
+        name: "schedule",
+        is_keyword: false,
+        help_display: Some("schedule create|list|show|delete|enable|disable|run"),
+    },
+    Builtin {
         name: "jobs",
         is_keyword: false,
         help_display: Some("jobs"),
@@ -435,7 +445,7 @@ Commands by category
                    eq/is  exists  intersects  isatty  true  false  not
   Tables           from-json  from-csv  select  where/filter  date-column
                    to-json  to-csv
-  State & jobs     pvar  history  jobs  wait  disown  which/type
+  State & jobs     pvar  task  schedule  history  jobs  wait  disown  which/type
   Editor           highlight  cls
 
 Examples
@@ -681,6 +691,18 @@ pub fn help_text(topic: Option<&str>) -> Result<String, String> {
         "eval" => page("eval WORD...", "Joins arguments and evaluates them as a new Ion command.", &["eval \"echo $name\""], &[]),
         "pvar" => page("pvar set KEY = VALUE\n        pvar get KEY\n        pvar list\n        pvar delete KEY", "Stores persistent scalar values in the ion-win state database.", &["pvar set project = ion-win", "pvar get project"], &[]),
         "dmark" => page("dmark add NAME [PATH]\n        dmark list\n        dmark jump NAME", "Stores and revisits persistent directory bookmarks.", &["dmark add repo .", "dmark jump repo"], &[]),
+        "task" | "tasks" => page(
+            "task create [--force] NAME [--] COMMAND [ARG...]\n        task list\n        task show NAME\n        task delete NAME\n        task run NAME",
+            "Stores named external-command definitions independently from runtime executions, then runs them through ExecutionManager.",
+            &["task create backup -- robocopy source backup", "task show backup", "task run backup"],
+            &["Creation captures the current working directory.", "Use --force to replace an existing task."],
+        ),
+        "schedule" | "schedules" => page(
+            "schedule create [--force] [--disabled] NAME TASK TRIGGER...\n        schedule list\n        schedule show NAME\n        schedule delete [--force] NAME\n        schedule enable|disable|run NAME",
+            "Persists a schedule and synchronizes it with Windows Task Scheduler.",
+            &["schedule create nightly backup daily 23:30 Australia/Sydney", "schedule create login-sync sync at-logon", "schedule run nightly"],
+            &["Triggers: once RFC3339, daily HH:MM TIMEZONE, at-logon, at-startup.", "Scheduled launches re-enter ion-win through ExecutionManager.", "Forced deletion removes a stale definition when its OS registration is already missing."],
+        ),
         "jobs" => page("jobs", "Lists tracked background processes.", &["long-command &", "jobs"], &[]),
         "wait" => page("wait", "Waits for all tracked background processes.", &[], &[]),
         "disown" => page("disown [-a | PID...]", "Stops tracking selected or all background processes without terminating them.", &["disown -a"], &[]),
