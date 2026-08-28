@@ -160,7 +160,7 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin {
         name: "compress",
         is_keyword: false,
-        help_display: Some("compress [--force] SRC... DEST.zip"),
+        help_display: Some("compress [--force] SRC... DEST.zip | FILESET | compress --per-root [--plan|--apply] DIR"),
     },
     Builtin {
         name: "delete",
@@ -654,10 +654,10 @@ pub fn help_text(topic: Option<&str>) -> Result<String, String> {
             &["NEW_NAME must be a name, not a path.", "`ren` is an alias."],
         ),
         "compress" => page(
-            "compress [--force] SRC... DEST.zip\n        TABLE | compress [--force] DEST.zip",
-            "Creates a standard ZIP from explicit files or table paths.",
-            &["compress report.txt report.zip", "manifest | compress snapshot.zip"],
-            &["Existing archives are skipped unless --force is supplied."],
+            "compress [--force] SRC... DEST.zip\n        FILESET | compress [--force] DEST.zip\n        FILESET | compress --per-root [--plan|--apply] [--backup DIR] ARCHIVE_DIR",
+            "Creates standard ZIP files from explicit paths or a FileSet. Per-root mode can preview every archive and backup destination before applying.",
+            &["compress report.txt report.zip", "manifest | compress snapshot.zip", "roots | find --recurse | compress --per-root --plan archives --backup backups", "roots | find --recurse | compress --per-root --apply archives --backup backups"],
+            &["--plan performs no writes and returns a structured preview.", "Existing archives and backups are refused unless --force is supplied."],
         ),
         "delete" => page(
             "delete [--recurse] PATH...\n        TABLE | delete [--recurse]",

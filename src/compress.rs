@@ -24,16 +24,18 @@
 //! so the actual expensive work (compression) is what runs in parallel,
 //! not the bookkeeping.
 
+use crate::fileset::FileSet;
 use crate::table::Table;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 const COMPRESS_USAGE: &str =
-    "compress: usage: compress [--force] SRC... DEST.zip  |  TABLE | compress [--force] DEST.zip";
+    "compress: usage: compress [--force] SRC... DEST.zip  |  FILESET | compress [--force] DEST.zip  |  FILESET | compress [--force] --per-root DIRECTORY";
 
 /// Splits `--force`/`-f` and `--help`/`-h` out of `args` — identical
 /// shape to `copy::parse_flags`, kept as its own copy rather than shared
@@ -74,10 +76,257 @@ pub async fn compress_files(sources: &[String], dest: &str, force: bool) -> Stri
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| src.clone());
-            (name, src.clone())
+            (name, PathBuf::from(src))
         })
         .collect();
     compress_entries(entries, dest, force, 0).await
+}
+
+/// Pipeline-only extension of `parse_flags`. `--per-root` needs FileSet
+/// provenance, so the standalone explicit-source form intentionally keeps
+/// rejecting it.
+pub fn parse_pipeline_flags(
+    args: &[String],
+) -> Result<(bool, bool, bool, bool, Option<String>, Vec<String>), String> {
+    let mut per_root = false;
+    let mut plan = false;
+    let mut apply = false;
+    let mut backup = None;
+    let mut remaining = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--per-root" => per_root = true,
+            "--plan" => plan = true,
+            "--apply" => apply = true,
+            "--backup" => {
+                backup = Some(
+                    iter.next()
+                        .ok_or_else(|| "compress: --backup requires a directory".to_string())?
+                        .clone(),
+                );
+            }
+            _ => remaining.push(arg.clone()),
+        }
+    }
+    if plan && apply {
+        return Err("compress: --plan and --apply are mutually exclusive".to_string());
+    }
+    if (plan || apply || backup.is_some()) && !per_root {
+        return Err("compress: --plan/--apply/--backup require --per-root".to_string());
+    }
+    let (force, positional) = parse_flags(&remaining)?;
+    Ok((force, per_root, plan, apply, backup, positional))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchivePlanItem {
+    pub root: PathBuf,
+    pub archive: PathBuf,
+    pub backup: Option<PathBuf>,
+    entries: Vec<(String, PathBuf)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchivePlan {
+    pub items: Vec<ArchivePlanItem>,
+}
+
+impl ArchivePlan {
+    pub fn to_table(&self) -> Table {
+        Table {
+            rows: self
+                .items
+                .iter()
+                .map(|item| {
+                    vec![
+                        ("operation".to_string(), "compress".to_string()),
+                        ("root".to_string(), item.root.to_string_lossy().into_owned()),
+                        ("file_count".to_string(), item.entries.len().to_string()),
+                        (
+                            "archive".to_string(),
+                            item.archive.to_string_lossy().into_owned(),
+                        ),
+                        (
+                            "backup".to_string(),
+                            item.backup
+                                .as_ref()
+                                .map(|path| path.to_string_lossy().into_owned())
+                                .unwrap_or_default(),
+                        ),
+                        (
+                            "archive_exists".to_string(),
+                            item.archive.exists().to_string(),
+                        ),
+                        (
+                            "backup_exists".to_string(),
+                            item.backup
+                                .as_ref()
+                                .is_some_and(|path| path.exists())
+                                .to_string(),
+                        ),
+                    ]
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Native FileSet pipeline form. It reads each record's `PathBuf` directly,
+/// preserving typed filesystem identity and avoiding the legacy display-table
+/// adapter used by `compress_table`.
+pub async fn compress_fileset(fileset: &FileSet, dest: &str, force: bool) -> String {
+    let entries = fileset
+        .files
+        .iter()
+        .map(|record| (path_entry_name(&record.path), record.path.clone()))
+        .collect();
+    compress_entries(entries, dest, force, 0).await
+}
+
+/// Creates one archive per provenance root. Archive names are derived from
+/// each root's final path component and entries are relative to that root,
+/// rather than embedding an absolute Windows path inside the ZIP.
+pub async fn compress_fileset_per_root(
+    fileset: &FileSet,
+    destination_directory: &str,
+    force: bool,
+) -> Result<String, String> {
+    let plan = plan_fileset_per_root(fileset, destination_directory, None)?;
+    apply_archive_plan(&plan, force).await
+}
+
+pub fn plan_fileset_per_root(
+    fileset: &FileSet,
+    destination_directory: &str,
+    backup_directory: Option<&str>,
+) -> Result<ArchivePlan, String> {
+    if fileset.provenance.roots.is_empty() {
+        return Err(
+            "compress: --per-root requires root provenance (pipe directories through 'find')"
+                .to_string(),
+        );
+    }
+
+    let destination = Path::new(destination_directory);
+    if destination.exists() && !destination.is_dir() {
+        return Err(format!(
+            "compress: --per-root destination is not a directory: {}",
+            destination.display()
+        ));
+    }
+    let backup_destination = backup_directory.map(Path::new);
+    if let Some(backup) = backup_destination {
+        if backup.exists() && !backup.is_dir() {
+            return Err(format!(
+                "compress: backup destination is not a directory: {}",
+                backup.display()
+            ));
+        }
+    }
+
+    let mut archive_names = HashSet::new();
+    let mut groups = Vec::with_capacity(fileset.provenance.roots.len());
+    for root in &fileset.provenance.roots {
+        let name = root
+            .file_name()
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| format!("compress: cannot derive an archive name from {}", root.display()))?
+            .to_string_lossy()
+            .into_owned();
+        let archive_name = format!("{name}.zip");
+        if !archive_names.insert(archive_name.to_lowercase()) {
+            return Err(format!(
+                "compress: multiple roots would create the same archive name: {archive_name}"
+            ));
+        }
+        let archive = destination.join(&archive_name);
+        let backup = backup_destination.map(|directory| directory.join(&archive_name));
+        groups.push(ArchivePlanItem {
+            root: root.clone(),
+            archive,
+            backup,
+            entries: Vec::new(),
+        });
+    }
+
+    for record in &fileset.files {
+        let Some((index, root)) = fileset
+            .provenance
+            .roots
+            .iter()
+            .enumerate()
+            .filter(|(_, root)| record.path.starts_with(root))
+            .max_by_key(|(_, root)| root.components().count())
+        else {
+            return Err(format!(
+                "compress: file is outside every provenance root: {}",
+                record.path.display()
+            ));
+        };
+        let relative = record.path.strip_prefix(root).expect("matched root prefix");
+        groups[index]
+            .entries
+            .push((path_entry_name(relative), record.path.clone()));
+    }
+
+    Ok(ArchivePlan { items: groups })
+}
+
+pub async fn apply_archive_plan(plan: &ArchivePlan, force: bool) -> Result<String, String> {
+    if !force {
+        for item in &plan.items {
+            if item.archive.exists() {
+                return Err(format!(
+                    "compress: {}: destination already exists (use --force to overwrite)",
+                    item.archive.display()
+                ));
+            }
+            if let Some(backup) = &item.backup {
+                if backup.exists() {
+                    return Err(format!(
+                        "compress: {}: backup already exists (use --force to overwrite)",
+                        backup.display()
+                    ));
+                }
+            }
+        }
+    }
+
+    let mut summaries = Vec::with_capacity(plan.items.len());
+    for item in &plan.items {
+        let result = compress_entries(
+            item.entries.clone(),
+            &item.archive.to_string_lossy(),
+            force,
+            0,
+        )
+        .await;
+        if let Some(backup) = &item.backup {
+            if let Some(parent) = backup.parent() {
+                fs::create_dir_all(parent).map_err(|error| {
+                    format!("compress: could not create {}: {error}", parent.display())
+                })?;
+            }
+            fs::copy(&item.archive, backup).map_err(|error| {
+                format!(
+                    "compress: could not back up {} to {}: {error}",
+                    item.archive.display(),
+                    backup.display()
+                )
+            })?;
+        }
+        summaries.push(format!(
+            "{} -> {}{}: {result}",
+            item.root.display(),
+            item.archive.display(),
+            item.backup
+                .as_ref()
+                .map(|backup| format!(" -> {}", backup.display()))
+                .unwrap_or_default()
+        ));
+    }
+    Ok(summaries.join("\n"))
 }
 
 /// The `Table`-consuming pipeline form (`TABLE | compress DEST.zip`):
@@ -95,7 +344,7 @@ pub async fn compress_table(table: &Table, dest: &str, force: bool) -> String {
             skipped += 1;
             continue;
         };
-        entries.push((table_row_entry_name(path), path.clone()));
+        entries.push((table_row_entry_name(path), PathBuf::from(path)));
     }
     compress_entries(entries, dest, force, skipped).await
 }
@@ -111,7 +360,11 @@ pub async fn compress_table(table: &Table, dest: &str, force: bool) -> String {
 /// matters for a hand-built table with a deliberately unusual `path`
 /// value, a deliberately unhandled edge case rather than an oversight.
 fn table_row_entry_name(path: &str) -> String {
-    Path::new(path)
+    path_entry_name(Path::new(path))
+}
+
+fn path_entry_name(path: &Path) -> String {
+    path
         .components()
         .filter_map(|c| match c {
             Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
@@ -129,7 +382,7 @@ fn table_row_entry_name(path: &str) -> String {
 /// into the final count rather than needing a second counter threaded
 /// back out — the same shape `copy.rs`'s `await_copies` uses.
 async fn compress_entries(
-    entries: Vec<(String, String)>,
+    entries: Vec<(String, PathBuf)>,
     dest: &str,
     force: bool,
     mut skipped: usize,
@@ -243,27 +496,30 @@ async fn compress_entries(
 /// Runs on a blocking task: streams `src` into a complete one-entry ZIP in
 /// temporary storage. It polls Ctrl+C between chunks, keeping both memory use
 /// and interrupt latency bounded independently of the source file's size.
-fn compress_one(src: &str, name: &str, mini_path: &Path) -> Result<(), String> {
-    let mut input = fs::File::open(src).map_err(|e| format!("{src}: {e}"))?;
-    let output = fs::File::create(mini_path).map_err(|e| format!("{src}: {e}"))?;
+fn compress_one(src: &Path, name: &str, mini_path: &Path) -> Result<(), String> {
+    let mut input = fs::File::open(src).map_err(|e| format!("{}: {e}", src.display()))?;
+    let output = fs::File::create(mini_path).map_err(|e| format!("{}: {e}", src.display()))?;
     let mut mini = ZipWriter::new(output);
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     mini.start_file(name, options)
-        .map_err(|e| format!("{src}: {e}"))?;
+        .map_err(|e| format!("{}: {e}", src.display()))?;
 
     let mut buffer = vec![0u8; 256 * 1024];
     loop {
         if crate::jobctl::interrupt_requested() {
             return Err("interrupted".to_string());
         }
-        let count = input.read(&mut buffer).map_err(|e| format!("{src}: {e}"))?;
+        let count = input
+            .read(&mut buffer)
+            .map_err(|e| format!("{}: {e}", src.display()))?;
         if count == 0 {
             break;
         }
         mini.write_all(&buffer[..count])
-            .map_err(|e| format!("{src}: {e}"))?;
+            .map_err(|e| format!("{}: {e}", src.display()))?;
     }
-    mini.finish().map_err(|e| format!("{src}: {e}"))?;
+    mini.finish()
+        .map_err(|e| format!("{}: {e}", src.display()))?;
     Ok(())
 }
 
@@ -304,6 +560,7 @@ fn summary(compressed: usize, skipped: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fileset::{FileRecord, FileSet};
     use std::io::Read;
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
@@ -405,6 +662,142 @@ mod tests {
         assert!(entries.iter().any(|(_, c)| c == "nested"));
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn compress_fileset_consumes_native_paths() {
+        let dir = temp_dir("fileset");
+        let source = dir.join("folder with spaces").join("native.txt");
+        write_file(&source, "native fileset");
+        let fileset = FileSet::new(
+            vec![FileRecord::from_path(source, None).unwrap()],
+            "test",
+        );
+        let out = dir.join("out.zip");
+
+        let result = compress_fileset(&fileset, &out.to_string_lossy(), false).await;
+
+        assert_eq!(result, "ion-win: compress: compressed 1 file(s)");
+        assert_eq!(read_archive(&out).len(), 1);
+        assert_eq!(read_archive(&out)[0].1, "native fileset");
+        assert_eq!(fileset.provenance.producer, "test");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn compress_fileset_per_root_names_archives_and_uses_relative_entries() {
+        let dir = temp_dir("per-root");
+        let alpha = dir.join("alpha");
+        let beta = dir.join("beta folder");
+        let alpha_file = alpha.join("nested").join("one.txt");
+        let beta_file = beta.join("two.txt");
+        write_file(&alpha_file, "alpha");
+        write_file(&beta_file, "beta");
+        let fileset = FileSet::new(
+            vec![
+                FileRecord::from_path(alpha_file, None).unwrap(),
+                FileRecord::from_path(beta_file, None).unwrap(),
+            ],
+            "find",
+        )
+        .with_roots(vec![alpha, beta]);
+        let output = dir.join("archives");
+
+        let result = compress_fileset_per_root(&fileset, &output.to_string_lossy(), false)
+            .await
+            .unwrap();
+
+        assert!(result.contains("alpha.zip"), "{result}");
+        assert!(result.contains("beta folder.zip"), "{result}");
+        assert_eq!(
+            read_archive(&output.join("alpha.zip")),
+            vec![("nested/one.txt".to_string(), "alpha".to_string())]
+        );
+        assert_eq!(
+            read_archive(&output.join("beta folder.zip")),
+            vec![("two.txt".to_string(), "beta".to_string())]
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn compress_fileset_per_root_rejects_case_insensitive_name_collisions() {
+        let dir = temp_dir("per-root-collision");
+        let first = dir.join("one").join("Data");
+        let second = dir.join("two").join("data");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let fileset = FileSet::new(Vec::new(), "find").with_roots(vec![first, second]);
+
+        let error = compress_fileset_per_root(
+            &fileset,
+            &dir.join("archives").to_string_lossy(),
+            false,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("same archive name"), "{error}");
+        assert!(!dir.join("archives").exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn archive_plan_previews_without_writing_then_apply_creates_zip_and_backup() {
+        let dir = temp_dir("plan-apply");
+        let root = dir.join("source");
+        let source = root.join("nested").join("file.txt");
+        write_file(&source, "planned");
+        let fileset = FileSet::new(
+            vec![FileRecord::from_path(source, None).unwrap()],
+            "find",
+        )
+        .with_roots(vec![root]);
+        let archives = dir.join("archives");
+        let backups = dir.join("backups");
+
+        let plan = plan_fileset_per_root(
+            &fileset,
+            &archives.to_string_lossy(),
+            Some(&backups.to_string_lossy()),
+        )
+        .unwrap();
+        let preview = plan.to_table();
+
+        assert_eq!(preview.rows.len(), 1);
+        assert!(!archives.exists(), "planning must not create the archive directory");
+        assert!(!backups.exists(), "planning must not create the backup directory");
+
+        apply_archive_plan(&plan, false).await.unwrap();
+        let archive = archives.join("source.zip");
+        let backup = backups.join("source.zip");
+        assert_eq!(
+            read_archive(&archive),
+            vec![("nested/file.txt".to_string(), "planned".to_string())]
+        );
+        assert_eq!(fs::read(&archive).unwrap(), fs::read(&backup).unwrap());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pipeline_flags_parse_plan_apply_and_backup_safely() {
+        let parsed = parse_pipeline_flags(&[
+            "--per-root".to_string(),
+            "--plan".to_string(),
+            "--backup".to_string(),
+            "backup".to_string(),
+            "archives".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(parsed, (false, true, true, false, Some("backup".to_string()), vec!["archives".to_string()]));
+        assert!(parse_pipeline_flags(&[
+            "--per-root".to_string(),
+            "--plan".to_string(),
+            "--apply".to_string(),
+            "archives".to_string(),
+        ])
+        .unwrap_err()
+        .contains("mutually exclusive"));
     }
 
     #[tokio::test]

@@ -1,0 +1,73 @@
+# Archive each immediate subfolder of a root directory separately.
+#
+# Every subfolder is scanned recursively into its own FileSet, compressed to
+# ARCHIVE_DIRECTORY/<folder-name>.zip, and optionally copied to BACKUP_DIRECTORY.
+# Existing archives and backups are not overwritten.
+#
+# Keep ARCHIVE_DIRECTORY and BACKUP_DIRECTORY outside ROOT.
+#
+# Usage:
+#   ion-win.exe examples/archive_subfolders.ion ROOT ARCHIVE_DIRECTORY
+#   ion-win.exe examples/archive_subfolders.ion ROOT ARCHIVE_DIRECTORY BACKUP_DIRECTORY
+
+if test $len(args) -lt 3
+    echo "Usage: ion-win.exe examples/archive_subfolders.ion ROOT ARCHIVE_DIRECTORY [BACKUP_DIRECTORY]"
+    exit 2
+end
+
+if test $len(args) -gt 4
+    echo "Usage: ion-win.exe examples/archive_subfolders.ion ROOT ARCHIVE_DIRECTORY [BACKUP_DIRECTORY]"
+    exit 2
+end
+
+let root = @args[1]
+let archive_directory = @args[2]
+
+if not test -e $root
+    echo "archive-subfolders: root does not exist: $root"
+    exit 2
+end
+
+# Capture this before creating output directories, so newly created output can
+# never become an input folder during this run.
+let folder_output = $(folders --all $root)
+let subfolders = [ @lines(folder_output) ]
+let folder_count = $len(subfolders)
+
+if test $folder_count -eq 0
+    echo "archive-subfolders: no subfolders found under $root"
+    exit 1
+end
+
+if not test -e $archive_directory
+    mkdir $archive_directory
+end
+
+if test $len(args) -eq 4
+    let backup_directory = @args[3]
+    if not test -e $backup_directory
+        mkdir $backup_directory
+    end
+end
+
+echo "Archiving $folder_count subfolders from $root ..."
+
+for folder_name in @subfolders
+    let folder = "$root/$folder_name"
+    let archive = "$archive_directory/$folder_name.zip"
+    let files = find --all --recurse $folder | stat
+
+    echo "  Compressing $folder -> $archive"
+    files | compress $archive
+
+    if test $len(args) -eq 4
+        let backup_directory = @args[3]
+        echo "  Backing up $archive -> $backup_directory"
+        copy $archive $backup_directory
+    end
+end
+
+echo "Complete: created $folder_count archives in $archive_directory"
+if test $len(args) -eq 4
+    echo "Backup copies are in @args[3]"
+end

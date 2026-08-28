@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::fileset::{FileRecord, FileSet};
+
 #[derive(Clone, Copy)]
 enum EntryKind {
     Dir,
@@ -39,7 +41,7 @@ fn cat(args: &[String]) -> Result<String, String> {
     Ok(out)
 }
 
-const FIND_USAGE: &str = "find: usage: find [--all] [--recurse] [PATH]";
+const FIND_USAGE: &str = "find: usage: find [--all] [--recurse] [PATH...]";
 
 /// `find [--all] [--recurse] [PATH]` (ion-win extension, `ARCHITECTURE.md`
 /// §22): lists files under `PATH` (defaulting to `.`), optionally
@@ -53,7 +55,7 @@ const FIND_USAGE: &str = "find: usage: find [--all] [--recurse] [PATH]";
 fn find(args: &[String]) -> Result<String, String> {
     let mut include_dot = false;
     let mut recurse = false;
-    let mut path: Option<String> = None;
+    let mut paths = Vec::new();
 
     for arg in args {
         match arg.as_str() {
@@ -61,34 +63,135 @@ fn find(args: &[String]) -> Result<String, String> {
             "--recurse" | "-r" => recurse = true,
             "--help" | "-h" => return Err(FIND_USAGE.to_string()),
             _ if arg.starts_with('-') => return Err(format!("find: unknown option: {arg}")),
-            _ if path.is_none() => path = Some(arg.clone()),
-            _ => return Err(FIND_USAGE.to_string()),
+            _ => paths.push(arg.clone()),
+        }
+    }
+    if paths.is_empty() {
+        paths.push(".".to_string());
+    }
+    let mut names = Vec::new();
+    let mut valid_roots = 0usize;
+    let mut errors = Vec::new();
+    for path in paths {
+        let base = PathBuf::from(&path);
+        if let Err(error) = fs::read_dir(&base) {
+            errors.push(format!("{}: {error}", base.display()));
+            continue;
+        }
+        valid_roots += 1;
+        // An explicit root remains in every emitted path, keeping files
+        // from multiple trees unambiguous. The implicit/default `.` root
+        // is the only case rendered without a leading `./`.
+        let prefix = if path == "." {
+            String::new()
+        } else {
+            format!("{}/", path.trim_end_matches(['/', '\\']))
+        };
+        walk_files(&base, &prefix, recurse, include_dot, &mut names);
+    }
+    if valid_roots == 0 {
+        return Err(format!("find: {}", errors.join("; ")));
+    }
+    for error in errors {
+        crate::err_println!("ion-win: find: {error}");
+    }
+    names.sort();
+    names.dedup();
+    Ok(names.join("\n"))
+}
+
+/// Structured pipeline form of `files`/`folders`. Standalone invocation
+/// keeps using `capture` and its traditional newline-delimited display,
+/// while a pipeline receives native paths and metadata without reparsing
+/// filenames from text (in particular, spaces remain unambiguous).
+pub fn capture_fileset(name: &str, args: &[String]) -> Option<Result<FileSet, String>> {
+    let kind = match name {
+        "dirs" | "folders" => EntryKind::Dir,
+        "files" => EntryKind::File,
+        _ => return None,
+    };
+    Some(list_entry_paths(args, kind).and_then(|entries| {
+        let records = entries
+            .into_iter()
+            .map(|(_, path)| {
+                FileRecord::from_path(path, None)
+                    .map_err(|error| format!("{}: {error}", command_name(kind)))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(FileSet::new(records, command_name(kind)))
+    }))
+}
+
+/// Expands directory records from an incoming FileSet into file records.
+/// Paths stay native throughout; this is deliberately separate from the
+/// newline-rendering `find` provider used at the byte-pipeline boundary.
+pub fn find_in_fileset(args: &[String], roots: &FileSet) -> Result<FileSet, String> {
+    let mut include_dot = false;
+    let mut recurse = false;
+    for arg in args {
+        match arg.as_str() {
+            "--all" | "-a" => include_dot = true,
+            "--recurse" | "-r" => recurse = true,
+            "--help" | "-h" => return Err(FIND_USAGE.to_string()),
+            _ if arg.starts_with('-') => return Err(format!("find: unknown option: {arg}")),
+            _ => {
+                return Err(
+                    "find: explicit paths cannot be combined with a piped FileSet".to_string(),
+                )
+            }
         }
     }
 
-    // The accumulated prefix must start with the given PATH itself, not
-    // empty — otherwise a recursive result like "top.txt" would silently
-    // mean "find_smoke_root/top.txt" without saying so, an invalid path
-    // relative to the caller's actual cwd (exactly the kind of thing that
-    // then breaks piping straight into `stat`). The default `.` is the one
-    // exception: real Unix `find .` technically prints `./file`, but a
-    // bare `file` is just as valid relative to cwd and reads cleaner.
-    let (base, initial_prefix) = match &path {
-        Some(p) => (PathBuf::from(p), format!("{}/", p.trim_end_matches(['/', '\\']))),
-        None => (PathBuf::from("."), String::new()),
-    };
-    // The starting path failing is a clear usage error (bad argument), not
-    // a mid-scan race the way a subdirectory failing partway through the
-    // walk is — checked once, up front, and propagated as a hard error
-    // rather than silently returning an empty list.
-    if let Err(e) = fs::read_dir(&base) {
-        return Err(format!("find: {}: {e}", base.display()));
+    let mut paths = Vec::new();
+    for root in &roots.files {
+        if root.kind != crate::fileset::FileKind::Directory {
+            return Err(format!(
+                "find: piped FileSet contains a non-directory: {}",
+                root.path.display()
+            ));
+        }
+        walk_file_paths(&root.path, recurse, include_dot, &mut paths);
     }
+    paths.sort_by_key(|path| path.to_string_lossy().to_lowercase());
+    paths.dedup();
 
-    let mut names = Vec::new();
-    walk_files(&base, &initial_prefix, recurse, include_dot, &mut names);
-    names.sort();
-    Ok(names.join("\n"))
+    let records = paths
+        .into_iter()
+        .filter_map(|path| match FileRecord::from_path(path.clone(), None) {
+            Ok(record) => Some(record),
+            Err(error) => {
+                crate::err_println!("ion-win: find: {}: {error}", path.display());
+                None
+            }
+        })
+        .collect();
+    Ok(FileSet::new(records, "find").with_roots(
+        roots.files.iter().map(|record| record.path.clone()).collect(),
+    ))
+}
+
+fn walk_file_paths(dir: &Path, recurse: bool, include_dot: bool, out: &mut Vec<PathBuf>) {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            crate::err_println!("ion-win: find: {}: {error}", dir.display());
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !include_dot && name.to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            if recurse {
+                walk_file_paths(&path, recurse, include_dot, out);
+            }
+        } else {
+            out.push(path);
+        }
+    }
 }
 
 /// Recurses into `dir`, appending each file's path (prefixed with
@@ -134,6 +237,17 @@ fn pwd(args: &[String]) -> Result<String, String> {
 }
 
 fn list_entries(args: &[String], kind: EntryKind) -> Result<String, String> {
+    Ok(list_entry_paths(args, kind)?
+        .into_iter()
+        .map(|(display, _)| display)
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+fn list_entry_paths(
+    args: &[String],
+    kind: EntryKind,
+) -> Result<Vec<(String, PathBuf)>, String> {
     let mut include_dot = false;
     let mut full_paths = false;
     let mut path: Option<String> = None;
@@ -164,7 +278,7 @@ fn list_entries(args: &[String], kind: EntryKind) -> Result<String, String> {
     };
     let entries = fs::read_dir(&base)
         .map_err(|e| format!("{}: {}: {e}", command_name(kind), base.display()))?;
-    let mut names = Vec::new();
+    let mut entries_out = Vec::new();
 
     for entry in entries {
         let entry = entry.map_err(|e| format!("{}: {e}", command_name(kind)))?;
@@ -182,15 +296,21 @@ fn list_entries(args: &[String], kind: EntryKind) -> Result<String, String> {
             continue;
         }
 
-        if full_paths {
-            names.push(full_base.join(&name).to_string_lossy().into_owned());
+        let record_path = if full_paths {
+            full_base.join(&name)
         } else {
-            names.push(name);
-        }
+            base.join(&name)
+        };
+        let display = if full_paths {
+            record_path.to_string_lossy().into_owned()
+        } else {
+            name
+        };
+        entries_out.push((display, record_path));
     }
 
-    names.sort_by_key(|name| name.to_lowercase());
-    Ok(names.join("\n"))
+    entries_out.sort_by_key(|(display, _)| display.to_lowercase());
+    Ok(entries_out)
 }
 
 fn command_name(kind: EntryKind) -> &'static str {
@@ -322,6 +442,47 @@ mod tests {
     }
 
     #[test]
+    fn find_accepts_multiple_roots_and_deduplicates_results() {
+        let first = temp_dir_tree("multi-first");
+        let second = temp_dir_tree("multi-second");
+        let first_arg = first.to_string_lossy().replace('\\', "/");
+        let second_arg = second.to_string_lossy().replace('\\', "/");
+        let result = capture(
+            "find",
+            &[
+                first_arg.clone(),
+                second_arg.clone(),
+                first_arg.clone(),
+                "--recurse".to_string(),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            result,
+            format!(
+                "{first_arg}/sub/nested.txt\n{first_arg}/top.txt\n{second_arg}/sub/nested.txt\n{second_arg}/top.txt"
+            )
+        );
+        let _ = fs::remove_dir_all(first);
+        let _ = fs::remove_dir_all(second);
+    }
+
+    #[test]
+    fn find_keeps_valid_roots_when_another_root_is_missing() {
+        let root = temp_dir_tree("mixed-validity");
+        let root_arg = root.to_string_lossy().replace('\\', "/");
+        let result = capture(
+            "find",
+            &["ion-win-missing-multi-root".to_string(), root_arg.clone()],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(result, format!("{root_arg}/top.txt"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn find_reports_a_clear_error_for_a_missing_starting_path() {
         let result = capture("find", &["ion-win-definitely-does-not-exist-dir".to_string()]);
         assert!(matches!(result, Some(Err(ref e)) if e.contains("find:")));
@@ -331,5 +492,74 @@ mod tests {
     fn find_rejects_unknown_flag() {
         let result = capture("find", &["--bogus".to_string()]);
         assert!(matches!(result, Some(Err(ref e)) if e.contains("unknown option")));
+    }
+
+    #[test]
+    fn files_structured_source_preserves_native_paths_and_filters_directories() {
+        let root = temp_dir_tree("typed-files");
+        fs::write(root.join("name with spaces.txt"), "spaces").unwrap();
+        let fileset = capture_fileset(
+            "files",
+            &["--all".to_string(), root.to_string_lossy().into_owned()],
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(fileset.provenance.producer, "files");
+        assert!(fileset.files.iter().all(|record| record.kind == crate::fileset::FileKind::File));
+        assert!(fileset.files.iter().any(|record| record.path == root.join("name with spaces.txt")));
+        assert!(fileset.files.iter().any(|record| record.path == root.join(".hidden.txt")));
+        assert!(!fileset.files.iter().any(|record| record.path == root.join("sub")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn folders_structured_source_emits_directory_records() {
+        let root = temp_dir_tree("typed-folders");
+        fs::create_dir(root.join("folder with spaces")).unwrap();
+        let fileset = capture_fileset(
+            "folders",
+            &["--full".to_string(), root.to_string_lossy().into_owned()],
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(fileset.provenance.producer, "folders");
+        assert_eq!(fileset.files.len(), 2);
+        assert!(fileset.files.iter().all(|record| record.kind == crate::fileset::FileKind::Directory));
+        assert!(fileset.files.iter().all(|record| record.path.is_absolute()));
+        assert!(fileset.files.iter().any(|record| record.path.ends_with("folder with spaces")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn find_consumes_directory_fileset_recursively_without_text_roundtrip() {
+        let root = temp_dir_tree("typed-find-root");
+        fs::write(root.join("sub").join("name with spaces.txt"), "spaces").unwrap();
+        let root_record = FileRecord::from_path(root.clone(), None).unwrap();
+        let roots = FileSet::new(vec![root_record], "test");
+
+        let found = find_in_fileset(&["--recurse".to_string()], &roots).unwrap();
+
+        assert_eq!(found.provenance.producer, "find");
+        assert_eq!(found.files.len(), 3);
+        assert!(found
+            .files
+            .iter()
+            .any(|record| record.path == root.join("sub").join("name with spaces.txt")));
+        assert!(found
+            .files
+            .iter()
+            .all(|record| record.kind == crate::fileset::FileKind::File));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn find_rejects_non_directory_records_in_piped_fileset() {
+        let path = temp_file("typed-find-file.txt", "file");
+        let roots = FileSet::new(vec![FileRecord::from_path(path.clone(), None).unwrap()], "test");
+        let error = find_in_fileset(&["--recurse".to_string()], &roots).unwrap_err();
+        assert!(error.contains("non-directory"), "{error}");
+        let _ = fs::remove_file(path);
     }
 }

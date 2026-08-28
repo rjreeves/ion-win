@@ -50,6 +50,9 @@ enum Kind {
     /// exactly one trailing newline added when printed/written rather
     /// than `Cat`'s transparent passthrough.
     Find(Vec<String>),
+    /// `files`/`folders` used in a structured pipeline are native FileSet
+    /// providers. Their standalone shell forms remain newline-delimited.
+    ListEntries(String, Vec<String>),
     /// `copy`/`cp [--force] ...` (ion-win extension, `ARCHITECTURE.md`
     /// §24) — raw args, resolved at execution time into one of two forms
     /// depending on how many positional arguments remain after stripping
@@ -318,7 +321,28 @@ async fn run_impl(
                 }
             }
             Kind::Find(find_args) => {
-                drop(incoming); // lists directories, doesn't read stdin
+                let incoming = match incoming {
+                    Carry::FileSet(roots) => {
+                        match crate::fs_builtins::find_in_fileset(find_args, &roots) {
+                            Ok(fileset) => {
+                                carry = finish_fileset_stage(
+                                    fileset,
+                                    is_last,
+                                    stdout_file,
+                                    capture.as_mut().map(|slot| &mut **slot),
+                                );
+                                continue;
+                            }
+                            Err(error) => {
+                                err_println!("ion-win: {error}");
+                                unregister_spawned!();
+                                return false;
+                            }
+                        }
+                    }
+                    other => other,
+                };
+                drop(incoming);
                 match crate::fs_builtins::capture("find", find_args) {
                     Some(Ok(mut text)) => {
                         // Unlike Cat: this is a synthesized list (like
@@ -342,6 +366,25 @@ async fn run_impl(
                         return false;
                     }
                     None => unreachable!("fs_builtins::capture always recognizes \"find\""),
+                }
+            }
+            Kind::ListEntries(name, args) => {
+                drop(incoming);
+                match crate::fs_builtins::capture_fileset(name, args) {
+                    Some(Ok(fileset)) => {
+                        carry = finish_fileset_stage(
+                            fileset,
+                            is_last,
+                            stdout_file,
+                            capture.as_mut().map(|slot| &mut **slot),
+                        );
+                    }
+                    Some(Err(error)) => {
+                        err_println!("ion-win: {error}");
+                        unregister_spawned!();
+                        return false;
+                    }
+                    None => unreachable!("ListEntries only contains files/folders/dirs"),
                 }
             }
             Kind::Copy(copy_args) => {
@@ -383,7 +426,7 @@ async fn run_impl(
                             result
                         }
                         Carry::FileSet(fileset) => {
-                            let result = crate::copy::copy_table(&fileset.to_table(), dest, force).await;
+                            let result = crate::copy::copy_fileset(&fileset, dest, force).await;
                             forwarded_fileset = Some(fileset);
                             result
                         }
@@ -478,7 +521,7 @@ async fn run_impl(
                 carry = Carry::None;
             }
             Kind::Compress(compress_args) => {
-                let (force, mut positional) = match crate::compress::parse_flags(compress_args) {
+                let (force, per_root, plan_only, _apply, backup, mut positional) = match crate::compress::parse_pipeline_flags(compress_args) {
                     Ok(v) => v,
                     Err(e) => {
                         drop(incoming);
@@ -495,7 +538,80 @@ async fn run_impl(
                 let mut forwarded_table: Option<Table> = None;
                 let mut forwarded_fileset: Option<FileSet> = None;
 
-                let mut text = if positional.len() >= 2 {
+                if plan_only {
+                    if positional.len() != 1 {
+                        drop(incoming);
+                        err_println!("ion-win: compress: --plan requires one archive directory");
+                        unregister_spawned!();
+                        return false;
+                    }
+                    let plan = match incoming {
+                        Carry::FileSet(fileset) => match crate::compress::plan_fileset_per_root(
+                            &fileset,
+                            &positional[0],
+                            backup.as_deref(),
+                        ) {
+                            Ok(plan) => plan,
+                            Err(error) => {
+                                err_println!("ion-win: {error}");
+                                unregister_spawned!();
+                                return false;
+                            }
+                        },
+                        _ => {
+                            err_println!("ion-win: compress: --plan requires a FileSet with root provenance");
+                            unregister_spawned!();
+                            return false;
+                        }
+                    };
+                    carry = finish_table_stage(
+                        plan.to_table(),
+                        is_last,
+                        stdout_file,
+                        capture.as_mut().map(|slot| &mut **slot),
+                    );
+                    continue;
+                }
+
+                let mut text = if per_root {
+                    if positional.len() != 1 {
+                        drop(incoming);
+                        err_println!("ion-win: compress: --per-root requires one destination directory");
+                        unregister_spawned!();
+                        return false;
+                    }
+                    match incoming {
+                        Carry::FileSet(fileset) => {
+                            let plan = match crate::compress::plan_fileset_per_root(
+                                &fileset,
+                                &positional[0],
+                                backup.as_deref(),
+                            ) {
+                                Ok(plan) => plan,
+                                Err(error) => {
+                                    err_println!("ion-win: {error}");
+                                    unregister_spawned!();
+                                    return false;
+                                }
+                            };
+                            let result = match crate::compress::apply_archive_plan(&plan, force).await {
+                                Ok(result) => result,
+                                Err(error) => {
+                                    err_println!("ion-win: {error}");
+                                    unregister_spawned!();
+                                    return false;
+                                }
+                            };
+                            forwarded_fileset = Some(fileset);
+                            result
+                        }
+                        _ => {
+                            err_println!("ion-win: compress: --per-root requires a FileSet with root provenance");
+                            unregister_spawned!();
+                            return false;
+                        }
+                    }
+                } else if positional.len() >= 2 {
                     // Explicit files: SRC... DEST.zip. Ignores whatever
                     // was piped in, matching Copy's "explicit args win"
                     // precedent.
@@ -513,13 +629,13 @@ async fn run_impl(
                             result
                         }
                         Carry::FileSet(fileset) => {
-                            let result = crate::compress::compress_table(&fileset.to_table(), dest, force).await;
+                            let result = crate::compress::compress_fileset(&fileset, dest, force).await;
                             forwarded_fileset = Some(fileset);
                             result
                         }
                         Carry::None => {
                             err_println!(
-                                "ion-win: compress: no table piped in (pipe through 'stat' first) \
+                                "ion-win: compress: no FileSet/table piped in (pipe through 'stat' first) \
                                  and no source files given"
                             );
                             unregister_spawned!();
@@ -527,7 +643,7 @@ async fn run_impl(
                         }
                         _ => {
                             err_println!(
-                                "ion-win: compress: expected a table (pipe through 'stat' first)"
+                                "ion-win: compress: expected a FileSet or table (pipe through 'stat' first)"
                             );
                             unregister_spawned!();
                             return false;
@@ -536,7 +652,7 @@ async fn run_impl(
                 } else {
                     drop(incoming);
                     err_println!(
-                        "ion-win: compress: usage: compress [--force] SRC... DEST.zip  |  TABLE | compress [--force] DEST.zip"
+                        "ion-win: compress: usage: compress [--force] SRC... DEST.zip  |  FILESET | compress [--force] DEST.zip"
                     );
                     unregister_spawned!();
                     return false;
@@ -948,6 +1064,14 @@ async fn run_impl(
                 // Explicit file arguments always win, matching `cat`'s
                 // convention; only fall back to piped-in paths (one per
                 // line, e.g. from a future `find`) when none were given.
+                let incoming_fileset = if arg_files.is_empty() {
+                    match &incoming {
+                        Carry::FileSet(fileset) => Some(fileset.clone()),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
                 let files = if !arg_files.is_empty() {
                     drop(incoming);
                     arg_files
@@ -962,7 +1086,20 @@ async fn run_impl(
                         _ => Vec::new(),
                     }
                 };
-                let fileset = crate::stat::build_fileset(&files, hash_algo.as_deref()).await;
+                let fileset = if let Some(fileset) = incoming_fileset {
+                    if hash_algo.is_none() {
+                        fileset
+                    } else {
+                        let paths = fileset
+                            .files
+                            .iter()
+                            .map(|record| record.path.to_string_lossy().into_owned())
+                            .collect::<Vec<_>>();
+                        crate::stat::build_fileset(&paths, hash_algo.as_deref()).await
+                    }
+                } else {
+                    crate::stat::build_fileset(&files, hash_algo.as_deref()).await
+                };
                 carry = finish_fileset_stage(
                     fileset,
                     is_last,
@@ -1106,6 +1243,8 @@ fn classify_stages(pipeline: &Pipeline, interp: &Interpreter) -> Vec<Kind> {
                 Kind::Cat(args[1..].to_vec())
             } else if cmd == "find" {
                 Kind::Find(args[1..].to_vec())
+            } else if matches!(cmd.as_str(), "files" | "folders" | "dirs") {
+                Kind::ListEntries(cmd, args[1..].to_vec())
             } else if cmd == "copy" || cmd == "cp" {
                 Kind::Copy(args[1..].to_vec())
             } else if cmd == "move" || cmd == "mv" {

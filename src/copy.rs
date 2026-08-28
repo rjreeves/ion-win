@@ -83,7 +83,7 @@ pub async fn copy_files(sources: &[String], dest: &str, force: bool) -> String {
         } else {
             dest_path.to_path_buf()
         };
-        let src = src.clone();
+        let src = PathBuf::from(src);
         jobs.push((src, target));
     }
     run_copies(jobs, force, 0).await
@@ -109,7 +109,7 @@ pub async fn copy_table(table: &crate::table::Table, dest: &str, force: bool) ->
             continue;
         };
         let target = table_row_target(dest_path, path);
-        let path = path.clone();
+        let path = PathBuf::from(path);
         jobs.push((path, target));
     }
     // `skipped` seeds the tally with rows that had no `path` column at
@@ -117,10 +117,27 @@ pub async fn copy_table(table: &crate::table::Table, dest: &str, force: bool) ->
     run_copies(jobs, force, skipped).await
 }
 
+/// Typed FileSet copy path. Unlike the legacy Table adapter, this consumes
+/// native `PathBuf` values directly from `FileRecord` and never discovers
+/// sources by looking up a display column.
+pub async fn copy_fileset(fileset: &crate::fileset::FileSet, dest: &str, force: bool) -> String {
+    let dest_path = Path::new(dest);
+    let jobs = fileset
+        .files
+        .iter()
+        .map(|record| {
+            let source = record.path.clone();
+            let target = resource_target(dest_path, &source);
+            (source, target)
+        })
+        .collect();
+    run_copies(jobs, force, 0).await
+}
+
 /// Keeps a small rolling set of copies active. Copying is storage-bound, so
 /// flooding the blocking pool with one task per manifest row generally hurts
 /// rather than helps; a completed worker immediately receives the next file.
-async fn run_copies(jobs: Vec<(String, PathBuf)>, force: bool, mut skipped: usize) -> String {
+async fn run_copies(jobs: Vec<(PathBuf, PathBuf)>, force: bool, mut skipped: usize) -> String {
     let concurrency = std::thread::available_parallelism()
         .map_or(1, usize::from)
         .min(4);
@@ -180,7 +197,11 @@ async fn run_copies(jobs: Vec<(String, PathBuf)>, force: bool, mut skipped: usiz
 /// its own pure function (no file I/O) so it's testable without touching
 /// the process's actual current directory.
 fn table_row_target(dest: &Path, path: &str) -> PathBuf {
-    let stripped: PathBuf = Path::new(path)
+    resource_target(dest, Path::new(path))
+}
+
+fn resource_target(dest: &Path, path: &Path) -> PathBuf {
+    let stripped: PathBuf = path
         .components()
         .filter(|c| !matches!(c, Component::Prefix(_) | Component::RootDir))
         .collect();
@@ -195,7 +216,7 @@ fn summary(copied: usize, skipped: usize) -> String {
     }
 }
 
-fn copy_one(src: &str, dest: &Path, force: bool) -> Result<(), String> {
+fn copy_one(src: &Path, dest: &Path, force: bool) -> Result<(), String> {
     if dest.exists() && !force {
         return Err(format!(
             "{}: destination already exists (use --force to overwrite)",
@@ -204,7 +225,7 @@ fn copy_one(src: &str, dest: &Path, force: bool) -> Result<(), String> {
     }
     if let Some(parent) = dest.parent() {
         if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).map_err(|e| format!("{src}: {e}"))?;
+            fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", src.display()))?;
         }
     }
     let temp = copy_temp_path(dest);
@@ -222,27 +243,27 @@ fn copy_one(src: &str, dest: &Path, force: bool) -> Result<(), String> {
     }
     fs::rename(&temp, dest).map_err(|e| {
         let _ = fs::remove_file(&temp);
-        format!("{src}: {e}")
+        format!("{}: {e}", src.display())
     })
 }
 
-fn copy_streamed(src: &str, temp: &Path) -> Result<(), String> {
-    let mut input = fs::File::open(src).map_err(|e| format!("{src}: {e}"))?;
-    let mut output = fs::File::create(temp).map_err(|e| format!("{src}: {e}"))?;
+fn copy_streamed(src: &Path, temp: &Path) -> Result<(), String> {
+    let mut input = fs::File::open(src).map_err(|e| format!("{}: {e}", src.display()))?;
+    let mut output = fs::File::create(temp).map_err(|e| format!("{}: {e}", src.display()))?;
     let mut buffer = vec![0u8; 256 * 1024];
     loop {
         if crate::jobctl::interrupt_requested() {
             return Err("interrupted".to_string());
         }
-        let count = input.read(&mut buffer).map_err(|e| format!("{src}: {e}"))?;
+        let count = input.read(&mut buffer).map_err(|e| format!("{}: {e}", src.display()))?;
         if count == 0 {
             break;
         }
         output
             .write_all(&buffer[..count])
-            .map_err(|e| format!("{src}: {e}"))?;
+            .map_err(|e| format!("{}: {e}", src.display()))?;
     }
-    output.flush().map_err(|e| format!("{src}: {e}"))
+    output.flush().map_err(|e| format!("{}: {e}", src.display()))
 }
 
 static COPY_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -502,6 +523,23 @@ mod tests {
         let result = copy_table(&table, &dest_root.to_string_lossy(), false).await;
         assert_eq!(result, "ion-win: copy: copied 1 file(s), skipped 1");
 
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn copy_fileset_uses_typed_native_paths() {
+        let dir = temp_dir("typed-fileset");
+        let source = dir.join("source").join("nested.txt");
+        write_file(&source, "typed");
+        let fileset = crate::fileset::FileSet::new(
+            vec![crate::fileset::FileRecord::from_path(source.clone(), None).unwrap()],
+            "test",
+        );
+        let destination = dir.join("destination");
+        let result = copy_fileset(&fileset, &destination.to_string_lossy(), false).await;
+        assert_eq!(result, "ion-win: copy: copied 1 file(s)");
+        let expected = resource_target(&destination, &source);
+        assert_eq!(fs::read_to_string(expected).unwrap(), "typed");
         let _ = fs::remove_dir_all(dir);
     }
 
