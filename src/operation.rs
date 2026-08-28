@@ -16,6 +16,10 @@ enum CrashPoint {
     OutputCheckpoint,
     ArchiveBeforeBackup,
     BeforeApplied,
+    BeforeTransferMutation,
+    TransferMutated,
+    TransferCheckpoint,
+    BetweenTransferRecords,
 }
 
 fn injected_crash(selected: Option<CrashPoint>, point: CrashPoint) -> Result<(), String> {
@@ -120,8 +124,8 @@ impl OperationPlan {
             PlannedOperation::Archive(plan) => {
                 apply_archive_transaction(plan, self.force, &mut journal, state, crash).await
             },
-            PlannedOperation::Copy(plan) => apply_transfer(plan, self.force, false, &mut journal, state).await,
-            PlannedOperation::Move(plan) => apply_transfer(plan, self.force, true, &mut journal, state).await,
+            PlannedOperation::Copy(plan) => apply_transfer(plan, self.force, false, &mut journal, state, crash).await,
+            PlannedOperation::Move(plan) => apply_transfer(plan, self.force, true, &mut journal, state, crash).await,
             PlannedOperation::Delete(plan) => apply_delete(plan, &mut journal, state).await,
         };
         match result {
@@ -345,7 +349,7 @@ fn transfer_table(plan: &FileTransferPlan, operation: &str) -> Table {
     ]).collect() }
 }
 
-async fn apply_transfer(plan: &FileTransferPlan, force: bool, moving: bool, journal: &mut OperationJournal, state: &crate::state::StateHandle) -> Result<(), String> {
+async fn apply_transfer(plan: &FileTransferPlan, force: bool, moving: bool, journal: &mut OperationJournal, state: &crate::state::StateHandle, crash: Option<CrashPoint>) -> Result<(), String> {
     for item in &plan.items {
         validate_record(&item.source, "apply: source drift")?;
         match (&item.destination_before, item.destination.exists()) {
@@ -356,22 +360,75 @@ async fn apply_transfer(plan: &FileTransferPlan, force: bool, moving: bool, jour
         }
         if item.destination_before.is_some() && !force { return Err(format!("apply: {} exists (use --force when planning to replace it)", item.destination.display())); }
     }
-    for item in &plan.items {
+    for (index, item) in plan.items.iter().enumerate() {
+        injected_crash(crash, CrashPoint::BeforeTransferMutation)?;
         let source = item.source.path.clone();
         let destination = item.destination.clone();
-        let result = if moving {
-            tokio::task::spawn_blocking(move || crate::fs_ops::move_one(&source, &destination, force)).await
+        if moving {
+            let mut pending = item.source.clone();
+            pending.path = destination.clone();
+            journal.outputs.push(JournalOutput { role: "pending_move".to_string(), record: pending, original_path: Some(source.clone()) });
+            if let Err(error) = state.put_journal(journal.clone()).await {
+                journal.outputs.retain(|output| output.role != "pending_move");
+                rollback_and_checkpoint(journal, state).await;
+                return Err(format!("apply: could not persist move intent: {error}"));
+            }
+            let result = tokio::task::spawn_blocking(move || crate::fs_ops::move_one(&source, &destination, force)).await
+                .map_err(|error| format!("apply: worker failed: {error}"))?;
+            if let Err(error) = result {
+                journal.outputs.retain(|output| output.role != "pending_move");
+                rollback_and_checkpoint(journal, state).await;
+                return Err(format!("apply: {error}"));
+            }
+            injected_crash(crash, CrashPoint::TransferMutated)?;
+            journal.outputs.retain(|output| output.role != "pending_move");
         } else {
-            tokio::task::spawn_blocking(move || crate::copy::copy_one(&source, &destination, force)).await
-        }.map_err(|error| format!("apply: worker failed: {error}"))?;
-        if let Err(error) = result {
-            transactional_rollback(journal);
-            let _ = state.put_journal(journal.clone()).await;
-            return Err(format!("apply: {error}"));
+            let staging = match staging_path(&destination, &journal.id, "copy") {
+                Ok(path) => path,
+                Err(error) => {
+                    rollback_and_checkpoint(journal, state).await;
+                    return Err(error);
+                }
+            };
+            if let Err(error) = checkpoint_staging(&staging, journal, state).await {
+                rollback_and_checkpoint(journal, state).await;
+                return Err(error);
+            }
+            let staging_target = staging.clone();
+            let result = tokio::task::spawn_blocking(move || crate::copy::copy_one(&source, &staging_target, false)).await
+                .map_err(|error| format!("apply: worker failed: {error}"))?;
+            if let Err(error) = result {
+                let _ = std::fs::remove_file(&staging);
+                journal.staging_paths.retain(|path| path != &staging);
+                rollback_and_checkpoint(journal, state).await;
+                return Err(format!("apply: {error}"));
+            }
+            let mut pending = FileRecord::from_path(staging.clone(), None).map_err(|error| format!("apply: could not identify staged copy: {error}"))?;
+            pending.path = destination.clone();
+            journal.outputs.push(JournalOutput { role: "pending_copy".to_string(), record: pending, original_path: None });
+            if let Err(error) = state.put_journal(journal.clone()).await {
+                journal.outputs.retain(|output| output.role != "pending_copy");
+                journal.staging_paths.retain(|path| path != &staging);
+                let _ = std::fs::remove_file(&staging);
+                rollback_and_checkpoint(journal, state).await;
+                return Err(format!("apply: could not persist copy publication intent: {error}"));
+            }
+            if let Err(error) = publish_staged(&staging, &destination, force) {
+                journal.outputs.retain(|output| output.role != "pending_copy");
+                journal.staging_paths.retain(|path| path != &staging);
+                let _ = std::fs::remove_file(staging);
+                rollback_and_checkpoint(journal, state).await;
+                return Err(error);
+            }
+            injected_crash(crash, CrashPoint::TransferMutated)?;
+            journal.outputs.retain(|output| output.role != "pending_copy");
+            journal.staging_paths.retain(|path| path != &staging);
         }
         let record = FileRecord::from_path(item.destination.clone(), None).map_err(|error| format!("apply: could not journal {}: {error}", item.destination.display()))?;
         journal.outputs.push(JournalOutput { role: if moving { "moved" } else { "copy" }.to_string(), record, original_path: moving.then(|| item.source.path.clone()) });
         state.put_journal(journal.clone()).await?;
+        injected_crash(crash, CrashPoint::TransferCheckpoint)?;
+        if index + 1 < plan.items.len() { injected_crash(crash, CrashPoint::BetweenTransferRecords)?; }
     }
     Ok(())
 }
@@ -408,6 +465,15 @@ impl OperationJournal {
         let mut unpublished = std::collections::HashSet::new();
         for (index, output) in self.outputs.iter().enumerate() {
             if output.role.starts_with("pending_") && !output.record.path.exists() {
+                if output.role == "pending_move" {
+                    if let Some(original) = &output.original_path {
+                        let mut expected = output.record.clone();
+                        expected.path = original.clone();
+                        validate_record(&expected, "recover: move source drift")?;
+                        unpublished.insert(index);
+                        continue;
+                    }
+                }
                 let mut matched = false;
                 for staging in &self.staging_paths {
                     if staging.exists() {
@@ -823,6 +889,69 @@ mod tests {
             drop(restarted);
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[tokio::test]
+    async fn every_copy_and_move_crash_boundary_recovers_without_unexplained_files() {
+        let points = [
+            CrashPoint::InitialJournal,
+            CrashPoint::BeforeTransferMutation,
+            CrashPoint::TransferMutated,
+            CrashPoint::TransferCheckpoint,
+            CrashPoint::BetweenTransferRecords,
+            CrashPoint::BeforeApplied,
+        ];
+        for moving in [false, true] {
+            for point in points {
+                let name = format!("{}-{point:?}", if moving { "move" } else { "copy" });
+                let (root, first, mut fileset) = transfer_fixture(&name);
+                let second = first.parent().unwrap().join("second.txt");
+                std::fs::write(&second, "second typed transfer").unwrap();
+                fileset.files.push(FileRecord::from_path(second.clone(), None).unwrap());
+                let destination_root = root.join("destination");
+                let plan = if moving {
+                    OperationPlan::move_files(&fileset, &destination_root.to_string_lossy(), false).unwrap()
+                } else {
+                    OperationPlan::copy(&fileset, &destination_root.to_string_lossy(), false).unwrap()
+                };
+                let destinations = match &plan.operation {
+                    PlannedOperation::Copy(value) | PlannedOperation::Move(value) => value.items.iter().map(|item| item.destination.clone()).collect::<Vec<_>>(),
+                    _ => unreachable!(),
+                };
+                let database = root.join("recovery-state.redb");
+                let state = crate::state::spawn(database.clone()).unwrap();
+
+                let error = plan.apply_internal(&state, Some(point)).await.unwrap_err();
+                assert!(error.starts_with("__ion_test_crash__:"), "{moving}/{point:?}: {error}");
+                let journal = state.list_journals().await.unwrap().pop().unwrap();
+                let operation_id = journal.id.clone();
+                assert_eq!(journal.status, "in_progress", "{moving}/{point:?}");
+                drop(state);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+                let restarted = crate::state::spawn(database).unwrap();
+                let journal = restarted.get_journal(operation_id).await.unwrap().unwrap();
+                let recovered = journal.recover_rollback().unwrap_or_else(|error| panic!("{moving}/{point:?}: {error}"));
+                restarted.put_journal(recovered.clone()).await.unwrap();
+
+                assert_eq!(recovered.status, "rolled_back", "{moving}/{point:?}");
+                assert!(recovered.staging_paths.is_empty(), "{moving}/{point:?}");
+                assert!(first.exists() && second.exists(), "{moving}/{point:?}: a source was not restored");
+                assert!(destinations.iter().all(|path| !path.exists()), "{moving}/{point:?}: a destination survived recovery");
+                let mut unexplained = Vec::new();
+                let mut pending_dirs = vec![destination_root.clone()];
+                while let Some(directory) = pending_dirs.pop() {
+                    if !directory.exists() { continue; }
+                    for entry in std::fs::read_dir(directory).unwrap().filter_map(Result::ok) {
+                        if entry.path().is_dir() { pending_dirs.push(entry.path()); } else { unexplained.push(entry.path()); }
+                    }
+                }
+                assert!(unexplained.is_empty(), "{moving}/{point:?}: unexplained destination files: {unexplained:?}");
+                drop(restarted);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                let _ = std::fs::remove_dir_all(root);
+            }
         }
     }
 }
