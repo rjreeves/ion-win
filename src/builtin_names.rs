@@ -710,9 +710,9 @@ pub fn help_text(topic: Option<&str>) -> Result<String, String> {
         ),
         "recover" => page(
             "recover [OPERATION_ID] [--rollback|--resume]",
-            "Lists interrupted operation journals, inspects one candidate, safely rolls it back, or conservatively resumes a copy or archive operation.",
+            "Lists interrupted operation journals, inspects one candidate, safely rolls it back, or conservatively resumes a copy, move, or archive operation.",
             &["recover", "recover operation-123", "recover operation-123 --rollback", "recover operation-123 --resume"],
-            &["Resume currently supports safe copy and archive journals. Recovery fails closed on ambiguous paths or identity drift."],
+            &["Resume supports safe copy, move, and archive journals. Move resume requires exactly one identity-matching source or destination."],
         ),
         "delete" => page(
             "delete [--recurse] PATH...\n        FILESET | delete [--recurse] --plan",

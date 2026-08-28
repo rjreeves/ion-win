@@ -534,7 +534,8 @@ impl OperationJournal {
     pub async fn recover_resume(&self, state: &crate::state::StateHandle) -> Result<Self, String> {
         if !self.needs_recovery() { return Err(format!("recover: operation {} has status '{}' and does not need recovery", self.id, self.status)); }
         if self.operation == "compress" { return self.recover_resume_archive(state).await; }
-        if self.operation != "copy" { return Err(format!("recover: --resume currently supports copy and compress operations only, not {}", self.operation)); }
+        if self.operation == "move" { return self.recover_resume_move(state).await; }
+        if self.operation != "copy" { return Err(format!("recover: --resume currently supports copy, move, and compress operations only, not {}", self.operation)); }
         if !self.resume_supported { return Err(format!("recover: operation {} predates persisted resume intent; use --rollback", self.id)); }
         if !self.undo_safe { return Err(format!("recover: operation {} replaced existing destinations and cannot be safely resumed", self.id)); }
         let mut resumed = self.clone();
@@ -594,6 +595,46 @@ impl OperationJournal {
         resumed.status = "applied".to_string();
         resumed.error = None;
         resumed.finished_at = now_seconds();
+        state.put_journal(resumed.clone()).await?;
+        Ok(resumed)
+    }
+
+    async fn recover_resume_move(&self, state: &crate::state::StateHandle) -> Result<Self, String> {
+        if !self.resume_supported { return Err(format!("recover: operation {} predates persisted move intent; use --rollback", self.id)); }
+        if !self.undo_safe { return Err(format!("recover: operation {} replaced existing destinations and cannot be safely resumed", self.id)); }
+        let mut resumed = self.clone();
+        for output in resumed.outputs.iter().filter(|output| output.role == "moved") {
+            validate_record(&output.record, "recover: completed move drift")?;
+            if output.original_path.as_ref().is_some_and(|path| path.exists()) { return Err(format!("recover: completed move has both source and destination: {}", output.record.path.display())); }
+        }
+        for step in resumed.remaining_steps.clone() {
+            if step.operation != "move" { return Err(format!("recover: journal {} contains a non-move remaining step", self.id)); }
+            let pending_index = resumed.outputs.iter().position(|output| output.role == "pending_move" && output.record.path == step.destination);
+            let source_exists = step.source.path.exists();
+            let destination_exists = step.destination.exists();
+            if source_exists && destination_exists { return Err(format!("recover: move is ambiguous because both source and destination exist: {}", step.destination.display())); }
+            if !source_exists && !destination_exists { return Err(format!("recover: move is unaccounted for at both source and destination: {}", step.destination.display())); }
+
+            if source_exists {
+                validate_record(&step.source, "recover: move source drift")?;
+                if pending_index.is_none() {
+                    let mut pending = step.source.clone(); pending.path = step.destination.clone();
+                    resumed.outputs.push(JournalOutput { role: "pending_move".to_string(), record: pending, original_path: Some(step.source.path.clone()) });
+                    state.put_journal(resumed.clone()).await?;
+                }
+                crate::fs_ops::move_one(&step.source.path, &step.destination, false).map_err(|error| format!("recover: {error}"))?;
+            } else {
+                let Some(index) = pending_index else { return Err(format!("recover: destination exists without a persisted move publication intent: {}", step.destination.display())); };
+                validate_record(&resumed.outputs[index].record, "recover: moved destination drift")?;
+            }
+            resumed.outputs.retain(|output| !(output.role == "pending_move" && output.record.path == step.destination));
+            let record = FileRecord::from_path(step.destination.clone(), None).map_err(|error| format!("recover: could not checkpoint resumed move: {error}"))?;
+            resumed.outputs.push(JournalOutput { role: "moved".to_string(), record, original_path: Some(step.source.path.clone()) });
+            resumed.remaining_steps.retain(|remaining| remaining.destination != step.destination);
+            state.put_journal(resumed.clone()).await?;
+        }
+        if !resumed.remaining_steps.is_empty() { return Err(format!("recover: operation {} still has unsupported move steps", self.id)); }
+        resumed.status = "applied".to_string(); resumed.error = None; resumed.finished_at = now_seconds();
         state.put_journal(resumed.clone()).await?;
         Ok(resumed)
     }
@@ -1291,6 +1332,60 @@ mod tests {
 
         assert!(error.contains("source drift"), "{error}");
         assert!(!root.join("archives").join("source.zip").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn move_resume_completes_every_persisted_crash_state() {
+        let points = [CrashPoint::InitialJournal, CrashPoint::BeforeTransferMutation, CrashPoint::TransferMutated, CrashPoint::TransferCheckpoint, CrashPoint::BetweenTransferRecords, CrashPoint::BeforeApplied];
+        for point in points {
+            let (root, first, mut fileset) = transfer_fixture(&format!("move-resume-{point:?}"));
+            let second = first.parent().unwrap().join("second.txt");
+            std::fs::write(&second, "second resumable move").unwrap();
+            fileset.files.push(FileRecord::from_path(second.clone(), None).unwrap());
+            let destination_root = root.join("destination");
+            let plan = OperationPlan::move_files(&fileset, &destination_root.to_string_lossy(), false).unwrap();
+            let destinations = match &plan.operation { PlannedOperation::Move(value) => value.items.iter().map(|item| item.destination.clone()).collect::<Vec<_>>(), _ => unreachable!() };
+            let database = root.join("move-resume.redb");
+            let state = crate::state::spawn(database.clone()).unwrap();
+            let error = plan.apply_internal(&state, Some(point)).await.unwrap_err();
+            assert!(error.starts_with("__ion_test_crash__:"), "{point:?}: {error}");
+            let operation_id = state.list_journals().await.unwrap().pop().unwrap().id;
+            drop(state);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+            let restarted = crate::state::spawn(database).unwrap();
+            let journal = restarted.get_journal(operation_id).await.unwrap().unwrap();
+            let resumed = journal.recover_resume(&restarted).await.unwrap_or_else(|error| panic!("{point:?}: {error}"));
+
+            assert_eq!(resumed.status, "applied", "{point:?}");
+            assert!(resumed.remaining_steps.is_empty(), "{point:?}");
+            assert_eq!(resumed.outputs.iter().filter(|output| output.role == "moved").count(), 2, "{point:?}");
+            assert!(!first.exists() && !second.exists(), "{point:?}: an original source survived");
+            assert_eq!(std::fs::read_to_string(&destinations[0]).unwrap(), "typed transfer", "{point:?}");
+            assert_eq!(std::fs::read_to_string(&destinations[1]).unwrap(), "second resumable move", "{point:?}");
+            drop(restarted);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[tokio::test]
+    async fn move_resume_refuses_when_source_and_destination_both_exist() {
+        let (root, source, fileset) = transfer_fixture("move-resume-ambiguous");
+        let destination_root = root.join("destination");
+        let plan = OperationPlan::move_files(&fileset, &destination_root.to_string_lossy(), false).unwrap();
+        let destination = match &plan.operation { PlannedOperation::Move(value) => value.items[0].destination.clone(), _ => unreachable!() };
+        let state = crate::state::spawn_memory();
+        plan.apply_internal(&state, Some(CrashPoint::InitialJournal)).await.unwrap_err();
+        let journal = state.list_journals().await.unwrap().pop().unwrap();
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::hard_link(&source, &destination).unwrap();
+
+        let error = journal.recover_resume(&state).await.unwrap_err();
+
+        assert!(error.contains("both source and destination"), "{error}");
+        assert!(source.exists() && destination.exists());
         let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -905,7 +905,7 @@ async fn run_impl(
                         ("status".to_string(), journal.status),
                         ("checkpoint_count".to_string(), journal.outputs.len().to_string()),
                         ("rollback_safe".to_string(), journal.undo_safe.to_string()),
-                        ("action".to_string(), if matches!(journal.operation.as_str(), "copy" | "compress") && journal.undo_safe && journal.resume_supported { "recover <id> --resume or --rollback" } else if journal.undo_safe { "recover <id> --rollback" } else { "manual inspection required" }.to_string()),
+                        ("action".to_string(), if matches!(journal.operation.as_str(), "copy" | "move" | "compress") && journal.undo_safe && journal.resume_supported { "recover <id> --resume or --rollback" } else if journal.undo_safe { "recover <id> --rollback" } else { "manual inspection required" }.to_string()),
                     ]).collect() };
                     carry = finish_table_stage(table, is_last, stdout_file, capture.as_mut().map(|slot| &mut **slot));
                 }
