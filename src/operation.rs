@@ -41,6 +41,9 @@ pub struct OperationJournal {
     pub started_at: u64,
     pub finished_at: u64,
     pub outputs: Vec<JournalOutput>,
+    /// Exact temporary paths created by a transactional operation. These
+    /// intents are persisted before creation so crash recovery never guesses.
+    pub staging_paths: Vec<PathBuf>,
     pub undo_safe: bool,
     pub status: String,
     pub error: Option<String>,
@@ -91,7 +94,7 @@ impl OperationPlan {
             PlannedOperation::Copy(plan) | PlannedOperation::Move(plan) => plan.items.iter().all(|item| item.destination_before.is_none()),
             PlannedOperation::Delete(_) => false,
         };
-        let mut journal = OperationJournal { id: unique_id("operation"), plan_id: self.id.clone(), operation: operation.to_string(), started_at, finished_at: 0, outputs: Vec::new(), undo_safe: initially_undo_safe, status: "in_progress".to_string(), error: None, undone_at: None };
+        let mut journal = OperationJournal { id: unique_id("operation"), plan_id: self.id.clone(), operation: operation.to_string(), started_at, finished_at: 0, outputs: Vec::new(), staging_paths: Vec::new(), undo_safe: initially_undo_safe, status: "in_progress".to_string(), error: None, undone_at: None };
         state.put_journal(journal.clone()).await?;
         let result: Result<(), String> = match &self.operation {
             PlannedOperation::Archive(plan) => {
@@ -139,6 +142,10 @@ async fn apply_archive_transaction(
                 return Err(error);
             }
         };
+        if let Err(error) = checkpoint_staging(&archive_staging, journal, state).await {
+            rollback_and_checkpoint(journal, state).await;
+            return Err(error);
+        }
         let build_result = crate::compress::build_planned_archive(item, &archive_staging).await;
         if let Err(error) = build_result {
             let _ = std::fs::remove_file(&archive_staging);
@@ -150,6 +157,7 @@ async fn apply_archive_transaction(
             rollback_and_checkpoint(journal, state).await;
             return Err(error);
         }
+        journal.staging_paths.retain(|path| path != &archive_staging);
         if let Err(error) = checkpoint_output("archive", item.archive.clone(), journal, state).await {
             rollback_and_checkpoint(journal, state).await;
             return Err(error);
@@ -163,6 +171,10 @@ async fn apply_archive_transaction(
                     return Err(error);
                 }
             };
+            if let Err(error) = checkpoint_staging(&backup_staging, journal, state).await {
+                rollback_and_checkpoint(journal, state).await;
+                return Err(error);
+            }
             if let Some(parent) = backup_staging.parent() {
                 if let Err(error) = std::fs::create_dir_all(parent) {
                     rollback_and_checkpoint(journal, state).await;
@@ -179,6 +191,7 @@ async fn apply_archive_transaction(
                 rollback_and_checkpoint(journal, state).await;
                 return Err(error);
             }
+            journal.staging_paths.retain(|path| path != &backup_staging);
             if let Err(error) = checkpoint_output("backup", backup.clone(), journal, state).await {
                 rollback_and_checkpoint(journal, state).await;
                 return Err(error);
@@ -213,6 +226,15 @@ fn publish_staged(staging: &std::path::Path, destination: &std::path::Path, forc
 async fn checkpoint_output(role: &str, path: PathBuf, journal: &mut OperationJournal, state: &crate::state::StateHandle) -> Result<(), String> {
     journal.outputs.push(journal_output(role, path)?);
     state.put_journal(journal.clone()).await
+}
+
+async fn checkpoint_staging(path: &std::path::Path, journal: &mut OperationJournal, state: &crate::state::StateHandle) -> Result<(), String> {
+    journal.staging_paths.push(path.to_path_buf());
+    if let Err(error) = state.put_journal(journal.clone()).await {
+        journal.staging_paths.retain(|candidate| candidate != path);
+        return Err(format!("apply: could not persist staging intent: {error}"));
+    }
+    Ok(())
 }
 
 async fn rollback_and_checkpoint(journal: &mut OperationJournal, state: &crate::state::StateHandle) {
@@ -319,6 +341,31 @@ fn validate_record(expected: &FileRecord, label: &str) -> Result<(), String> {
 }
 
 impl OperationJournal {
+    pub fn needs_recovery(&self) -> bool {
+        matches!(self.status.as_str(), "in_progress" | "partially_applied" | "failed")
+    }
+
+    pub fn recover_rollback(&self) -> Result<Self, String> {
+        if !self.needs_recovery() {
+            return Err(format!("recover: operation {} has status '{}' and does not need recovery", self.id, self.status));
+        }
+        if !self.undo_safe { return Err(format!("recover: operation {} is not safely reversible", self.id)); }
+        for output in &self.outputs {
+            validate_record(&output.record, "recover: output drift")?;
+            if let Some(original) = &output.original_path {
+                if original.exists() { return Err(format!("recover: original path is no longer free: {}", original.display())); }
+            }
+        }
+        for path in &self.staging_paths {
+            if path.exists() {
+                std::fs::remove_file(path).map_err(|error| format!("recover: could not remove staged file {}: {error}", path.display()))?;
+            }
+        }
+        let mut recovered = self.rollback().map_err(|error| error.replacen("rollback:", "recover:", 1))?;
+        recovered.staging_paths.clear();
+        Ok(recovered)
+    }
+
     pub fn to_table(&self) -> Table {
         Table { rows: self.outputs.iter().map(|output| vec![
             ("operation_id".to_string(), self.id.clone()),
@@ -390,7 +437,7 @@ impl OperationJournal {
             "modified": output.record.modified,
             "original_path": output.original_path.as_ref().map(|path| path.to_string_lossy())
         })).collect::<Vec<_>>();
-        serde_json::json!({"version":2,"id":self.id,"plan_id":self.plan_id,"operation":self.operation,"started_at":self.started_at,"finished_at":self.finished_at,"undo_safe":self.undo_safe,"status":self.status,"error":self.error,"undone_at":self.undone_at,"outputs":outputs}).to_string()
+        serde_json::json!({"version":3,"id":self.id,"plan_id":self.plan_id,"operation":self.operation,"started_at":self.started_at,"finished_at":self.finished_at,"undo_safe":self.undo_safe,"status":self.status,"error":self.error,"undone_at":self.undone_at,"staging_paths":self.staging_paths.iter().map(|path| path.to_string_lossy()).collect::<Vec<_>>(),"outputs":outputs}).to_string()
     }
 
     pub fn from_json(text: &str) -> Result<Self, String> {
@@ -409,7 +456,8 @@ impl OperationJournal {
         }
         let undone_at = value.get("undone_at").and_then(|v| v.as_u64());
         let status = value.get("status").and_then(|v| v.as_str()).map(str::to_string).unwrap_or_else(|| if undone_at.is_some() { "undone" } else { "applied" }.to_string());
-        Ok(Self { id: required_string("id")?, plan_id: required_string("plan_id")?, operation: required_string("operation")?, started_at: required_number("started_at")?, finished_at: required_number("finished_at")?, outputs, undo_safe: value.get("undo_safe").and_then(|v| v.as_bool()).unwrap_or(false), status, error: value.get("error").and_then(|v| v.as_str()).map(str::to_string), undone_at })
+        let staging_paths = value.get("staging_paths").and_then(|v| v.as_array()).map(|values| values.iter().filter_map(|value| value.as_str().map(PathBuf::from)).collect()).unwrap_or_default();
+        Ok(Self { id: required_string("id")?, plan_id: required_string("plan_id")?, operation: required_string("operation")?, started_at: required_number("started_at")?, finished_at: required_number("finished_at")?, outputs, staging_paths, undo_safe: value.get("undo_safe").and_then(|v| v.as_bool()).unwrap_or(false), status, error: value.get("error").and_then(|v| v.as_str()).map(str::to_string), undone_at })
     }
 }
 
@@ -429,7 +477,7 @@ mod tests {
 
     #[test]
     fn journal_round_trips_persistent_json() {
-        let journal = OperationJournal { id: "operation-1".into(), plan_id: "plan-1".into(), operation: "compress".into(), started_at: 1, finished_at: 2, outputs: vec![JournalOutput { role: "archive".into(), record: FileRecord { path: "a.zip".into(), identity: FileIdentity { volume_id: Some(7), file_id: Some([3; 16]) }, kind: FileKind::File, size: 10, modified: Some(9), sha256: None }, original_path: None }], undo_safe: true, status: "applied".into(), error: None, undone_at: None };
+        let journal = OperationJournal { id: "operation-1".into(), plan_id: "plan-1".into(), operation: "compress".into(), started_at: 1, finished_at: 2, outputs: vec![JournalOutput { role: "archive".into(), record: FileRecord { path: "a.zip".into(), identity: FileIdentity { volume_id: Some(7), file_id: Some([3; 16]) }, kind: FileKind::File, size: 10, modified: Some(9), sha256: None }, original_path: None }], staging_paths: Vec::new(), undo_safe: true, status: "applied".into(), error: None, undone_at: None };
         assert_eq!(OperationJournal::from_json(&journal.to_json()).unwrap(), journal);
     }
 
@@ -444,7 +492,7 @@ mod tests {
     #[test]
     fn undo_removes_unchanged_created_outputs() {
         let (path, record) = temp_output("undo.zip", "archive");
-        let journal = OperationJournal { id: "operation-undo".into(), plan_id: "plan".into(), operation: "compress".into(), started_at: 1, finished_at: 2, outputs: vec![JournalOutput { role: "archive".into(), record, original_path: None }], undo_safe: true, status: "applied".into(), error: None, undone_at: None };
+        let journal = OperationJournal { id: "operation-undo".into(), plan_id: "plan".into(), operation: "compress".into(), started_at: 1, finished_at: 2, outputs: vec![JournalOutput { role: "archive".into(), record, original_path: None }], staging_paths: Vec::new(), undo_safe: true, status: "applied".into(), error: None, undone_at: None };
         let undone = journal.undo().unwrap();
         assert!(!path.exists());
         assert!(undone.undone_at.is_some());
@@ -454,7 +502,7 @@ mod tests {
     fn undo_validates_all_outputs_before_deleting_any() {
         let (first_path, first) = temp_output("atomic-a.zip", "first");
         let (second_path, second) = temp_output("atomic-b.zip", "second");
-        let journal = OperationJournal { id: "operation-drift".into(), plan_id: "plan".into(), operation: "compress".into(), started_at: 1, finished_at: 2, outputs: vec![JournalOutput { role: "archive".into(), record: first, original_path: None }, JournalOutput { role: "backup".into(), record: second, original_path: None }], undo_safe: true, status: "applied".into(), error: None, undone_at: None };
+        let journal = OperationJournal { id: "operation-drift".into(), plan_id: "plan".into(), operation: "compress".into(), started_at: 1, finished_at: 2, outputs: vec![JournalOutput { role: "archive".into(), record: first, original_path: None }, JournalOutput { role: "backup".into(), record: second, original_path: None }], staging_paths: Vec::new(), undo_safe: true, status: "applied".into(), error: None, undone_at: None };
         std::fs::write(&second_path, "changed-size").unwrap();
         let error = journal.undo().unwrap_err();
         assert!(error.contains("output drift"), "{error}");
@@ -535,10 +583,49 @@ mod tests {
     #[test]
     fn transactional_rollback_removes_completed_safe_copy_outputs() {
         let (path, record) = temp_output("transaction-copy.tmp", "completed copy");
-        let mut journal = OperationJournal { id: "operation-transaction".into(), plan_id: "plan".into(), operation: "copy".into(), started_at: 1, finished_at: 0, outputs: vec![JournalOutput { role: "copy".into(), record, original_path: None }], undo_safe: true, status: "in_progress".into(), error: None, undone_at: None };
+        let mut journal = OperationJournal { id: "operation-transaction".into(), plan_id: "plan".into(), operation: "copy".into(), started_at: 1, finished_at: 0, outputs: vec![JournalOutput { role: "copy".into(), record, original_path: None }], staging_paths: Vec::new(), undo_safe: true, status: "in_progress".into(), error: None, undone_at: None };
         transactional_rollback(&mut journal);
         assert_eq!(journal.status, "rolled_back");
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn recovery_rolls_back_a_crash_checkpoint_after_identity_validation() {
+        let (path, record) = temp_output("recover-copy.tmp", "checkpointed copy");
+        let journal = OperationJournal { id: "operation-recover".into(), plan_id: "plan".into(), operation: "copy".into(), started_at: 1, finished_at: 0, outputs: vec![JournalOutput { role: "copy".into(), record, original_path: None }], staging_paths: Vec::new(), undo_safe: true, status: "in_progress".into(), error: None, undone_at: None };
+        assert!(journal.needs_recovery());
+        let recovered = journal.recover_rollback().unwrap();
+        assert_eq!(recovered.status, "rolled_back");
+        assert!(!path.exists());
+        assert!(!recovered.needs_recovery());
+    }
+
+    #[test]
+    fn recovery_fails_closed_when_a_checkpointed_output_drifted() {
+        let (path, record) = temp_output("recover-drift.tmp", "before");
+        let journal = OperationJournal { id: "operation-recover-drift".into(), plan_id: "plan".into(), operation: "compress".into(), started_at: 1, finished_at: 0, outputs: vec![JournalOutput { role: "archive".into(), record, original_path: None }], staging_paths: Vec::new(), undo_safe: true, status: "partially_applied".into(), error: None, undone_at: None };
+        std::fs::write(&path, "changed and now a different size").unwrap();
+        let error = journal.recover_rollback().unwrap_err();
+        assert!(error.contains("output drift"), "{error}");
+        assert!(path.exists());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn recovery_removes_only_the_exact_persisted_staging_intent() {
+        let staged = std::env::temp_dir().join(format!("ion-win-recover-stage-{}.tmp", std::process::id()));
+        let unrelated = std::env::temp_dir().join(format!("ion-win-recover-unrelated-{}.tmp", std::process::id()));
+        std::fs::write(&staged, "partial zip").unwrap();
+        std::fs::write(&unrelated, "must survive").unwrap();
+        let journal = OperationJournal { id: "operation-stage".into(), plan_id: "plan".into(), operation: "compress".into(), started_at: 1, finished_at: 0, outputs: Vec::new(), staging_paths: vec![staged.clone()], undo_safe: true, status: "in_progress".into(), error: None, undone_at: None };
+
+        let recovered = journal.recover_rollback().unwrap();
+
+        assert_eq!(recovered.status, "rolled_back");
+        assert!(recovered.staging_paths.is_empty());
+        assert!(!staged.exists());
+        assert!(unrelated.exists());
+        let _ = std::fs::remove_file(unrelated);
     }
 
     #[tokio::test]

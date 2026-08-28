@@ -76,6 +76,7 @@ enum Kind {
     Apply(Vec<String>),
     Undo(Vec<String>),
     Rollback(Vec<String>),
+    Recover(Vec<String>),
     Journal(Vec<String>),
     /// `delete [--recurse] [--permanent --force] [PATH...]`. With
     /// explicit paths it ignores pipeline input; with no paths it consumes
@@ -829,6 +830,75 @@ async fn run_impl(
                 if let Err(error) = state.put_journal(rolled_back.clone()).await { err_println!("ion-win: rollback: journal update failed: {error}"); }
                 carry = finish_operation_journal_stage(rolled_back, is_last, stdout_file, capture.as_mut().map(|slot| &mut **slot));
             }
+            Kind::Recover(args) => {
+                drop(incoming);
+                let rollback = args.iter().any(|arg| arg == "--rollback");
+                let positional = args.iter().filter(|arg| arg.as_str() != "--rollback").collect::<Vec<_>>();
+                if positional.len() > 1 || args.iter().any(|arg| arg.starts_with("--") && arg != "--rollback") {
+                    err_println!("ion-win: recover: usage: recover [OPERATION_ID] [--rollback]");
+                    unregister_spawned!();
+                    return false;
+                }
+                if rollback && positional.is_empty() {
+                    err_println!("ion-win: recover: --rollback requires an operation ID");
+                    unregister_spawned!();
+                    return false;
+                }
+                if let Some(id) = positional.first() {
+                    let journal = match state.get_journal(id.as_str()).await {
+                        Ok(Some(journal)) => journal,
+                        Ok(None) => {
+                            err_println!("ion-win: recover: operation not found: {id}");
+                            unregister_spawned!();
+                            return false;
+                        }
+                        Err(error) => {
+                            err_println!("ion-win: recover: {error}");
+                            unregister_spawned!();
+                            return false;
+                        }
+                    };
+                    if !journal.needs_recovery() {
+                        err_println!("ion-win: recover: operation {} has status '{}' and does not need recovery", journal.id, journal.status);
+                        unregister_spawned!();
+                        return false;
+                    }
+                    if rollback {
+                        let recovered = match journal.recover_rollback() {
+                            Ok(journal) => journal,
+                            Err(error) => {
+                                err_println!("ion-win: {error}");
+                                unregister_spawned!();
+                                return false;
+                            }
+                        };
+                        if let Err(error) = state.put_journal(recovered.clone()).await {
+                            err_println!("ion-win: recover: rollback completed but journal persistence failed: {error}");
+                        }
+                        carry = finish_operation_journal_stage(recovered, is_last, stdout_file, capture.as_mut().map(|slot| &mut **slot));
+                    } else {
+                        carry = finish_operation_journal_stage(journal, is_last, stdout_file, capture.as_mut().map(|slot| &mut **slot));
+                    }
+                } else {
+                    let journals = match state.list_journals().await {
+                        Ok(journals) => journals,
+                        Err(error) => {
+                            err_println!("ion-win: recover: {error}");
+                            unregister_spawned!();
+                            return false;
+                        }
+                    };
+                    let table = Table { rows: journals.into_iter().filter(OperationJournal::needs_recovery).map(|journal| vec![
+                        ("operation_id".to_string(), journal.id),
+                        ("operation".to_string(), journal.operation),
+                        ("status".to_string(), journal.status),
+                        ("checkpoint_count".to_string(), journal.outputs.len().to_string()),
+                        ("rollback_safe".to_string(), journal.undo_safe.to_string()),
+                        ("action".to_string(), if journal.undo_safe { "recover <id> --rollback" } else { "manual inspection required" }.to_string()),
+                    ]).collect() };
+                    carry = finish_table_stage(table, is_last, stdout_file, capture.as_mut().map(|slot| &mut **slot));
+                }
+            }
             Kind::Journal(args) => {
                 drop(incoming);
                 if args.len() > 1 {
@@ -1525,6 +1595,8 @@ fn classify_stages(pipeline: &Pipeline, interp: &Interpreter) -> Vec<Kind> {
                 Kind::Undo(args[1..].to_vec())
             } else if cmd == "rollback" {
                 Kind::Rollback(args[1..].to_vec())
+            } else if cmd == "recover" {
+                Kind::Recover(args[1..].to_vec())
             } else if cmd == "journal" {
                 Kind::Journal(args[1..].to_vec())
             } else if cmd == "delete" {

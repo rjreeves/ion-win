@@ -348,6 +348,11 @@ pub const BUILTINS: &[Builtin] = &[
         help_display: Some("JOURNAL | rollback"),
     },
     Builtin {
+        name: "recover",
+        is_keyword: false,
+        help_display: Some("recover [OPERATION_ID] [--rollback]"),
+    },
+    Builtin {
         name: "task",
         is_keyword: false,
         help_display: Some("task create|list|show|delete|run"),
@@ -702,6 +707,12 @@ pub fn help_text(topic: Option<&str>) -> Result<String, String> {
             "Rolls back checkpointed outputs from an unfinished or partially applied operation.",
             &["journal operation-123 | rollback"],
             &["Rollback validates every checkpointed output and refuses operations that replaced pre-existing destinations."],
+        ),
+        "recover" => page(
+            "recover [OPERATION_ID] [--rollback]",
+            "Lists interrupted operation journals, inspects one recovery candidate, or safely rolls it back after FileIdentity validation.",
+            &["recover", "recover operation-123", "recover operation-123 --rollback"],
+            &["Recovery fails closed if an output changed after its checkpoint. Non-reversible operations require manual inspection."],
         ),
         "delete" => page(
             "delete [--recurse] PATH...\n        FILESET | delete [--recurse] --plan",
