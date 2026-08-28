@@ -24,10 +24,11 @@
 //! regardless of which task actually finishes first.
 
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-const COPY_USAGE: &str =
-    "copy: usage: copy [--force] SRC... DEST  |  TABLE | copy [--force] DEST";
+const COPY_USAGE: &str = "copy: usage: copy [--force] SRC... DEST  |  TABLE | copy [--force] DEST";
 
 /// Splits `--force`/`-f` and `--help`/`-h` out of `args`, returning
 /// (force, remaining positional arguments). Shared between `copy`'s
@@ -71,7 +72,7 @@ pub async fn copy_files(sources: &[String], dest: &str, force: bool) -> String {
     let dest_is_dir =
         dest_path.is_dir() || sources.len() > 1 || dest.ends_with('/') || dest.ends_with('\\');
 
-    let mut handles = Vec::with_capacity(sources.len());
+    let mut jobs = Vec::with_capacity(sources.len());
     for src in sources {
         let target = if dest_is_dir {
             let name = Path::new(src)
@@ -83,9 +84,9 @@ pub async fn copy_files(sources: &[String], dest: &str, force: bool) -> String {
             dest_path.to_path_buf()
         };
         let src = src.clone();
-        handles.push(tokio::task::spawn_blocking(move || copy_one(&src, &target, force)));
+        jobs.push((src, target));
     }
-    await_copies(handles, 0).await
+    run_copies(jobs, force, 0).await
 }
 
 /// The `Table`-consuming pipeline form (`TABLE | copy DEST`): copies
@@ -99,7 +100,7 @@ pub async fn copy_files(sources: &[String], dest: &str, force: bool) -> String {
 /// list thousands of files.
 pub async fn copy_table(table: &crate::table::Table, dest: &str, force: bool) -> String {
     let dest_path = Path::new(dest);
-    let mut handles = Vec::with_capacity(table.rows.len());
+    let mut jobs = Vec::with_capacity(table.rows.len());
     let mut skipped = 0usize;
     for row in &table.rows {
         let Some((_, path)) = row.iter().find(|(k, _)| k == "path") else {
@@ -109,26 +110,41 @@ pub async fn copy_table(table: &crate::table::Table, dest: &str, force: bool) ->
         };
         let target = table_row_target(dest_path, path);
         let path = path.clone();
-        handles.push(tokio::task::spawn_blocking(move || copy_one(&path, &target, force)));
+        jobs.push((path, target));
     }
     // `skipped` seeds the tally with rows that had no `path` column at
     // all, so they're never spawned as a task in the first place.
-    await_copies(handles, skipped).await
+    run_copies(jobs, force, skipped).await
 }
 
-/// Awaits every blocking copy task in the order it was spawned (each
-/// already runs concurrently on tokio's blocking thread pool regardless
-/// of await order) and tallies the result on top of `skipped`, an initial
-/// count of items that never became a task at all — shared by both
-/// `copy_files` and `copy_table`.
-async fn await_copies(
-    handles: Vec<tokio::task::JoinHandle<Result<(), String>>>,
-    mut skipped: usize,
-) -> String {
+/// Keeps a small rolling set of copies active. Copying is storage-bound, so
+/// flooding the blocking pool with one task per manifest row generally hurts
+/// rather than helps; a completed worker immediately receives the next file.
+async fn run_copies(jobs: Vec<(String, PathBuf)>, force: bool, mut skipped: usize) -> String {
+    let concurrency = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(4);
+    let mut pending = jobs.into_iter();
+    let mut active = tokio::task::JoinSet::new();
     let mut copied = 0usize;
-    for handle in handles {
-        match handle.await {
+    let mut interrupted = false;
+
+    loop {
+        if crate::jobctl::interrupt_requested() {
+            interrupted = true;
+        }
+        while active.len() < concurrency && !crate::jobctl::interrupt_requested() {
+            let Some((src, target)) = pending.next() else {
+                break;
+            };
+            active.spawn_blocking(move || copy_one(&src, &target, force));
+        }
+        if active.is_empty() {
+            break;
+        }
+        match active.join_next().await.expect("active set is not empty") {
             Ok(Ok(())) => copied += 1,
+            Ok(Err(e)) if e == "interrupted" => interrupted = true,
             Ok(Err(e)) => {
                 crate::err_println!("ion-win: copy: {e}");
                 skipped += 1;
@@ -138,8 +154,17 @@ async fn await_copies(
                 skipped += 1;
             }
         }
+        if crate::jobctl::interrupt_requested() {
+            interrupted = true;
+        }
     }
-    summary(copied, skipped)
+
+    if interrupted {
+        let _ = crate::jobctl::take_interrupt();
+        "ion-win: copy: interrupted".to_string()
+    } else {
+        summary(copied, skipped)
+    }
 }
 
 /// Computes where a table row's `path` column lands under `dest`,
@@ -182,8 +207,50 @@ fn copy_one(src: &str, dest: &Path, force: bool) -> Result<(), String> {
             fs::create_dir_all(parent).map_err(|e| format!("{src}: {e}"))?;
         }
     }
-    fs::copy(src, dest).map_err(|e| format!("{src}: {e}"))?;
-    Ok(())
+    let temp = copy_temp_path(dest);
+    let result = copy_streamed(src, &temp);
+    if let Err(e) = result {
+        let _ = fs::remove_file(&temp);
+        return Err(e);
+    }
+    if crate::jobctl::interrupt_requested() {
+        let _ = fs::remove_file(&temp);
+        return Err("interrupted".to_string());
+    }
+    if force && dest.exists() {
+        fs::remove_file(dest).map_err(|e| format!("{}: {e}", dest.display()))?;
+    }
+    fs::rename(&temp, dest).map_err(|e| {
+        let _ = fs::remove_file(&temp);
+        format!("{src}: {e}")
+    })
+}
+
+fn copy_streamed(src: &str, temp: &Path) -> Result<(), String> {
+    let mut input = fs::File::open(src).map_err(|e| format!("{src}: {e}"))?;
+    let mut output = fs::File::create(temp).map_err(|e| format!("{src}: {e}"))?;
+    let mut buffer = vec![0u8; 256 * 1024];
+    loop {
+        if crate::jobctl::interrupt_requested() {
+            return Err("interrupted".to_string());
+        }
+        let count = input.read(&mut buffer).map_err(|e| format!("{src}: {e}"))?;
+        if count == 0 {
+            break;
+        }
+        output
+            .write_all(&buffer[..count])
+            .map_err(|e| format!("{src}: {e}"))?;
+    }
+    output.flush().map_err(|e| format!("{src}: {e}"))
+}
+
+static COPY_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+fn copy_temp_path(dest: &Path) -> PathBuf {
+    let id = COPY_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    let name = dest.file_name().unwrap_or_default().to_string_lossy();
+    dest.with_file_name(format!(".{name}.ion-copy-{}-{id}.tmp", std::process::id()))
 }
 
 #[cfg(test)]
@@ -215,8 +282,12 @@ mod tests {
         write_file(&src, "hello");
         let dest = dir.join("renamed.txt");
 
-        let result =
-            copy_files(&[src.to_string_lossy().into_owned()], &dest.to_string_lossy(), false).await;
+        let result = copy_files(
+            &[src.to_string_lossy().into_owned()],
+            &dest.to_string_lossy(),
+            false,
+        )
+        .await;
         assert_eq!(result, "ion-win: copy: copied 1 file(s)");
         assert_eq!(fs::read_to_string(&dest).unwrap(), "hello");
 
@@ -233,7 +304,10 @@ mod tests {
         let out = dir.join("out");
 
         let result = copy_files(
-            &[a.to_string_lossy().into_owned(), b.to_string_lossy().into_owned()],
+            &[
+                a.to_string_lossy().into_owned(),
+                b.to_string_lossy().into_owned(),
+            ],
             &out.to_string_lossy(),
             false,
         )
@@ -253,10 +327,18 @@ mod tests {
         write_file(&src, "new");
         write_file(&dest, "old");
 
-        let result =
-            copy_files(&[src.to_string_lossy().into_owned()], &dest.to_string_lossy(), false).await;
+        let result = copy_files(
+            &[src.to_string_lossy().into_owned()],
+            &dest.to_string_lossy(),
+            false,
+        )
+        .await;
         assert_eq!(result, "ion-win: copy: copied 0 file(s), skipped 1");
-        assert_eq!(fs::read_to_string(&dest).unwrap(), "old", "must not have been overwritten");
+        assert_eq!(
+            fs::read_to_string(&dest).unwrap(),
+            "old",
+            "must not have been overwritten"
+        );
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -269,8 +351,12 @@ mod tests {
         write_file(&src, "new");
         write_file(&dest, "old");
 
-        let result =
-            copy_files(&[src.to_string_lossy().into_owned()], &dest.to_string_lossy(), true).await;
+        let result = copy_files(
+            &[src.to_string_lossy().into_owned()],
+            &dest.to_string_lossy(),
+            true,
+        )
+        .await;
         assert_eq!(result, "ion-win: copy: copied 1 file(s)");
         assert_eq!(fs::read_to_string(&dest).unwrap(), "new");
 
@@ -286,7 +372,10 @@ mod tests {
         let out = dir.join("out");
 
         let result = copy_files(
-            &[missing.to_string_lossy().into_owned(), a.to_string_lossy().into_owned()],
+            &[
+                missing.to_string_lossy().into_owned(),
+                a.to_string_lossy().into_owned(),
+            ],
             &out.to_string_lossy(),
             false,
         )
@@ -322,13 +411,20 @@ mod tests {
     #[test]
     fn table_row_target_strips_the_root_from_an_absolute_path() {
         let dest = Path::new("dest");
-        let absolute = if cfg!(windows) { r"C:\Users\Bob\data.txt" } else { "/home/bob/data.txt" };
+        let absolute = if cfg!(windows) {
+            r"C:\Users\Bob\data.txt"
+        } else {
+            "/home/bob/data.txt"
+        };
         let target = table_row_target(dest, absolute);
         assert!(
             target.starts_with(dest),
             "expected {target:?} to land under {dest:?}, not replace it"
         );
-        assert!(!target.is_absolute(), "expected {target:?} to no longer be absolute");
+        assert!(
+            !target.is_absolute(),
+            "expected {target:?} to no longer be absolute"
+        );
     }
 
     /// End-to-end confirmation via real file I/O with absolute source
@@ -344,10 +440,17 @@ mod tests {
 
         let table = Table {
             rows: vec![
-                vec![("path".to_string(), src_root.join("top.txt").to_string_lossy().into_owned())],
                 vec![(
                     "path".to_string(),
-                    src_root.join("sub").join("nested.txt").to_string_lossy().into_owned(),
+                    src_root.join("top.txt").to_string_lossy().into_owned(),
+                )],
+                vec![(
+                    "path".to_string(),
+                    src_root
+                        .join("sub")
+                        .join("nested.txt")
+                        .to_string_lossy()
+                        .into_owned(),
                 )],
             ],
         };
@@ -389,7 +492,10 @@ mod tests {
 
         let table = Table {
             rows: vec![
-                vec![("path".to_string(), src_root.join("ok.txt").to_string_lossy().into_owned())],
+                vec![(
+                    "path".to_string(),
+                    src_root.join("ok.txt").to_string_lossy().into_owned(),
+                )],
                 vec![("name".to_string(), "no-path-here".to_string())],
             ],
         };
@@ -434,7 +540,9 @@ mod tests {
 
     #[tokio::test]
     async fn parse_and_copy_files_requires_at_least_one_source_and_a_destination() {
-        let err = parse_and_copy_files(&["only-one-arg".to_string()]).await.unwrap_err();
+        let err = parse_and_copy_files(&["only-one-arg".to_string()])
+            .await
+            .unwrap_err();
         assert!(err.contains("usage"), "{err}");
     }
 }

@@ -6,6 +6,7 @@
 
 use crate::table::{Row, Table};
 use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::time::UNIX_EPOCH;
 
 /// Parses `stat`'s arguments into (file paths, optional hash algorithm).
@@ -57,11 +58,21 @@ fn stat_one(path: &str, hash_algo: Option<&str>) -> Result<Row, String> {
     ];
 
     if let Some(algo) = hash_algo {
-        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
         let digest = match algo {
             "sha256" => {
                 let mut hasher = Sha256::new();
-                hasher.update(&bytes);
+                let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+                let mut buffer = vec![0u8; 256 * 1024];
+                loop {
+                    if crate::jobctl::interrupt_requested() {
+                        return Err("interrupted".to_string());
+                    }
+                    let count = file.read(&mut buffer).map_err(|e| e.to_string())?;
+                    if count == 0 {
+                        break;
+                    }
+                    hasher.update(&buffer[..count]);
+                }
                 format!("{:x}", hasher.finalize())
             }
             other => return Err(format!("unsupported hash algorithm '{other}'")),
@@ -88,24 +99,51 @@ fn stat_one(path: &str, hash_algo: Option<&str>) -> Result<Row, String> {
 /// results for every other file.
 pub async fn build_table(files: &[String], hash_algo: Option<&str>) -> Table {
     let algo_owned = hash_algo.map(str::to_string);
-    let mut handles = Vec::with_capacity(files.len());
-    for path in files {
-        let path = path.clone();
-        let algo = algo_owned.clone();
-        handles.push(tokio::task::spawn_blocking(move || {
-            stat_one(&path, algo.as_deref())
-        }));
-    }
+    let concurrency = if hash_algo.is_some() {
+        std::thread::available_parallelism().map_or(1, usize::from)
+    } else {
+        std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(4)
+    };
+    let mut pending = files.iter().cloned().enumerate();
+    let mut active = tokio::task::JoinSet::new();
+    let mut ordered: Vec<Option<Row>> = vec![None; files.len()];
+    let mut interrupted = false;
 
-    let mut rows = Vec::with_capacity(files.len());
-    for (path, handle) in files.iter().zip(handles) {
-        match handle.await {
-            Ok(Ok(row)) => rows.push(row),
-            Ok(Err(e)) => crate::err_println!("ion-win: stat: {path}: {e}"),
-            Err(e) => crate::err_println!("ion-win: stat: {path}: task failed: {e}"),
+    loop {
+        if crate::jobctl::interrupt_requested() {
+            interrupted = true;
+        }
+        while active.len() < concurrency && !crate::jobctl::interrupt_requested() {
+            let Some((index, path)) = pending.next() else {
+                break;
+            };
+            let algo = algo_owned.clone();
+            active.spawn_blocking(move || {
+                let result = stat_one(&path, algo.as_deref());
+                (index, path, result)
+            });
+        }
+        if active.is_empty() {
+            break;
+        }
+        match active.join_next().await.expect("active set is not empty") {
+            Ok((index, _, Ok(row))) => ordered[index] = Some(row),
+            Ok((_, _, Err(e))) if e == "interrupted" => interrupted = true,
+            Ok((_, path, Err(e))) => crate::err_println!("ion-win: stat: {path}: {e}"),
+            Err(e) => crate::err_println!("ion-win: stat: task failed: {e}"),
+        }
+        if crate::jobctl::interrupt_requested() {
+            interrupted = true;
         }
     }
-    Table { rows }
+    if interrupted {
+        let _ = crate::jobctl::take_interrupt();
+    }
+    Table {
+        rows: ordered.into_iter().flatten().collect(),
+    }
 }
 
 #[cfg(test)]
@@ -165,7 +203,11 @@ mod tests {
             "ion-win-definitely-does-not-exist-99999.txt".to_string(),
         ];
         let table = build_table(&files, None).await;
-        assert_eq!(table.rows.len(), 1, "the missing file should be skipped, not error out");
+        assert_eq!(
+            table.rows.len(),
+            1,
+            "the missing file should be skipped, not error out"
+        );
         assert_eq!(field(&table.rows[0], "size"), Some("5".to_string()));
         assert_eq!(field(&table.rows[0], "is_dir"), Some("false".to_string()));
 
@@ -196,11 +238,17 @@ mod tests {
         let mut paths = Vec::new();
         for i in 0..8 {
             let mut path = std::env::temp_dir();
-            path.push(format!("ion-win-stat-order-test-{}-{i}.txt", std::process::id()));
+            path.push(format!(
+                "ion-win-stat-order-test-{}-{i}.txt",
+                std::process::id()
+            ));
             std::fs::write(&path, format!("file-{i}")).unwrap();
             paths.push(path);
         }
-        let files: Vec<String> = paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        let files: Vec<String> = paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
 
         let table = build_table(&files, Some("sha256")).await;
         let got_paths: Vec<String> = table
