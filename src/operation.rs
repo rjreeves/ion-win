@@ -8,13 +8,28 @@ use std::time::{SystemTime, UNIX_EPOCH};
 static OPERATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PlannedOperation { Archive(ArchivePlan) }
+pub enum PlannedOperation { Archive(ArchivePlan), Copy(FileTransferPlan), Move(FileTransferPlan), Delete(DeletePlan) }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletePlan { pub items: Vec<FileRecord>, pub options: crate::delete::DeleteOptions }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileTransferPlan {
+    pub items: Vec<FileTransferPlanItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileTransferPlanItem {
+    pub source: FileRecord,
+    pub destination: PathBuf,
+    pub destination_before: Option<FileRecord>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationPlan { pub id: String, pub operation: PlannedOperation, pub force: bool }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct JournalOutput { pub role: String, pub record: FileRecord }
+pub struct JournalOutput { pub role: String, pub record: FileRecord, pub original_path: Option<PathBuf> }
 
 /// Durable evidence of what an operation actually created. Undo trusts these
 /// post-write identities, never just the paths from the original plan.
@@ -27,6 +42,8 @@ pub struct OperationJournal {
     pub finished_at: u64,
     pub outputs: Vec<JournalOutput>,
     pub undo_safe: bool,
+    pub status: String,
+    pub error: Option<String>,
     pub undone_at: Option<u64>,
 }
 
@@ -41,33 +58,172 @@ fn unique_id(prefix: &str) -> String {
 impl OperationPlan {
     pub fn archive(plan: ArchivePlan, force: bool) -> Self { Self { id: unique_id("plan"), operation: PlannedOperation::Archive(plan), force } }
 
+    pub fn copy(fileset: &crate::fileset::FileSet, destination: &str, force: bool) -> Result<Self, String> {
+        Ok(Self { id: unique_id("plan"), operation: PlannedOperation::Copy(plan_transfer(fileset, destination, crate::copy::resource_target, "copy")?), force })
+    }
+
+    pub fn move_files(fileset: &crate::fileset::FileSet, destination: &str, force: bool) -> Result<Self, String> {
+        Ok(Self { id: unique_id("plan"), operation: PlannedOperation::Move(plan_transfer(fileset, destination, crate::fs_ops::resource_target, "move")?), force })
+    }
+
+    pub fn delete(fileset: &crate::fileset::FileSet, options: crate::delete::DeleteOptions) -> Result<Self, String> {
+        if options.permanent { return Err("delete: --plan does not support permanent deletion".to_string()); }
+        for item in &fileset.files { crate::delete::validate_planned(&item.path, options)?; }
+        Ok(Self { id: unique_id("plan"), operation: PlannedOperation::Delete(DeletePlan { items: fileset.files.clone(), options }), force: false })
+    }
+
     pub fn to_table(&self) -> Table {
-        let mut table = match &self.operation { PlannedOperation::Archive(plan) => plan.to_table() };
+        let mut table = match &self.operation {
+            PlannedOperation::Archive(plan) => plan.to_table(),
+            PlannedOperation::Copy(plan) => transfer_table(plan, "copy"),
+            PlannedOperation::Move(plan) => transfer_table(plan, "move"),
+            PlannedOperation::Delete(plan) => Table { rows: plan.items.iter().map(|item| vec![("operation".to_string(), "delete".to_string()), ("path".to_string(), item.path.to_string_lossy().into_owned()), ("kind".to_string(), kind_name(&item.kind).to_string()), ("recurse".to_string(), plan.options.recurse.to_string()), ("mode".to_string(), "recycle".to_string()), ("undo_safe".to_string(), "false".to_string())]).collect() },
+        };
         for row in &mut table.rows { row.insert(0, ("plan_id".to_string(), self.id.clone())); }
         table
     }
 
-    pub async fn apply(&self) -> Result<OperationJournal, String> {
+    pub async fn apply(&self, state: &crate::state::StateHandle) -> Result<OperationJournal, String> {
         let started_at = now_seconds();
-        let outputs = match &self.operation {
-            PlannedOperation::Archive(plan) => {
-                let undo_safe = plan.items.iter().all(|item| !item.archive.exists() && item.backup.as_ref().is_none_or(|path| !path.exists()));
-                crate::compress::apply_archive_plan(plan, self.force).await?;
-                let mut outputs = Vec::new();
-                for item in &plan.items {
-                    outputs.push(journal_output("archive", item.archive.clone())?);
-                    if let Some(backup) = &item.backup { outputs.push(journal_output("backup", backup.clone())?); }
-                }
-                (outputs, undo_safe)
-            }
+        let operation = match &self.operation { PlannedOperation::Archive(_) => "compress", PlannedOperation::Copy(_) => "copy", PlannedOperation::Move(_) => "move", PlannedOperation::Delete(_) => "delete" };
+        let initially_undo_safe = match &self.operation {
+            PlannedOperation::Archive(plan) => plan.items.iter().all(|item| !item.archive.exists() && item.backup.as_ref().is_none_or(|path| !path.exists())),
+            PlannedOperation::Copy(plan) | PlannedOperation::Move(plan) => plan.items.iter().all(|item| item.destination_before.is_none()),
+            PlannedOperation::Delete(_) => false,
         };
-        Ok(OperationJournal { id: unique_id("operation"), plan_id: self.id.clone(), operation: "compress".to_string(), started_at, finished_at: now_seconds(), outputs: outputs.0, undo_safe: outputs.1, undone_at: None })
+        let mut journal = OperationJournal { id: unique_id("operation"), plan_id: self.id.clone(), operation: operation.to_string(), started_at, finished_at: 0, outputs: Vec::new(), undo_safe: initially_undo_safe, status: "in_progress".to_string(), error: None, undone_at: None };
+        state.put_journal(journal.clone()).await?;
+        let result: Result<(), String> = match &self.operation {
+            PlannedOperation::Archive(plan) => {
+                match crate::compress::apply_archive_plan(plan, self.force).await {
+                    Ok(_) => {
+                        for item in &plan.items {
+                            journal.outputs.push(journal_output("archive", item.archive.clone())?);
+                            if let Some(backup) = &item.backup { journal.outputs.push(journal_output("backup", backup.clone())?); }
+                        }
+                        state.put_journal(journal.clone()).await
+                    }
+                    Err(error) => Err(error),
+                }
+            },
+            PlannedOperation::Copy(plan) => apply_transfer(plan, self.force, false, &mut journal, state).await,
+            PlannedOperation::Move(plan) => apply_transfer(plan, self.force, true, &mut journal, state).await,
+            PlannedOperation::Delete(plan) => apply_delete(plan, &mut journal, state).await,
+        };
+        match result {
+            Ok(()) => {
+                journal.status = "applied".to_string();
+                journal.finished_at = now_seconds();
+                state.put_journal(journal.clone()).await?;
+                Ok(journal)
+            }
+            Err(error) => {
+                if journal.status == "in_progress" { journal.status = "failed".to_string(); }
+                journal.error = Some(error.clone());
+                journal.finished_at = now_seconds();
+                let _ = state.put_journal(journal.clone()).await;
+                Err(format!("{error} (journal {})", journal.id))
+            }
+        }
     }
+}
+
+async fn apply_delete(plan: &DeletePlan, journal: &mut OperationJournal, state: &crate::state::StateHandle) -> Result<(), String> {
+    for item in &plan.items {
+        validate_record(item, "apply: source drift")?;
+        crate::delete::validate_planned(&item.path, plan.options)?;
+    }
+    for item in &plan.items {
+        let path = item.path.clone();
+        let options = plan.options;
+        let result = tokio::task::spawn_blocking(move || crate::delete::delete_planned(&path, options)).await.map_err(|error| format!("apply: delete worker failed: {error}"))?;
+        if let Err(error) = result {
+            journal.status = if journal.outputs.is_empty() { "failed" } else { "partially_applied" }.to_string();
+            let _ = state.put_journal(journal.clone()).await;
+            return Err(format!("apply: delete: {error}"));
+        }
+        journal.outputs.push(JournalOutput { role: "recycled".to_string(), record: item.clone(), original_path: Some(item.path.clone()) });
+        state.put_journal(journal.clone()).await?;
+    }
+    Ok(())
 }
 
 fn journal_output(role: &str, path: PathBuf) -> Result<JournalOutput, String> {
     let record = FileRecord::from_path(path.clone(), None).map_err(|error| format!("apply: could not journal {}: {error}", path.display()))?;
-    Ok(JournalOutput { role: role.to_string(), record })
+    Ok(JournalOutput { role: role.to_string(), record, original_path: None })
+}
+
+fn plan_transfer(fileset: &crate::fileset::FileSet, destination: &str, target: fn(&std::path::Path, &std::path::Path) -> PathBuf, operation: &str) -> Result<FileTransferPlan, String> {
+    let destination = std::path::Path::new(destination);
+    let mut seen = std::collections::HashSet::new();
+    let mut items = Vec::with_capacity(fileset.files.len());
+    for source in &fileset.files {
+        if source.kind != FileKind::File { return Err(format!("{operation}: --plan currently accepts file records only: {}", source.path.display())); }
+        let output = target(destination, &source.path);
+        if source.path == output { return Err(format!("{operation}: source and destination are the same: {}", source.path.display())); }
+        if !seen.insert(output.to_string_lossy().to_lowercase()) { return Err(format!("{operation}: multiple sources target the same destination: {}", output.display())); }
+        let destination_before = if output.exists() { Some(FileRecord::from_path(output.clone(), None).map_err(|error| format!("{operation}: cannot inspect {}: {error}", output.display()))?) } else { None };
+        items.push(FileTransferPlanItem { source: source.clone(), destination: output, destination_before });
+    }
+    Ok(FileTransferPlan { items })
+}
+
+fn transfer_table(plan: &FileTransferPlan, operation: &str) -> Table {
+    Table { rows: plan.items.iter().map(|item| vec![
+        ("operation".to_string(), operation.to_string()),
+        ("source".to_string(), item.source.path.to_string_lossy().into_owned()),
+        ("destination".to_string(), item.destination.to_string_lossy().into_owned()),
+        ("destination_exists".to_string(), item.destination_before.is_some().to_string()),
+    ]).collect() }
+}
+
+async fn apply_transfer(plan: &FileTransferPlan, force: bool, moving: bool, journal: &mut OperationJournal, state: &crate::state::StateHandle) -> Result<(), String> {
+    for item in &plan.items {
+        validate_record(&item.source, "apply: source drift")?;
+        match (&item.destination_before, item.destination.exists()) {
+            (None, true) => return Err(format!("apply: destination drift: {} appeared after planning", item.destination.display())),
+            (Some(_), false) => return Err(format!("apply: destination drift: {} disappeared after planning", item.destination.display())),
+            (Some(expected), true) => validate_record(expected, "apply: destination drift")?,
+            (None, false) => {}
+        }
+        if item.destination_before.is_some() && !force { return Err(format!("apply: {} exists (use --force when planning to replace it)", item.destination.display())); }
+    }
+    for item in &plan.items {
+        let source = item.source.path.clone();
+        let destination = item.destination.clone();
+        let result = if moving {
+            tokio::task::spawn_blocking(move || crate::fs_ops::move_one(&source, &destination, force)).await
+        } else {
+            tokio::task::spawn_blocking(move || crate::copy::copy_one(&source, &destination, force)).await
+        }.map_err(|error| format!("apply: worker failed: {error}"))?;
+        if let Err(error) = result {
+            transactional_rollback(journal);
+            let _ = state.put_journal(journal.clone()).await;
+            return Err(format!("apply: {error}"));
+        }
+        let record = FileRecord::from_path(item.destination.clone(), None).map_err(|error| format!("apply: could not journal {}: {error}", item.destination.display()))?;
+        journal.outputs.push(JournalOutput { role: if moving { "moved" } else { "copy" }.to_string(), record, original_path: moving.then(|| item.source.path.clone()) });
+        state.put_journal(journal.clone()).await?;
+    }
+    Ok(())
+}
+
+fn transactional_rollback(journal: &mut OperationJournal) {
+    if !journal.undo_safe { journal.status = "partially_applied".to_string(); return; }
+    let mut complete = true;
+    for output in journal.outputs.iter().rev() {
+        let result = if let Some(original) = &output.original_path { crate::fs_ops::move_one(&output.record.path, original, false) } else { std::fs::remove_file(&output.record.path).map_err(|error| error.to_string()) };
+        if result.is_err() { complete = false; }
+    }
+    journal.status = if complete { "rolled_back" } else { "partially_applied" }.to_string();
+}
+
+fn validate_record(expected: &FileRecord, label: &str) -> Result<(), String> {
+    let current = FileRecord::from_path(expected.path.clone(), None).map_err(|error| format!("{label}: {} is unavailable: {error}", expected.path.display()))?;
+    if current.identity != expected.identity || current.kind != expected.kind || current.size != expected.size || current.modified != expected.modified {
+        return Err(format!("{label}: {} changed", expected.path.display()));
+    }
+    Ok(())
 }
 
 impl OperationJournal {
@@ -76,9 +232,10 @@ impl OperationJournal {
             ("operation_id".to_string(), self.id.clone()),
             ("plan_id".to_string(), self.plan_id.clone()),
             ("operation".to_string(), self.operation.clone()),
-            ("status".to_string(), if self.undone_at.is_some() { "undone" } else { "applied" }.to_string()),
+            ("status".to_string(), self.status.clone()),
             ("role".to_string(), output.role.clone()),
             ("path".to_string(), output.record.path.to_string_lossy().into_owned()),
+            ("original_path".to_string(), output.original_path.as_ref().map(|path| path.to_string_lossy().into_owned()).unwrap_or_default()),
             ("size".to_string(), output.record.size.to_string()),
             ("undo_safe".to_string(), self.undo_safe.to_string()),
             ("started_at".to_string(), self.started_at.to_string()),
@@ -89,6 +246,7 @@ impl OperationJournal {
     /// Validates every output before deleting the first one. A modified,
     /// replaced, or missing output makes the entire undo fail closed.
     pub fn undo(&self) -> Result<Self, String> {
+        if self.status != "applied" { return Err(format!("undo: operation {} has status '{}'", self.id, self.status)); }
         if self.undone_at.is_some() { return Err(format!("undo: operation {} was already undone", self.id)); }
         if !self.undo_safe { return Err(format!("undo: operation {} replaced existing output and cannot be safely undone", self.id)); }
         for output in &self.outputs {
@@ -96,11 +254,39 @@ impl OperationJournal {
             if current.identity != output.record.identity || current.kind != output.record.kind || current.size != output.record.size || current.modified != output.record.modified {
                 return Err(format!("undo: output drift: {} changed after apply", output.record.path.display()));
             }
+            if let Some(original) = &output.original_path {
+                if original.exists() { return Err(format!("undo: original path is no longer free: {}", original.display())); }
+            }
         }
-        for output in &self.outputs { std::fs::remove_file(&output.record.path).map_err(|error| format!("undo: could not remove {}: {error}", output.record.path.display()))?; }
+        for output in &self.outputs {
+            if let Some(original) = &output.original_path {
+                crate::fs_ops::move_one(&output.record.path, original, false).map_err(|error| format!("undo: could not restore {}: {error}", original.display()))?;
+            } else {
+                std::fs::remove_file(&output.record.path).map_err(|error| format!("undo: could not remove {}: {error}", output.record.path.display()))?;
+            }
+        }
         let mut undone = self.clone();
         undone.undone_at = Some(now_seconds());
+        undone.status = "undone".to_string();
         Ok(undone)
+    }
+
+    pub fn rollback(&self) -> Result<Self, String> {
+        if !matches!(self.status.as_str(), "in_progress" | "partially_applied" | "failed") {
+            return Err(format!("rollback: operation {} has status '{}'", self.id, self.status));
+        }
+        if !self.undo_safe { return Err(format!("rollback: operation {} is not safely reversible", self.id)); }
+        for output in &self.outputs {
+            validate_record(&output.record, "rollback: output drift")?;
+            if let Some(original) = &output.original_path {
+                if original.exists() { return Err(format!("rollback: original path is no longer free: {}", original.display())); }
+            }
+        }
+        let mut rolled_back = self.clone();
+        transactional_rollback(&mut rolled_back);
+        if rolled_back.status != "rolled_back" { return Err(format!("rollback: operation {} could not be fully rolled back", self.id)); }
+        rolled_back.finished_at = now_seconds();
+        Ok(rolled_back)
     }
 
     pub fn to_json(&self) -> String {
@@ -109,9 +295,10 @@ impl OperationJournal {
             "volume_id": output.record.identity.volume_id,
             "file_id": output.record.identity.file_id.map(hex_file_id),
             "kind": kind_name(&output.record.kind), "size": output.record.size,
-            "modified": output.record.modified
+            "modified": output.record.modified,
+            "original_path": output.original_path.as_ref().map(|path| path.to_string_lossy())
         })).collect::<Vec<_>>();
-        serde_json::json!({"version":1,"id":self.id,"plan_id":self.plan_id,"operation":self.operation,"started_at":self.started_at,"finished_at":self.finished_at,"undo_safe":self.undo_safe,"undone_at":self.undone_at,"outputs":outputs}).to_string()
+        serde_json::json!({"version":2,"id":self.id,"plan_id":self.plan_id,"operation":self.operation,"started_at":self.started_at,"finished_at":self.finished_at,"undo_safe":self.undo_safe,"status":self.status,"error":self.error,"undone_at":self.undone_at,"outputs":outputs}).to_string()
     }
 
     pub fn from_json(text: &str) -> Result<Self, String> {
@@ -121,14 +308,16 @@ impl OperationJournal {
         let mut outputs = Vec::new();
         for output in value.get("outputs").and_then(|v| v.as_array()).ok_or_else(|| "journal: missing 'outputs'".to_string())? {
             let file_id = output.get("file_id").and_then(|v| v.as_str()).map(parse_file_id).transpose()?;
-            outputs.push(JournalOutput { role: output.get("role").and_then(|v| v.as_str()).unwrap_or("").to_string(), record: FileRecord {
+            outputs.push(JournalOutput { role: output.get("role").and_then(|v| v.as_str()).unwrap_or("").to_string(), original_path: output.get("original_path").and_then(|v| v.as_str()).map(PathBuf::from), record: FileRecord {
                 path: PathBuf::from(output.get("path").and_then(|v| v.as_str()).ok_or_else(|| "journal: output missing path".to_string())?),
                 identity: FileIdentity { volume_id: output.get("volume_id").and_then(|v| v.as_u64()), file_id },
                 kind: parse_kind(output.get("kind").and_then(|v| v.as_str()).unwrap_or("other")),
                 size: output.get("size").and_then(|v| v.as_u64()).unwrap_or(0), modified: output.get("modified").and_then(|v| v.as_u64()), sha256: None,
             } });
         }
-        Ok(Self { id: required_string("id")?, plan_id: required_string("plan_id")?, operation: required_string("operation")?, started_at: required_number("started_at")?, finished_at: required_number("finished_at")?, outputs, undo_safe: value.get("undo_safe").and_then(|v| v.as_bool()).unwrap_or(false), undone_at: value.get("undone_at").and_then(|v| v.as_u64()) })
+        let undone_at = value.get("undone_at").and_then(|v| v.as_u64());
+        let status = value.get("status").and_then(|v| v.as_str()).map(str::to_string).unwrap_or_else(|| if undone_at.is_some() { "undone" } else { "applied" }.to_string());
+        Ok(Self { id: required_string("id")?, plan_id: required_string("plan_id")?, operation: required_string("operation")?, started_at: required_number("started_at")?, finished_at: required_number("finished_at")?, outputs, undo_safe: value.get("undo_safe").and_then(|v| v.as_bool()).unwrap_or(false), status, error: value.get("error").and_then(|v| v.as_str()).map(str::to_string), undone_at })
     }
 }
 
@@ -148,7 +337,7 @@ mod tests {
 
     #[test]
     fn journal_round_trips_persistent_json() {
-        let journal = OperationJournal { id: "operation-1".into(), plan_id: "plan-1".into(), operation: "compress".into(), started_at: 1, finished_at: 2, outputs: vec![JournalOutput { role: "archive".into(), record: FileRecord { path: "a.zip".into(), identity: FileIdentity { volume_id: Some(7), file_id: Some([3; 16]) }, kind: FileKind::File, size: 10, modified: Some(9), sha256: None } }], undo_safe: true, undone_at: None };
+        let journal = OperationJournal { id: "operation-1".into(), plan_id: "plan-1".into(), operation: "compress".into(), started_at: 1, finished_at: 2, outputs: vec![JournalOutput { role: "archive".into(), record: FileRecord { path: "a.zip".into(), identity: FileIdentity { volume_id: Some(7), file_id: Some([3; 16]) }, kind: FileKind::File, size: 10, modified: Some(9), sha256: None }, original_path: None }], undo_safe: true, status: "applied".into(), error: None, undone_at: None };
         assert_eq!(OperationJournal::from_json(&journal.to_json()).unwrap(), journal);
     }
 
@@ -163,7 +352,7 @@ mod tests {
     #[test]
     fn undo_removes_unchanged_created_outputs() {
         let (path, record) = temp_output("undo.zip", "archive");
-        let journal = OperationJournal { id: "operation-undo".into(), plan_id: "plan".into(), operation: "compress".into(), started_at: 1, finished_at: 2, outputs: vec![JournalOutput { role: "archive".into(), record }], undo_safe: true, undone_at: None };
+        let journal = OperationJournal { id: "operation-undo".into(), plan_id: "plan".into(), operation: "compress".into(), started_at: 1, finished_at: 2, outputs: vec![JournalOutput { role: "archive".into(), record, original_path: None }], undo_safe: true, status: "applied".into(), error: None, undone_at: None };
         let undone = journal.undo().unwrap();
         assert!(!path.exists());
         assert!(undone.undone_at.is_some());
@@ -173,7 +362,7 @@ mod tests {
     fn undo_validates_all_outputs_before_deleting_any() {
         let (first_path, first) = temp_output("atomic-a.zip", "first");
         let (second_path, second) = temp_output("atomic-b.zip", "second");
-        let journal = OperationJournal { id: "operation-drift".into(), plan_id: "plan".into(), operation: "compress".into(), started_at: 1, finished_at: 2, outputs: vec![JournalOutput { role: "archive".into(), record: first }, JournalOutput { role: "backup".into(), record: second }], undo_safe: true, undone_at: None };
+        let journal = OperationJournal { id: "operation-drift".into(), plan_id: "plan".into(), operation: "compress".into(), started_at: 1, finished_at: 2, outputs: vec![JournalOutput { role: "archive".into(), record: first, original_path: None }, JournalOutput { role: "backup".into(), record: second, original_path: None }], undo_safe: true, status: "applied".into(), error: None, undone_at: None };
         std::fs::write(&second_path, "changed-size").unwrap();
         let error = journal.undo().unwrap_err();
         assert!(error.contains("output drift"), "{error}");
@@ -181,5 +370,98 @@ mod tests {
         assert!(second_path.exists());
         let _ = std::fs::remove_file(first_path);
         let _ = std::fs::remove_file(second_path);
+    }
+
+    fn transfer_fixture(name: &str) -> (PathBuf, PathBuf, crate::fileset::FileSet) {
+        let root = std::env::temp_dir().join(format!("ion-win-transfer-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let source = root.join("source").join("file.txt");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "typed transfer").unwrap();
+        let fileset = crate::fileset::FileSet::new(vec![FileRecord::from_path(source.clone(), None).unwrap()], "test");
+        (root, source, fileset)
+    }
+
+    #[tokio::test]
+    async fn copy_plan_applies_and_undo_removes_the_typed_destination() {
+        let (root, source, fileset) = transfer_fixture("copy");
+        let plan = OperationPlan::copy(&fileset, &root.join("copies").to_string_lossy(), false).unwrap();
+        let destination = match &plan.operation { PlannedOperation::Copy(plan) => plan.items[0].destination.clone(), _ => unreachable!() };
+        let journal = plan.apply(&crate::state::spawn_memory()).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&destination).unwrap(), "typed transfer");
+        assert!(source.exists());
+        assert_eq!(journal.operation, "copy");
+        journal.undo().unwrap();
+        assert!(!destination.exists());
+        assert!(source.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn move_plan_undo_restores_the_original_path() {
+        let (root, source, fileset) = transfer_fixture("move");
+        let plan = OperationPlan::move_files(&fileset, &root.join("moved").to_string_lossy(), false).unwrap();
+        let destination = match &plan.operation { PlannedOperation::Move(plan) => plan.items[0].destination.clone(), _ => unreachable!() };
+        let journal = plan.apply(&crate::state::spawn_memory()).await.unwrap();
+        assert!(!source.exists());
+        assert!(destination.exists());
+        assert_eq!(journal.outputs[0].original_path.as_ref(), Some(&source));
+        journal.undo().unwrap();
+        assert!(source.exists());
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), "typed transfer");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn transfer_apply_rejects_source_drift_before_writes() {
+        let (root, source, fileset) = transfer_fixture("drift");
+        let plan = OperationPlan::copy(&fileset, &root.join("copies").to_string_lossy(), false).unwrap();
+        let destination = match &plan.operation { PlannedOperation::Copy(plan) => plan.items[0].destination.clone(), _ => unreachable!() };
+        std::fs::write(&source, "changed after planning and a different size").unwrap();
+        let error = plan.apply(&crate::state::spawn_memory()).await.unwrap_err();
+        assert!(error.contains("source drift"), "{error}");
+        assert!(!destination.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn forced_transfer_that_replaces_a_destination_is_not_undoable() {
+        let (root, _source, fileset) = transfer_fixture("force-undo");
+        let destination_root = root.join("copies");
+        let planned_destination = crate::copy::resource_target(&destination_root, &fileset.files[0].path);
+        std::fs::create_dir_all(planned_destination.parent().unwrap()).unwrap();
+        std::fs::write(&planned_destination, "existing destination").unwrap();
+        let plan = OperationPlan::copy(&fileset, &destination_root.to_string_lossy(), true).unwrap();
+        let journal = plan.apply(&crate::state::spawn_memory()).await.unwrap();
+        assert!(!journal.undo_safe);
+        assert!(journal.undo().unwrap_err().contains("cannot be safely undone"));
+        assert!(planned_destination.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn transactional_rollback_removes_completed_safe_copy_outputs() {
+        let (path, record) = temp_output("transaction-copy.tmp", "completed copy");
+        let mut journal = OperationJournal { id: "operation-transaction".into(), plan_id: "plan".into(), operation: "copy".into(), started_at: 1, finished_at: 0, outputs: vec![JournalOutput { role: "copy".into(), record, original_path: None }], undo_safe: true, status: "in_progress".into(), error: None, undone_at: None };
+        transactional_rollback(&mut journal);
+        assert_eq!(journal.status, "rolled_back");
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn delete_plan_source_drift_persists_a_failed_journal_before_writes() {
+        let (root, source, fileset) = transfer_fixture("delete-drift");
+        let plan = OperationPlan::delete(&fileset, crate::delete::DeleteOptions::default()).unwrap();
+        std::fs::write(&source, "changed after delete planning").unwrap();
+        let state = crate::state::spawn_memory();
+        let error = plan.apply(&state).await.unwrap_err();
+        assert!(error.contains("source drift"), "{error}");
+        assert!(source.exists());
+        let journals = state.list_journals().await.unwrap();
+        assert_eq!(journals.len(), 1);
+        assert_eq!(journals[0].status, "failed");
+        assert!(journals[0].outputs.is_empty());
+        let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -120,7 +120,7 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin {
         name: "copy",
         is_keyword: false,
-        help_display: Some("copy/cp [--force] SRC... DEST"),
+        help_display: Some("copy/cp [--force] SRC... DEST | FILESET | copy --plan DEST"),
     },
     Builtin {
         name: "cp",
@@ -140,7 +140,7 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin {
         name: "move",
         is_keyword: false,
-        help_display: Some("move/mv [--force] SRC... DEST"),
+        help_display: Some("move/mv [--force] SRC... DEST | FILESET | move --plan DEST"),
     },
     Builtin {
         name: "mv",
@@ -165,7 +165,7 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin {
         name: "delete",
         is_keyword: false,
-        help_display: Some("delete [--recurse] PATH..."),
+        help_display: Some("delete [--recurse] PATH... | FILESET | delete --plan"),
     },
     Builtin {
         name: "if",
@@ -341,6 +341,11 @@ pub const BUILTINS: &[Builtin] = &[
         name: "undo",
         is_keyword: false,
         help_display: Some("JOURNAL | undo"),
+    },
+    Builtin {
+        name: "rollback",
+        is_keyword: false,
+        help_display: Some("JOURNAL | rollback"),
     },
     Builtin {
         name: "task",
@@ -645,10 +650,10 @@ pub fn help_text(topic: Option<&str>) -> Result<String, String> {
         "cat" => page("cat FILE...", "Writes file contents unchanged, in argument order.", &["cat manifest.json | from-json"], &[]),
         "stat" => page("stat FILE... [--hash sha256]", "Builds a table with path, size, modified time, and is_dir; optionally hashes files concurrently.", &["find . --recurse | stat --hash sha256 | to-json"], &[]),
         "copy" | "cp" => page(
-            "copy [--force] SRC... DEST\n        TABLE | copy [--force] DEST",
-            "Copies explicit files or every path in a table. Table paths retain their relative layout.",
-            &["copy report.txt backup", "manifest | copy backup"],
-            &["Existing destinations are skipped unless --force is supplied.", "`cp` is an alias."],
+            "copy [--force] SRC... DEST\n        FILESET | copy [--force] [--plan] DEST",
+            "Copies explicit files or typed FileSet records. --plan returns a typed OperationPlan for apply, journal, and undo.",
+            &["copy report.txt backup", "let plan = manifest | copy --plan backup", "let result = plan | apply"],
+            &["Existing destinations are skipped unless --force is supplied.", "Planned apply validates source and destination identity before writes.", "`cp` is an alias."],
         ),
         "mkdir" | "md" => page(
             "mkdir DIR...",
@@ -657,10 +662,10 @@ pub fn help_text(topic: Option<&str>) -> Result<String, String> {
             &["Existing directories are counted and left unchanged.", "`md` is an alias."],
         ),
         "move" | "mv" => page(
-            "move [--force] SRC... DEST\n        TABLE | move [--force] DEST",
-            "Moves files or folders. A table supplies sources from its `path` column and preserves relative layout under DEST.",
-            &["move draft.txt final.txt", "move one.txt two.txt archive", "manifest | move archive"],
-            &["Existing destinations are skipped unless --force is supplied.", "Existing directories are never replaced.", "`mv` is an alias."],
+            "move [--force] SRC... DEST\n        FILESET | move [--force] [--plan] DEST",
+            "Moves explicit paths or typed FileSet records. --plan returns a typed OperationPlan whose undo restores original paths.",
+            &["move draft.txt final.txt", "let plan = manifest | move --plan archive", "let result = plan | apply", "result | undo"],
+            &["Existing destinations are skipped unless --force is supplied.", "Planned apply validates source and destination identity before writes.", "Existing directories are never replaced.", "`mv` is an alias."],
         ),
         "rename" | "ren" => page(
             "rename [--force] SOURCE NEW_NAME",
@@ -692,13 +697,20 @@ pub fn help_text(topic: Option<&str>) -> Result<String, String> {
             &["result | undo", "journal operation-123 | undo"],
             &["Undo refuses the entire operation if any output is missing, replaced, or modified."],
         ),
+        "rollback" => page(
+            "JOURNAL | rollback",
+            "Rolls back checkpointed outputs from an unfinished or partially applied operation.",
+            &["journal operation-123 | rollback"],
+            &["Rollback validates every checkpointed output and refuses operations that replaced pre-existing destinations."],
+        ),
         "delete" => page(
-            "delete [--recurse] PATH...\n        TABLE | delete [--recurse]",
-            "Moves files to the Windows Recycle Bin by default. Tables supply paths from their `path` column.",
-            &["delete old.txt", "manifest | delete", "delete --recurse old-folder"],
+            "delete [--recurse] PATH...\n        FILESET | delete [--recurse] --plan",
+            "Moves files to the Windows Recycle Bin by default. --plan creates a typed, identity-validated and transaction-journaled delete plan.",
+            &["delete old.txt", "let plan = manifest | delete --plan", "let result = plan | apply"],
             &[
                 "Permanent deletion requires both --permanent and --force.",
                 "Directories require --recurse, including Recycle Bin deletion.",
+                "Delete journals are not yet undoable because the Windows Shell API does not return a stable recycled-item restoration identity.",
                 "Filesystem roots, the current directory, and its ancestors are refused.",
             ],
         ),

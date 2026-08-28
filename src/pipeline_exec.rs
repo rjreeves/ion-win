@@ -75,6 +75,7 @@ enum Kind {
     /// inspected, and validated immediately before the first write.
     Apply(Vec<String>),
     Undo(Vec<String>),
+    Rollback(Vec<String>),
     Journal(Vec<String>),
     /// `delete [--recurse] [--permanent --force] [PATH...]`. With
     /// explicit paths it ignores pipeline input; with no paths it consumes
@@ -401,7 +402,7 @@ async fn run_impl(
                 }
             }
             Kind::Copy(copy_args) => {
-                let (force, mut positional) = match crate::copy::parse_flags(copy_args) {
+                let (force, plan_only, mut positional) = match crate::copy::parse_pipeline_flags(copy_args) {
                     Ok(v) => v,
                     Err(e) => {
                         drop(incoming);
@@ -420,6 +421,32 @@ async fn run_impl(
                 // begin with, so there's nothing to forward in that case.
                 let mut forwarded_table: Option<Table> = None;
                 let mut forwarded_fileset: Option<FileSet> = None;
+
+                if plan_only {
+                    if positional.len() != 1 {
+                        drop(incoming);
+                        err_println!("ion-win: copy: --plan requires one destination directory");
+                        unregister_spawned!();
+                        return false;
+                    }
+                    let plan = match incoming {
+                        Carry::FileSet(fileset) => match OperationPlan::copy(&fileset, &positional[0], force) {
+                            Ok(plan) => plan,
+                            Err(error) => {
+                                err_println!("ion-win: {error}");
+                                unregister_spawned!();
+                                return false;
+                            }
+                        },
+                        _ => {
+                            err_println!("ion-win: copy: --plan requires a typed FileSet");
+                            unregister_spawned!();
+                            return false;
+                        }
+                    };
+                    carry = finish_operation_plan_stage(plan, is_last, stdout_file, capture.as_mut().map(|slot| &mut **slot));
+                    continue;
+                }
 
                 let mut text = if positional.len() >= 2 {
                     // Explicit files: SRC... DEST. Ignores whatever was
@@ -485,7 +512,7 @@ async fn run_impl(
                     else { Carry::None };
             }
             Kind::Move(move_args) => {
-                let (force, mut positional) = match crate::fs_ops::parse_move_flags(move_args) {
+                let (force, plan_only, mut positional) = match crate::fs_ops::parse_move_pipeline_flags(move_args) {
                     Ok(value) => value,
                     Err(error) => {
                         drop(incoming);
@@ -494,6 +521,31 @@ async fn run_impl(
                         return false;
                     }
                 };
+                if plan_only {
+                    if positional.len() != 1 {
+                        drop(incoming);
+                        err_println!("ion-win: move: --plan requires one destination directory");
+                        unregister_spawned!();
+                        return false;
+                    }
+                    let plan = match incoming {
+                        Carry::FileSet(fileset) => match OperationPlan::move_files(&fileset, &positional[0], force) {
+                            Ok(plan) => plan,
+                            Err(error) => {
+                                err_println!("ion-win: {error}");
+                                unregister_spawned!();
+                                return false;
+                            }
+                        },
+                        _ => {
+                            err_println!("ion-win: move: --plan requires a typed FileSet");
+                            unregister_spawned!();
+                            return false;
+                        }
+                    };
+                    carry = finish_operation_plan_stage(plan, is_last, stdout_file, capture.as_mut().map(|slot| &mut **slot));
+                    continue;
+                }
                 let mut text = if positional.len() >= 2 {
                     drop(incoming);
                     let destination = positional.pop().expect("checked length");
@@ -704,7 +756,7 @@ async fn run_impl(
                         return false;
                     }
                 };
-                let journal = match plan.apply().await {
+                let journal = match plan.apply(state).await {
                     Ok(journal) => journal,
                     Err(error) => {
                         err_println!("ion-win: {error}");
@@ -712,9 +764,6 @@ async fn run_impl(
                         return false;
                     }
                 };
-                if let Err(error) = state.put_journal(journal.clone()).await {
-                    err_println!("ion-win: apply: operation succeeded but its journal could not be persisted: {error}");
-                }
                 carry = finish_operation_journal_stage(journal, is_last, stdout_file, capture.as_mut().map(|slot| &mut **slot));
             }
             Kind::Undo(args) => {
@@ -749,6 +798,32 @@ async fn run_impl(
                     err_println!("ion-win: undo: outputs were removed but the journal update could not be persisted: {error}");
                 }
                 carry = finish_operation_journal_stage(undone, is_last, stdout_file, capture.as_mut().map(|slot| &mut **slot));
+            }
+            Kind::Rollback(args) => {
+                if !args.is_empty() {
+                    drop(incoming);
+                    err_println!("ion-win: rollback: usage: JOURNAL | rollback");
+                    unregister_spawned!();
+                    return false;
+                }
+                let journal = match incoming {
+                    Carry::OperationJournal(journal) => journal,
+                    _ => {
+                        err_println!("ion-win: rollback: expected a typed OperationJournal");
+                        unregister_spawned!();
+                        return false;
+                    }
+                };
+                let rolled_back = match journal.rollback() {
+                    Ok(journal) => journal,
+                    Err(error) => {
+                        err_println!("ion-win: {error}");
+                        unregister_spawned!();
+                        return false;
+                    }
+                };
+                if let Err(error) = state.put_journal(rolled_back.clone()).await { err_println!("ion-win: rollback: journal update failed: {error}"); }
+                carry = finish_operation_journal_stage(rolled_back, is_last, stdout_file, capture.as_mut().map(|slot| &mut **slot));
             }
             Kind::Journal(args) => {
                 drop(incoming);
@@ -785,7 +860,7 @@ async fn run_impl(
                         ("operation_id".to_string(), journal.id.clone()),
                         ("plan_id".to_string(), journal.plan_id.clone()),
                         ("operation".to_string(), journal.operation.clone()),
-                        ("status".to_string(), if journal.undone_at.is_some() { "undone" } else { "applied" }.to_string()),
+                        ("status".to_string(), journal.status.clone()),
                         ("output_count".to_string(), journal.outputs.len().to_string()),
                         ("started_at".to_string(), journal.started_at.to_string()),
                     ]).collect() };
@@ -793,7 +868,7 @@ async fn run_impl(
                 }
             }
             Kind::Delete(delete_args) => {
-                let (options, positional) = match crate::delete::parse_flags(delete_args) {
+                let (options, plan_only, positional) = match crate::delete::parse_pipeline_flags(delete_args) {
                     Ok(v) => v,
                     Err(e) => {
                         drop(incoming);
@@ -802,6 +877,32 @@ async fn run_impl(
                         return false;
                     }
                 };
+
+                if plan_only {
+                    if !positional.is_empty() {
+                        drop(incoming);
+                        err_println!("ion-win: delete: --plan consumes a typed FileSet and takes no paths");
+                        unregister_spawned!();
+                        return false;
+                    }
+                    let plan = match incoming {
+                        Carry::FileSet(fileset) => match OperationPlan::delete(&fileset, options) {
+                            Ok(plan) => plan,
+                            Err(error) => {
+                                err_println!("ion-win: {error}");
+                                unregister_spawned!();
+                                return false;
+                            }
+                        },
+                        _ => {
+                            err_println!("ion-win: delete: --plan requires a typed FileSet");
+                            unregister_spawned!();
+                            return false;
+                        }
+                    };
+                    carry = finish_operation_plan_stage(plan, is_last, stdout_file, capture.as_mut().map(|slot| &mut **slot));
+                    continue;
+                }
 
                 let mut text = if !positional.is_empty() {
                     drop(incoming);
@@ -1418,6 +1519,8 @@ fn classify_stages(pipeline: &Pipeline, interp: &Interpreter) -> Vec<Kind> {
                 Kind::Apply(args[1..].to_vec())
             } else if cmd == "undo" {
                 Kind::Undo(args[1..].to_vec())
+            } else if cmd == "rollback" {
+                Kind::Rollback(args[1..].to_vec())
             } else if cmd == "journal" {
                 Kind::Journal(args[1..].to_vec())
             } else if cmd == "delete" {

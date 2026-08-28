@@ -48,6 +48,15 @@ pub fn parse_flags(args: &[String]) -> Result<(bool, Vec<String>), String> {
     Ok((force, positional))
 }
 
+pub fn parse_pipeline_flags(args: &[String]) -> Result<(bool, bool, Vec<String>), String> {
+    let mut plan = false;
+    let remaining = args.iter().filter_map(|arg| {
+        if arg == "--plan" { plan = true; None } else { Some(arg.clone()) }
+    }).collect::<Vec<_>>();
+    let (force, positional) = parse_flags(&remaining)?;
+    Ok((force, plan, positional))
+}
+
 /// The explicit-arguments form, used standalone (`copy a.txt b.txt`):
 /// parses flags, requires at least one source plus a destination, then
 /// copies.
@@ -200,7 +209,7 @@ fn table_row_target(dest: &Path, path: &str) -> PathBuf {
     resource_target(dest, Path::new(path))
 }
 
-fn resource_target(dest: &Path, path: &Path) -> PathBuf {
+pub(crate) fn resource_target(dest: &Path, path: &Path) -> PathBuf {
     let stripped: PathBuf = path
         .components()
         .filter(|c| !matches!(c, Component::Prefix(_) | Component::RootDir))
@@ -216,7 +225,7 @@ fn summary(copied: usize, skipped: usize) -> String {
     }
 }
 
-fn copy_one(src: &Path, dest: &Path, force: bool) -> Result<(), String> {
+pub(crate) fn copy_one(src: &Path, dest: &Path, force: bool) -> Result<(), String> {
     if dest.exists() && !force {
         return Err(format!(
             "{}: destination already exists (use --force to overwrite)",

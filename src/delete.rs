@@ -42,6 +42,31 @@ pub fn parse_flags(args: &[String]) -> Result<(DeleteOptions, Vec<String>), Stri
     Ok((options, positional))
 }
 
+pub fn parse_pipeline_flags(args: &[String]) -> Result<(DeleteOptions, bool, Vec<String>), String> {
+    let mut plan = false;
+    let remaining = args.iter().filter_map(|arg| {
+        if arg == "--plan" { plan = true; None } else { Some(arg.clone()) }
+    }).collect::<Vec<_>>();
+    let (options, positional) = parse_flags(&remaining)?;
+    if plan && options.permanent { return Err("delete: --plan does not support permanent deletion".to_string()); }
+    Ok((options, plan, positional))
+}
+
+pub(crate) fn validate_planned(path: &Path, options: DeleteOptions) -> Result<(), String> {
+    let meta = fs::symlink_metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let target_is_dir = meta.is_dir() || (is_reparse_point(&meta) && fs::metadata(path).map(|value| value.is_dir()).unwrap_or(false));
+    if !is_reparse_point(&meta) && !meta.file_type().is_symlink() { reject_broad_target(path)?; }
+    if target_is_dir && !options.recurse { return Err(format!("{}: is a directory (use --recurse)", path.display())); }
+    Ok(())
+}
+
+pub(crate) fn delete_planned(path: &Path, options: DeleteOptions) -> Result<(), String> {
+    match validate_then_delete(path, options) {
+        DeleteResult::Deleted => Ok(()),
+        DeleteResult::Skipped(error) | DeleteResult::Failed(error) => Err(error),
+    }
+}
+
 pub async fn parse_and_delete_files(args: &[String]) -> Result<String, String> {
     let (options, paths) = parse_flags(args)?;
     if paths.is_empty() {

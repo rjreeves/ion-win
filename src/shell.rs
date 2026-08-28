@@ -125,6 +125,12 @@ pub async fn run(state: StateHandle) {
     history::seed_defaults(&mut interp);
     let mut editor = LineEditor::with_history(history::load(&interp));
     load_initrc(&mut interp, &state).await;
+    if let Ok(journals) = state.list_journals().await {
+        let unfinished = journals.iter().filter(|journal| matches!(journal.status.as_str(), "in_progress" | "partially_applied")).collect::<Vec<_>>();
+        if !unfinished.is_empty() {
+            err_println!("ion-win: warning: {} unfinished operation(s); run 'journal' to inspect them", unfinished.len());
+        }
+    }
 
     loop {
         if let Some(shared) = history::refresh(&interp) {
@@ -855,7 +861,7 @@ fn split_at_top_level_chain_op(line: &str) -> Option<(&str, ChainOp, &str)> {
 fn is_table_producing_command(cmd: &str, interp: &Interpreter) -> bool {
     matches!(
         cmd,
-        "from-json" | "select" | "where" | "filter" | "stat" | "from-csv" | "date-column" | "compress" | "apply" | "undo" | "journal"
+        "from-json" | "from-csv" | "files" | "folders" | "dirs" | "find" | "select" | "where" | "filter" | "stat" | "date-column" | "copy" | "cp" | "move" | "mv" | "compress" | "delete" | "apply" | "undo" | "rollback" | "journal"
     ) || interp.get_table(cmd).is_some()
         || interp.get_fileset(cmd).is_some()
         || interp.get_plan(cmd).is_some()

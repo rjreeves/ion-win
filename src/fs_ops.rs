@@ -51,6 +51,15 @@ pub fn parse_move_flags(args: &[String]) -> Result<(bool, Vec<String>), String> 
     Ok((force, positional))
 }
 
+pub fn parse_move_pipeline_flags(args: &[String]) -> Result<(bool, bool, Vec<String>), String> {
+    let mut plan = false;
+    let remaining = args.iter().filter_map(|arg| {
+        if arg == "--plan" { plan = true; None } else { Some(arg.clone()) }
+    }).collect::<Vec<_>>();
+    let (force, positional) = parse_move_flags(&remaining)?;
+    Ok((force, plan, positional))
+}
+
 pub async fn parse_and_move(args: &[String]) -> Result<String, String> {
     let (force, mut positional) = parse_move_flags(args)?;
     if positional.len() < 2 {
@@ -127,15 +136,19 @@ async fn await_moves(
     }
 }
 
-fn table_target(dest: &Path, source: &str) -> PathBuf {
-    let relative: PathBuf = Path::new(source)
+pub(crate) fn resource_target(dest: &Path, source: &Path) -> PathBuf {
+    let relative: PathBuf = source
         .components()
         .filter(|part| !matches!(part, Component::Prefix(_) | Component::RootDir))
         .collect();
     dest.join(relative)
 }
 
-fn move_one(source: &Path, target: &Path, force: bool) -> Result<(), String> {
+fn table_target(dest: &Path, source: &str) -> PathBuf {
+    resource_target(dest, Path::new(source))
+}
+
+pub(crate) fn move_one(source: &Path, target: &Path, force: bool) -> Result<(), String> {
     let metadata =
         fs::symlink_metadata(source).map_err(|error| format!("{}: {error}", source.display()))?;
 
