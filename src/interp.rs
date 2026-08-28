@@ -8,6 +8,7 @@
 
 use crate::functions::FunctionDef;
 use crate::fileset::FileSet;
+use crate::operation::OperationPlan;
 use crate::table::Table;
 use crate::{err_eprintln, err_println};
 use std::collections::HashMap;
@@ -56,6 +57,7 @@ pub struct Interpreter {
     /// kinds.
     tables: Vec<HashMap<String, Table>>,
     filesets: Vec<HashMap<String, FileSet>>,
+    plans: Vec<HashMap<String, OperationPlan>>,
 }
 
 impl Default for Interpreter {
@@ -69,6 +71,7 @@ impl Default for Interpreter {
             echo_capture: None,
             tables: vec![HashMap::new()],
             filesets: vec![HashMap::new()],
+            plans: vec![HashMap::new()],
         }
     }
 }
@@ -986,6 +989,10 @@ impl Interpreter {
         self.filesets.iter().rev().find_map(|frame| frame.get(name))
     }
 
+    pub fn get_plan(&self, name: &str) -> Option<&OperationPlan> {
+        self.plans.iter().rev().find_map(|frame| frame.get(name))
+    }
+
     /// `let`'s core ownership rule (ion-manual page 20): if `name` already
     /// exists in any visible frame, updates it there in place — the frame
     /// that first defined it keeps "owning" it, so a nested block's `let`
@@ -1030,6 +1037,15 @@ impl Interpreter {
             }
         }
         self.filesets.last_mut().expect("global scope frame is never popped").insert(name, value)
+    }
+
+    pub fn set_plan(&mut self, name: String, value: OperationPlan) -> Option<OperationPlan> {
+        for frame in self.plans.iter_mut().rev() {
+            if let Some(slot) = frame.get_mut(&name) {
+                return Some(std::mem::replace(slot, value));
+            }
+        }
+        self.plans.last_mut().expect("global scope frame is never popped").insert(name, value)
     }
 
     /// Defines a *new* binding directly in the current (innermost) frame,
@@ -1129,6 +1145,7 @@ impl Interpreter {
         self.arrays.push(HashMap::new());
         self.tables.push(HashMap::new());
         self.filesets.push(HashMap::new());
+        self.plans.push(HashMap::new());
     }
 
     /// Pops the innermost scope frame, deleting whatever it newly defined
@@ -1148,6 +1165,9 @@ impl Interpreter {
         if self.filesets.len() > 1 {
             self.filesets.pop();
         }
+        if self.plans.len() > 1 {
+            self.plans.pop();
+        }
     }
 
     /// Hides every scope above the global one, returning them so the
@@ -1163,12 +1183,14 @@ impl Interpreter {
         Vec<HashMap<String, Vec<String>>>,
         Vec<HashMap<String, Table>>,
         Vec<HashMap<String, FileSet>>,
+        Vec<HashMap<String, OperationPlan>>,
     ) {
         (
             self.scalars.split_off(1),
             self.arrays.split_off(1),
             self.tables.split_off(1),
             self.filesets.split_off(1),
+            self.plans.split_off(1),
         )
     }
 
@@ -1181,12 +1203,14 @@ impl Interpreter {
             Vec<HashMap<String, Vec<String>>>,
             Vec<HashMap<String, Table>>,
             Vec<HashMap<String, FileSet>>,
+            Vec<HashMap<String, OperationPlan>>,
         ),
     ) {
         self.scalars.extend(saved.0);
         self.arrays.extend(saved.1);
         self.tables.extend(saved.2);
         self.filesets.extend(saved.3);
+        self.plans.extend(saved.4);
     }
 
     /// Expands a single raw token as a scalar value: `$var`/`@var`
@@ -1248,6 +1272,9 @@ impl Interpreter {
                 }
             }
             for frame in self.filesets.iter_mut().rev() {
+                if frame.remove(&token.text).is_some() { break; }
+            }
+            for frame in self.plans.iter_mut().rev() {
                 if frame.remove(&token.text).is_some() { break; }
             }
         }
@@ -2194,6 +2221,26 @@ mod tests {
         interp.pop_scope();
         assert_eq!(interp.get_table("l"), None);
         assert_eq!(interp.get_table("g"), Some(&one_row()));
+    }
+
+    #[test]
+    fn operation_plan_variables_follow_scope_and_drop_rules() {
+        let mut interp = Interpreter::new();
+        let plan = crate::operation::OperationPlan::archive(
+            crate::compress::ArchivePlan { items: Vec::new() },
+            false,
+        );
+        interp.push_scope();
+        interp.set_plan("pending".to_string(), plan.clone());
+        assert_eq!(interp.get_plan("pending"), Some(&plan));
+
+        let saved = interp.isolate_global_scope();
+        assert_eq!(interp.get_plan("pending"), None);
+        interp.restore_scope(saved);
+        assert_eq!(interp.get_plan("pending"), Some(&plan));
+
+        interp.builtin_drop(&["pending".into()]);
+        assert_eq!(interp.get_plan("pending"), None);
     }
 
     #[test]

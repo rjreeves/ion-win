@@ -26,6 +26,7 @@ use crate::err_println;
 use crate::execution;
 use crate::fileset::FileSet;
 use crate::interp::Interpreter;
+use crate::operation::OperationPlan;
 use crate::jobctl;
 use crate::pipeline::{PipeKind, Pipeline, Redirect, Stream};
 use crate::state::StateHandle;
@@ -69,6 +70,10 @@ enum Kind {
     /// `SRC... DEST.zip` (explicit files) or just `DEST.zip` (sources
     /// come from the incoming `Table`'s `path` column instead).
     Compress(Vec<String>),
+    /// Applies a previously constructed typed plan. Planning and applying
+    /// are deliberately separate pipeline stages so plans can be stored,
+    /// inspected, and validated immediately before the first write.
+    Apply(Vec<String>),
     /// `delete [--recurse] [--permanent --force] [PATH...]`. With
     /// explicit paths it ignores pipeline input; with no paths it consumes
     /// the incoming table's `path` column. Unlike copy/compress, it does
@@ -106,6 +111,7 @@ enum Kind {
     /// at execution time.
     TableSource(Table),
     FileSetSource(FileSet),
+    OperationPlanSource(OperationPlan),
     /// A builtin/function name that isn't yet supported as a pipeline
     /// stage. Empty string means the stage had no command at all (e.g. a
     /// stray `|`).
@@ -132,11 +138,13 @@ enum Carry {
     /// A structured table from a previous `from-json`/`select` stage.
     Table(Table),
     FileSet(FileSet),
+    OperationPlan(OperationPlan),
 }
 
 pub enum CapturedStructured {
     Table(Table),
     FileSet(FileSet),
+    OperationPlan(OperationPlan),
 }
 
 enum EitherStructured {
@@ -564,8 +572,8 @@ async fn run_impl(
                             return false;
                         }
                     };
-                    carry = finish_table_stage(
-                        plan.to_table(),
+                    carry = finish_operation_plan_stage(
+                        OperationPlan::archive(plan, force),
                         is_last,
                         stdout_file,
                         capture.as_mut().map(|slot| &mut **slot),
@@ -671,6 +679,43 @@ async fn run_impl(
                     else if let Some(table) = forwarded_table { Carry::Table(table) }
                     else { Carry::None };
             }
+            Kind::Apply(args) => {
+                if !args.is_empty() {
+                    drop(incoming);
+                    err_println!("ion-win: apply: usage: PLAN | apply");
+                    unregister_spawned!();
+                    return false;
+                }
+                let plan = match incoming {
+                    Carry::OperationPlan(plan) => plan,
+                    Carry::None => {
+                        err_println!("ion-win: apply: no OperationPlan piped in");
+                        unregister_spawned!();
+                        return false;
+                    }
+                    _ => {
+                        err_println!("ion-win: apply: expected a typed OperationPlan");
+                        unregister_spawned!();
+                        return false;
+                    }
+                };
+                let mut text = match plan.apply().await {
+                    Ok(text) => text,
+                    Err(error) => {
+                        err_println!("ion-win: {error}");
+                        unregister_spawned!();
+                        return false;
+                    }
+                };
+                text.push('\n');
+                if let Some(mut file) = stdout_file {
+                    let _ = file.write_all(text.as_bytes());
+                    carry = Carry::None;
+                } else {
+                    print!("{text}");
+                    carry = if is_last { Carry::None } else { Carry::OperationPlan(plan) };
+                }
+            }
             Kind::Delete(delete_args) => {
                 let (options, positional) = match crate::delete::parse_flags(delete_args) {
                     Ok(v) => v,
@@ -749,6 +794,11 @@ async fn run_impl(
                     }
                     Carry::FileSet(_) => {
                         err_println!("ion-win: typed FileSet cannot be passed to an external command; convert it with 'to-json' or 'to-csv'");
+                        unregister_spawned!();
+                        return false;
+                    }
+                    Carry::OperationPlan(_) => {
+                        err_println!("ion-win: typed OperationPlan cannot be passed to an external command; inspect it with 'to-json' or 'to-csv'");
                         unregister_spawned!();
                         return false;
                     }
@@ -868,6 +918,10 @@ async fn run_impl(
                 drop(incoming);
                 carry = finish_fileset_stage(fileset.clone(), is_last, stdout_file, capture.as_mut().map(|s| &mut **s));
             }
+            Kind::OperationPlanSource(plan) => {
+                drop(incoming);
+                carry = finish_operation_plan_stage(plan.clone(), is_last, stdout_file, capture.as_mut().map(|s| &mut **s));
+            }
             Kind::FromJson => {
                 let bytes = match incoming {
                     Carry::Bytes(b) => b,
@@ -883,6 +937,11 @@ async fn run_impl(
                     }
                     Carry::FileSet(_) => {
                         err_println!("ion-win: from-json: input is already a FileSet");
+                        unregister_spawned!();
+                        return false;
+                    }
+                    Carry::OperationPlan(_) => {
+                        err_println!("ion-win: from-json: input is already an OperationPlan");
                         unregister_spawned!();
                         return false;
                     }
@@ -926,6 +985,11 @@ async fn run_impl(
                     }
                     Carry::FileSet(_) => {
                         err_println!("ion-win: from-csv: input is already a FileSet");
+                        unregister_spawned!();
+                        return false;
+                    }
+                    Carry::OperationPlan(_) => {
+                        err_println!("ion-win: from-csv: input is already an OperationPlan");
                         unregister_spawned!();
                         return false;
                     }
@@ -1111,6 +1175,7 @@ async fn run_impl(
                 let table = match incoming {
                     Carry::Table(t) => t,
                     Carry::FileSet(f) => f.to_table(),
+                    Carry::OperationPlan(plan) => plan.to_table(),
                     Carry::None => {
                         err_println!(
                             "ion-win: to-json: no table piped in (pipe through 'from-json' first)"
@@ -1140,6 +1205,7 @@ async fn run_impl(
                 let table = match incoming {
                     Carry::Table(t) => t,
                     Carry::FileSet(f) => f.to_table(),
+                    Carry::OperationPlan(plan) => plan.to_table(),
                     Carry::None => {
                         err_println!(
                             "ion-win: to-csv: no table piped in (pipe through 'from-json'/'from-csv' first)"
@@ -1251,6 +1317,8 @@ fn classify_stages(pipeline: &Pipeline, interp: &Interpreter) -> Vec<Kind> {
                 Kind::Move(args[1..].to_vec())
             } else if cmd == "compress" {
                 Kind::Compress(args[1..].to_vec())
+            } else if cmd == "apply" {
+                Kind::Apply(args[1..].to_vec())
             } else if cmd == "delete" {
                 Kind::Delete(args[1..].to_vec())
             } else if cmd == "from-json" {
@@ -1271,6 +1339,8 @@ fn classify_stages(pipeline: &Pipeline, interp: &Interpreter) -> Vec<Kind> {
                 Kind::Stat(args[1..].to_vec())
             } else if let Some(fileset) = interp.get_fileset(&cmd) {
                 Kind::FileSetSource(fileset.clone())
+            } else if let Some(plan) = interp.get_plan(&cmd) {
+                Kind::OperationPlanSource(plan.clone())
             } else if let Some(table) = interp.get_table(&cmd) {
                 Kind::TableSource(table.clone())
             } else if interp.get_function(&cmd).is_some()
@@ -1349,6 +1419,28 @@ fn finish_fileset_stage(
         Carry::None
     } else {
         Carry::FileSet(fileset)
+    }
+}
+
+fn finish_operation_plan_stage(
+    plan: OperationPlan,
+    is_last: bool,
+    stdout_file: Option<std::fs::File>,
+    capture: Option<&mut Option<CapturedStructured>>,
+) -> Carry {
+    if let Some(mut file) = stdout_file {
+        let mut text = plan.to_table().to_json();
+        text.push('\n');
+        let _ = file.write_all(text.as_bytes());
+        Carry::None
+    } else if is_last {
+        match capture {
+            Some(slot) => *slot = Some(CapturedStructured::OperationPlan(plan)),
+            None => println!("{}", plan.to_table().to_json()),
+        }
+        Carry::None
+    } else {
+        Carry::OperationPlan(plan)
     }
 }
 

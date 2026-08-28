@@ -328,6 +328,11 @@ pub const BUILTINS: &[Builtin] = &[
         help_display: Some("dmark add|list|jump"),
     },
     Builtin {
+        name: "apply",
+        is_keyword: false,
+        help_display: Some("PLAN | apply"),
+    },
+    Builtin {
         name: "task",
         is_keyword: false,
         help_display: Some("task create|list|show|delete|run"),
@@ -658,6 +663,12 @@ pub fn help_text(topic: Option<&str>) -> Result<String, String> {
             "Creates standard ZIP files from explicit paths or a FileSet. Per-root mode can preview every archive and backup destination before applying.",
             &["compress report.txt report.zip", "manifest | compress snapshot.zip", "roots | find --recurse | compress --per-root --plan archives --backup backups", "roots | find --recurse | compress --per-root --apply archives --backup backups"],
             &["--plan performs no writes and returns a structured preview.", "Existing archives and backups are refused unless --force is supplied."],
+        ),
+        "apply" => page(
+            "PLAN | apply",
+            "Applies a typed OperationPlan after validating every planned source before the first write.",
+            &["plan | apply"],
+            &["Any FileIdentity or metadata drift aborts the entire operation before files are written."],
         ),
         "delete" => page(
             "delete [--recurse] PATH...\n        TABLE | delete [--recurse]",

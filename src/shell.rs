@@ -856,7 +856,9 @@ fn is_table_producing_command(cmd: &str, interp: &Interpreter) -> bool {
     matches!(
         cmd,
         "from-json" | "select" | "where" | "filter" | "stat" | "from-csv" | "date-column" | "compress"
-    ) || interp.get_table(cmd).is_some() || interp.get_fileset(cmd).is_some()
+    ) || interp.get_table(cmd).is_some()
+        || interp.get_fileset(cmd).is_some()
+        || interp.get_plan(cmd).is_some()
 }
 
 /// Intercepts `let NAME = PIPELINE` — where `PIPELINE`'s *last* stage
@@ -897,7 +899,8 @@ async fn try_dispatch_let_table(
     match captured {
         Some(pipeline_exec::CapturedStructured::Table(table)) => { interp.set_table(name, table); }
         Some(pipeline_exec::CapturedStructured::FileSet(fileset)) => { interp.set_fileset(name, fileset); }
-        None => err_println!("ion-win: let: right-hand side did not produce a table"),
+        Some(pipeline_exec::CapturedStructured::OperationPlan(plan)) => { interp.set_plan(name, plan); }
+        None => err_println!("ion-win: let: right-hand side did not produce a structured value"),
     }
     Some(Flow::Normal)
 }

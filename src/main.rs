@@ -20,6 +20,7 @@ mod jobctl;
 mod job_object;
 mod keyboard_input;
 mod methods;
+mod operation;
 mod pipeline;
 mod pipeline_exec;
 mod procexpand;

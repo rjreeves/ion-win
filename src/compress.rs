@@ -124,7 +124,13 @@ pub struct ArchivePlanItem {
     pub root: PathBuf,
     pub archive: PathBuf,
     pub backup: Option<PathBuf>,
-    entries: Vec<(String, PathBuf)>,
+    entries: Vec<ArchivePlanEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchivePlanEntry {
+    pub archive_name: String,
+    pub source: crate::fileset::FileRecord,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -267,13 +273,17 @@ pub fn plan_fileset_per_root(
         let relative = record.path.strip_prefix(root).expect("matched root prefix");
         groups[index]
             .entries
-            .push((path_entry_name(relative), record.path.clone()));
+            .push(ArchivePlanEntry {
+                archive_name: path_entry_name(relative),
+                source: record.clone(),
+            });
     }
 
     Ok(ArchivePlan { items: groups })
 }
 
 pub async fn apply_archive_plan(plan: &ArchivePlan, force: bool) -> Result<String, String> {
+    validate_archive_plan(plan)?;
     if !force {
         for item in &plan.items {
             if item.archive.exists() {
@@ -296,7 +306,10 @@ pub async fn apply_archive_plan(plan: &ArchivePlan, force: bool) -> Result<Strin
     let mut summaries = Vec::with_capacity(plan.items.len());
     for item in &plan.items {
         let result = compress_entries(
-            item.entries.clone(),
+            item.entries
+                .iter()
+                .map(|entry| (entry.archive_name.clone(), entry.source.path.clone()))
+                .collect(),
             &item.archive.to_string_lossy(),
             force,
             0,
@@ -327,6 +340,40 @@ pub async fn apply_archive_plan(plan: &ArchivePlan, force: bool) -> Result<Strin
         ));
     }
     Ok(summaries.join("\n"))
+}
+
+/// Reopens every planned source before any destination is created. Windows
+/// handle identity detects replacement at the same path; size and modified
+/// time detect content drift while preserving a clear cross-platform check.
+pub fn validate_archive_plan(plan: &ArchivePlan) -> Result<(), String> {
+    for item in &plan.items {
+        for entry in &item.entries {
+            let expected = &entry.source;
+            let current = crate::fileset::FileRecord::from_path(expected.path.clone(), None)
+                .map_err(|error| {
+                    format!(
+                        "apply: source drift: {} is unavailable: {error}",
+                        expected.path.display()
+                    )
+                })?;
+            if expected.identity != current.identity {
+                return Err(format!(
+                    "apply: source drift: file identity changed: {}",
+                    expected.path.display()
+                ));
+            }
+            if expected.kind != current.kind
+                || expected.size != current.size
+                || expected.modified != current.modified
+            {
+                return Err(format!(
+                    "apply: source drift: metadata changed: {}",
+                    expected.path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The `Table`-consuming pipeline form (`TABLE | compress DEST.zip`):
@@ -776,6 +823,60 @@ mod tests {
             vec![("nested/file.txt".to_string(), "planned".to_string())]
         );
         assert_eq!(fs::read(&archive).unwrap(), fs::read(&backup).unwrap());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn archive_plan_rejects_source_drift_before_creating_destinations() {
+        let dir = temp_dir("plan-drift");
+        let root = dir.join("source");
+        let source = root.join("file.txt");
+        write_file(&source, "before");
+        let fileset = FileSet::new(
+            vec![FileRecord::from_path(source.clone(), None).unwrap()],
+            "find",
+        )
+        .with_roots(vec![root]);
+        let archives = dir.join("archives");
+        let backups = dir.join("backups");
+        let plan = plan_fileset_per_root(
+            &fileset,
+            &archives.to_string_lossy(),
+            Some(&backups.to_string_lossy()),
+        )
+        .unwrap();
+
+        // A different size guarantees metadata drift even on filesystems
+        // whose timestamp granularity cannot distinguish these writes.
+        write_file(&source, "after-and-a-different-size");
+        let error = apply_archive_plan(&plan, false).await.unwrap_err();
+
+        assert!(error.contains("source drift"), "{error}");
+        assert!(!archives.exists(), "validation must finish before archive writes");
+        assert!(!backups.exists(), "validation must finish before backup writes");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn archive_plan_detects_same_path_replacement_by_windows_file_identity() {
+        let dir = temp_dir("plan-identity-drift");
+        let root = dir.join("source");
+        let source = root.join("file.txt");
+        write_file(&source, "same-size");
+        let original = FileRecord::from_path(source.clone(), None).unwrap();
+        let fileset = FileSet::new(vec![original.clone()], "find").with_roots(vec![root]);
+        let archives = dir.join("archives");
+        let plan = plan_fileset_per_root(&fileset, &archives.to_string_lossy(), None).unwrap();
+
+        fs::remove_file(&source).unwrap();
+        write_file(&source, "new-value");
+        let replacement = FileRecord::from_path(source, None).unwrap();
+        assert_ne!(original.identity, replacement.identity);
+
+        let error = apply_archive_plan(&plan, false).await.unwrap_err();
+        assert!(error.contains("file identity changed"), "{error}");
+        assert!(!archives.exists(), "identity validation must precede writes");
         let _ = fs::remove_dir_all(dir);
     }
 
