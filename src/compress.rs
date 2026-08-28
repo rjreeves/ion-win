@@ -342,6 +342,50 @@ pub async fn apply_archive_plan(plan: &ArchivePlan, force: bool) -> Result<Strin
     Ok(summaries.join("\n"))
 }
 
+/// Builds one planned archive at a caller-provided staging path and verifies
+/// that the resulting ZIP contains every planned entry. The operation layer
+/// publishes this file with an atomic rename only after this succeeds.
+pub(crate) async fn build_planned_archive(
+    item: &ArchivePlanItem,
+    staging: &Path,
+) -> Result<String, String> {
+    if staging.exists() {
+        fs::remove_file(staging).map_err(|error| {
+            format!("compress: could not clear staging file {}: {error}", staging.display())
+        })?;
+    }
+    let result = compress_entries(
+        item.entries
+            .iter()
+            .map(|entry| (entry.archive_name.clone(), entry.source.path.clone()))
+            .collect(),
+        &staging.to_string_lossy(),
+        false,
+        0,
+    )
+    .await;
+    let verification = (|| -> Result<(), String> {
+        let file = fs::File::open(staging).map_err(|error| {
+            format!("compress: staging archive was not created: {}: {error}", staging.display())
+        })?;
+        let archive = ZipArchive::new(file).map_err(|error| {
+            format!("compress: staging archive is invalid: {}: {error}", staging.display())
+        })?;
+        if archive.len() != item.entries.len() {
+            return Err(format!(
+                "compress: staging archive {} contains {} of {} planned entries",
+                staging.display(), archive.len(), item.entries.len()
+            ));
+        }
+        Ok(())
+    })();
+    if let Err(error) = verification {
+        let _ = fs::remove_file(staging);
+        return Err(error);
+    }
+    Ok(result)
+}
+
 /// Reopens every planned source before any destination is created. Windows
 /// handle identity detects replacement at the same path; size and modified
 /// time detect content drift while preserving a clear cross-platform check.

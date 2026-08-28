@@ -95,16 +95,7 @@ impl OperationPlan {
         state.put_journal(journal.clone()).await?;
         let result: Result<(), String> = match &self.operation {
             PlannedOperation::Archive(plan) => {
-                match crate::compress::apply_archive_plan(plan, self.force).await {
-                    Ok(_) => {
-                        for item in &plan.items {
-                            journal.outputs.push(journal_output("archive", item.archive.clone())?);
-                            if let Some(backup) = &item.backup { journal.outputs.push(journal_output("backup", backup.clone())?); }
-                        }
-                        state.put_journal(journal.clone()).await
-                    }
-                    Err(error) => Err(error),
-                }
+                apply_archive_transaction(plan, self.force, &mut journal, state).await
             },
             PlannedOperation::Copy(plan) => apply_transfer(plan, self.force, false, &mut journal, state).await,
             PlannedOperation::Move(plan) => apply_transfer(plan, self.force, true, &mut journal, state).await,
@@ -126,6 +117,107 @@ impl OperationPlan {
             }
         }
     }
+}
+
+async fn apply_archive_transaction(
+    plan: &ArchivePlan,
+    force: bool,
+    journal: &mut OperationJournal,
+    state: &crate::state::StateHandle,
+) -> Result<(), String> {
+    crate::compress::validate_archive_plan(plan)?;
+    for item in &plan.items {
+        validate_archive_destination(&item.archive, force)?;
+        if let Some(backup) = &item.backup { validate_archive_destination(backup, force)?; }
+    }
+
+    for item in &plan.items {
+        let archive_staging = match staging_path(&item.archive, &journal.id, "archive") {
+            Ok(path) => path,
+            Err(error) => {
+                rollback_and_checkpoint(journal, state).await;
+                return Err(error);
+            }
+        };
+        let build_result = crate::compress::build_planned_archive(item, &archive_staging).await;
+        if let Err(error) = build_result {
+            let _ = std::fs::remove_file(&archive_staging);
+            rollback_and_checkpoint(journal, state).await;
+            return Err(error);
+        }
+        if let Err(error) = publish_staged(&archive_staging, &item.archive, force) {
+            let _ = std::fs::remove_file(&archive_staging);
+            rollback_and_checkpoint(journal, state).await;
+            return Err(error);
+        }
+        if let Err(error) = checkpoint_output("archive", item.archive.clone(), journal, state).await {
+            rollback_and_checkpoint(journal, state).await;
+            return Err(error);
+        }
+
+        if let Some(backup) = &item.backup {
+            let backup_staging = match staging_path(backup, &journal.id, "backup") {
+                Ok(path) => path,
+                Err(error) => {
+                    rollback_and_checkpoint(journal, state).await;
+                    return Err(error);
+                }
+            };
+            if let Some(parent) = backup_staging.parent() {
+                if let Err(error) = std::fs::create_dir_all(parent) {
+                    rollback_and_checkpoint(journal, state).await;
+                    return Err(format!("compress: could not create {}: {error}", parent.display()));
+                }
+            }
+            if let Err(error) = std::fs::copy(&item.archive, &backup_staging) {
+                let _ = std::fs::remove_file(&backup_staging);
+                rollback_and_checkpoint(journal, state).await;
+                return Err(format!("compress: could not stage backup {}: {error}", backup.display()));
+            }
+            if let Err(error) = publish_staged(&backup_staging, backup, force) {
+                let _ = std::fs::remove_file(&backup_staging);
+                rollback_and_checkpoint(journal, state).await;
+                return Err(error);
+            }
+            if let Err(error) = checkpoint_output("backup", backup.clone(), journal, state).await {
+                rollback_and_checkpoint(journal, state).await;
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_archive_destination(path: &std::path::Path, force: bool) -> Result<(), String> {
+    if path.exists() && !force {
+        return Err(format!("compress: {}: destination already exists (use --force to overwrite)", path.display()));
+    }
+    Ok(())
+}
+
+fn staging_path(path: &std::path::Path, journal_id: &str, role: &str) -> Result<PathBuf, String> {
+    let parent = path.parent().filter(|value| !value.as_os_str().is_empty()).unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|error| format!("compress: could not create {}: {error}", parent.display()))?;
+    let name = path.file_name().ok_or_else(|| format!("compress: invalid destination: {}", path.display()))?.to_string_lossy();
+    Ok(parent.join(format!(".{name}.{journal_id}.{role}.tmp")))
+}
+
+fn publish_staged(staging: &std::path::Path, destination: &std::path::Path, force: bool) -> Result<(), String> {
+    if destination.exists() {
+        if !force { return Err(format!("compress: destination appeared during apply: {}", destination.display())); }
+        std::fs::remove_file(destination).map_err(|error| format!("compress: could not replace {}: {error}", destination.display()))?;
+    }
+    std::fs::rename(staging, destination).map_err(|error| format!("compress: could not publish {}: {error}", destination.display()))
+}
+
+async fn checkpoint_output(role: &str, path: PathBuf, journal: &mut OperationJournal, state: &crate::state::StateHandle) -> Result<(), String> {
+    journal.outputs.push(journal_output(role, path)?);
+    state.put_journal(journal.clone()).await
+}
+
+async fn rollback_and_checkpoint(journal: &mut OperationJournal, state: &crate::state::StateHandle) {
+    transactional_rollback(journal);
+    let _ = state.put_journal(journal.clone()).await;
 }
 
 async fn apply_delete(plan: &DeletePlan, journal: &mut OperationJournal, state: &crate::state::StateHandle) -> Result<(), String> {
@@ -462,6 +554,57 @@ mod tests {
         assert_eq!(journals.len(), 1);
         assert_eq!(journals[0].status, "failed");
         assert!(journals[0].outputs.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn archive_plan_checkpoints_each_atomic_output_and_undo_removes_them() {
+        let (root, source, fileset) = transfer_fixture("archive-transaction");
+        let fileset = fileset.with_roots(vec![source.parent().unwrap().to_path_buf()]);
+        let archives = root.join("archives");
+        let backups = root.join("backups");
+        let archive_plan = crate::compress::plan_fileset_per_root(
+            &fileset,
+            &archives.to_string_lossy(),
+            Some(&backups.to_string_lossy()),
+        ).unwrap();
+        let plan = OperationPlan::archive(archive_plan, false);
+        let state = crate::state::spawn_memory();
+
+        let journal = plan.apply(&state).await.unwrap();
+
+        assert_eq!(journal.status, "applied");
+        assert_eq!(journal.outputs.iter().map(|output| output.role.as_str()).collect::<Vec<_>>(), vec!["archive", "backup"]);
+        assert!(journal.outputs.iter().all(|output| output.record.path.exists()));
+        let undone = journal.undo().unwrap();
+        assert_eq!(undone.status, "undone");
+        assert!(journal.outputs.iter().all(|output| !output.record.path.exists()));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn archive_backup_failure_rolls_back_an_already_published_archive() {
+        let (root, source, fileset) = transfer_fixture("archive-rollback");
+        let fileset = fileset.with_roots(vec![source.parent().unwrap().to_path_buf()]);
+        let archives = root.join("archives");
+        let backups = root.join("blocked-backups");
+        let archive_plan = crate::compress::plan_fileset_per_root(
+            &fileset,
+            &archives.to_string_lossy(),
+            Some(&backups.to_string_lossy()),
+        ).unwrap();
+        let archive_path = archive_plan.items[0].archive.clone();
+        std::fs::write(&backups, "blocks creation of the backup directory").unwrap();
+        let plan = OperationPlan::archive(archive_plan, false);
+        let state = crate::state::spawn_memory();
+
+        let error = plan.apply(&state).await.unwrap_err();
+
+        assert!(error.contains("could not create"), "{error}");
+        assert!(!archive_path.exists(), "published archive must be rolled back when backup staging fails");
+        let journals = state.list_journals().await.unwrap();
+        assert_eq!(journals[0].status, "rolled_back");
+        assert_eq!(journals[0].outputs.len(), 1, "the completed archive remains as durable rollback evidence");
         let _ = std::fs::remove_dir_all(root);
     }
 }

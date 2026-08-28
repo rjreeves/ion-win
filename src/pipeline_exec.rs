@@ -659,8 +659,12 @@ async fn run_impl(
                                     return false;
                                 }
                             };
-                            let result = match crate::compress::apply_archive_plan(&plan, force).await {
-                                Ok(result) => result,
+                            let operation_plan = OperationPlan::archive(plan, force);
+                            let result = match operation_plan.apply(state).await {
+                                Ok(journal) => format!(
+                                    "ion-win: compress: applied {} output(s) (journal {})",
+                                    journal.outputs.len(), journal.id
+                                ),
                                 Err(error) => {
                                     err_println!("ion-win: {error}");
                                     unregister_spawned!();
