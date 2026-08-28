@@ -333,6 +333,16 @@ pub const BUILTINS: &[Builtin] = &[
         help_display: Some("PLAN | apply"),
     },
     Builtin {
+        name: "journal",
+        is_keyword: false,
+        help_display: Some("journal [OPERATION_ID]"),
+    },
+    Builtin {
+        name: "undo",
+        is_keyword: false,
+        help_display: Some("JOURNAL | undo"),
+    },
+    Builtin {
         name: "task",
         is_keyword: false,
         help_display: Some("task create|list|show|delete|run"),
@@ -669,6 +679,18 @@ pub fn help_text(topic: Option<&str>) -> Result<String, String> {
             "Applies a typed OperationPlan after validating every planned source before the first write.",
             &["plan | apply"],
             &["Any FileIdentity or metadata drift aborts the entire operation before files are written."],
+        ),
+        "journal" => page(
+            "journal [OPERATION_ID]",
+            "Lists persisted operation journals or loads one typed journal by operation ID.",
+            &["journal", "journal operation-123 | to-json"],
+            &["Completed apply and undo records persist across Ion restarts."],
+        ),
+        "undo" => page(
+            "JOURNAL | undo",
+            "Reverses outputs created by an operation journal after validating every output identity.",
+            &["result | undo", "journal operation-123 | undo"],
+            &["Undo refuses the entire operation if any output is missing, replaced, or modified."],
         ),
         "delete" => page(
             "delete [--recurse] PATH...\n        TABLE | delete [--recurse]",

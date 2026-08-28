@@ -8,7 +8,7 @@
 
 use crate::functions::FunctionDef;
 use crate::fileset::FileSet;
-use crate::operation::OperationPlan;
+use crate::operation::{OperationJournal, OperationPlan};
 use crate::table::Table;
 use crate::{err_eprintln, err_println};
 use std::collections::HashMap;
@@ -58,6 +58,7 @@ pub struct Interpreter {
     tables: Vec<HashMap<String, Table>>,
     filesets: Vec<HashMap<String, FileSet>>,
     plans: Vec<HashMap<String, OperationPlan>>,
+    journals: Vec<HashMap<String, OperationJournal>>,
 }
 
 impl Default for Interpreter {
@@ -72,6 +73,7 @@ impl Default for Interpreter {
             tables: vec![HashMap::new()],
             filesets: vec![HashMap::new()],
             plans: vec![HashMap::new()],
+            journals: vec![HashMap::new()],
         }
     }
 }
@@ -993,6 +995,10 @@ impl Interpreter {
         self.plans.iter().rev().find_map(|frame| frame.get(name))
     }
 
+    pub fn get_journal(&self, name: &str) -> Option<&OperationJournal> {
+        self.journals.iter().rev().find_map(|frame| frame.get(name))
+    }
+
     /// `let`'s core ownership rule (ion-manual page 20): if `name` already
     /// exists in any visible frame, updates it there in place — the frame
     /// that first defined it keeps "owning" it, so a nested block's `let`
@@ -1046,6 +1052,13 @@ impl Interpreter {
             }
         }
         self.plans.last_mut().expect("global scope frame is never popped").insert(name, value)
+    }
+
+    pub fn set_journal(&mut self, name: String, value: OperationJournal) -> Option<OperationJournal> {
+        for frame in self.journals.iter_mut().rev() {
+            if let Some(slot) = frame.get_mut(&name) { return Some(std::mem::replace(slot, value)); }
+        }
+        self.journals.last_mut().expect("global scope frame is never popped").insert(name, value)
     }
 
     /// Defines a *new* binding directly in the current (innermost) frame,
@@ -1146,6 +1159,7 @@ impl Interpreter {
         self.tables.push(HashMap::new());
         self.filesets.push(HashMap::new());
         self.plans.push(HashMap::new());
+        self.journals.push(HashMap::new());
     }
 
     /// Pops the innermost scope frame, deleting whatever it newly defined
@@ -1168,6 +1182,7 @@ impl Interpreter {
         if self.plans.len() > 1 {
             self.plans.pop();
         }
+        if self.journals.len() > 1 { self.journals.pop(); }
     }
 
     /// Hides every scope above the global one, returning them so the
@@ -1184,6 +1199,7 @@ impl Interpreter {
         Vec<HashMap<String, Table>>,
         Vec<HashMap<String, FileSet>>,
         Vec<HashMap<String, OperationPlan>>,
+        Vec<HashMap<String, OperationJournal>>,
     ) {
         (
             self.scalars.split_off(1),
@@ -1191,6 +1207,7 @@ impl Interpreter {
             self.tables.split_off(1),
             self.filesets.split_off(1),
             self.plans.split_off(1),
+            self.journals.split_off(1),
         )
     }
 
@@ -1204,6 +1221,7 @@ impl Interpreter {
             Vec<HashMap<String, Table>>,
             Vec<HashMap<String, FileSet>>,
             Vec<HashMap<String, OperationPlan>>,
+            Vec<HashMap<String, OperationJournal>>,
         ),
     ) {
         self.scalars.extend(saved.0);
@@ -1211,6 +1229,7 @@ impl Interpreter {
         self.tables.extend(saved.2);
         self.filesets.extend(saved.3);
         self.plans.extend(saved.4);
+        self.journals.extend(saved.5);
     }
 
     /// Expands a single raw token as a scalar value: `$var`/`@var`
@@ -1275,6 +1294,9 @@ impl Interpreter {
                 if frame.remove(&token.text).is_some() { break; }
             }
             for frame in self.plans.iter_mut().rev() {
+                if frame.remove(&token.text).is_some() { break; }
+            }
+            for frame in self.journals.iter_mut().rev() {
                 if frame.remove(&token.text).is_some() { break; }
             }
         }

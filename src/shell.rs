@@ -855,10 +855,11 @@ fn split_at_top_level_chain_op(line: &str) -> Option<(&str, ChainOp, &str)> {
 fn is_table_producing_command(cmd: &str, interp: &Interpreter) -> bool {
     matches!(
         cmd,
-        "from-json" | "select" | "where" | "filter" | "stat" | "from-csv" | "date-column" | "compress"
+        "from-json" | "select" | "where" | "filter" | "stat" | "from-csv" | "date-column" | "compress" | "apply" | "undo" | "journal"
     ) || interp.get_table(cmd).is_some()
         || interp.get_fileset(cmd).is_some()
         || interp.get_plan(cmd).is_some()
+        || interp.get_journal(cmd).is_some()
 }
 
 /// Intercepts `let NAME = PIPELINE` — where `PIPELINE`'s *last* stage
@@ -900,6 +901,7 @@ async fn try_dispatch_let_table(
         Some(pipeline_exec::CapturedStructured::Table(table)) => { interp.set_table(name, table); }
         Some(pipeline_exec::CapturedStructured::FileSet(fileset)) => { interp.set_fileset(name, fileset); }
         Some(pipeline_exec::CapturedStructured::OperationPlan(plan)) => { interp.set_plan(name, plan); }
+        Some(pipeline_exec::CapturedStructured::OperationJournal(journal)) => { interp.set_journal(name, journal); }
         None => err_println!("ion-win: let: right-hand side did not produce a structured value"),
     }
     Some(Flow::Normal)
@@ -1011,6 +1013,10 @@ async fn dispatch(line: &str, interp: &mut Interpreter, state: &StateHandle) -> 
                     interp.set_previous_status(false);
                 }
             }
+        }
+        "journal" => {
+            let ok = pipeline_exec::run(&parsed, interp, state).await;
+            interp.set_previous_status(ok);
         }
 
         // These operate on raw tokens because destination names must not

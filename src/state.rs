@@ -19,6 +19,7 @@ pub const DIR_BOOKMARKS: TableDefinition<&str, &str> = TableDefinition::new("dir
 /// Named reusable task definitions, stored independently from executions.
 pub const TASKS: TableDefinition<&str, &str> = TableDefinition::new("tasks");
 pub const SCHEDULES: TableDefinition<&str, &str> = TableDefinition::new("schedules");
+pub const OPERATION_JOURNALS: TableDefinition<&str, &str> = TableDefinition::new("operation_journals");
 
 #[derive(Debug)]
 pub enum StateCommand {
@@ -82,6 +83,17 @@ pub enum StateCommand {
     DeleteSchedule {
         name: String,
         reply: oneshot::Sender<Result<bool, String>>,
+    },
+    PutJournal {
+        journal: crate::operation::OperationJournal,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    GetJournal {
+        id: String,
+        reply: oneshot::Sender<Result<Option<crate::operation::OperationJournal>, String>>,
+    },
+    ListJournals {
+        reply: oneshot::Sender<Result<Vec<crate::operation::OperationJournal>, String>>,
     },
 }
 
@@ -252,6 +264,24 @@ impl StateHandle {
         rx.await.map_err(|_| "state worker dropped".to_string())?
     }
 
+    pub async fn put_journal(&self, journal: crate::operation::OperationJournal) -> Result<(), String> {
+        let (reply, rx) = oneshot::channel();
+        self.send(StateCommand::PutJournal { journal, reply }).await;
+        rx.await.map_err(|_| "state worker dropped".to_string())?
+    }
+
+    pub async fn get_journal(&self, id: impl Into<String>) -> Result<Option<crate::operation::OperationJournal>, String> {
+        let (reply, rx) = oneshot::channel();
+        self.send(StateCommand::GetJournal { id: id.into(), reply }).await;
+        rx.await.map_err(|_| "state worker dropped".to_string())?
+    }
+
+    pub async fn list_journals(&self) -> Result<Vec<crate::operation::OperationJournal>, String> {
+        let (reply, rx) = oneshot::channel();
+        self.send(StateCommand::ListJournals { reply }).await;
+        rx.await.map_err(|_| "state worker dropped".to_string())?
+    }
+
     async fn send(&self, cmd: StateCommand) {
         // Bounded channel backpressure is fine here: the worker drains fast
         // and this is the only place allowed to block briefly on contention.
@@ -269,6 +299,7 @@ pub fn spawn(db_path: PathBuf) -> Result<StateHandle, redb::Error> {
         write_txn.open_table(DIR_BOOKMARKS)?;
         write_txn.open_table(TASKS)?;
         write_txn.open_table(SCHEDULES)?;
+        write_txn.open_table(OPERATION_JOURNALS)?;
         write_txn.commit()?;
     }
 
@@ -293,9 +324,10 @@ pub fn spawn_memory() -> StateHandle {
         let mut bookmarks = HashMap::<String, String>::new();
         let mut tasks = HashMap::<String, crate::task::TaskDefinition>::new();
         let mut schedules = HashMap::<String, crate::schedule::ScheduleDefinition>::new();
+        let mut journals = HashMap::<String, crate::operation::OperationJournal>::new();
 
         while let Some(cmd) = rx.recv().await {
-            handle_memory_command(&mut vars, &mut bookmarks, &mut tasks, &mut schedules, cmd);
+            handle_memory_command(&mut vars, &mut bookmarks, &mut tasks, &mut schedules, &mut journals, cmd);
         }
     });
 
@@ -590,6 +622,41 @@ fn handle_command(db: &Database, cmd: StateCommand) {
             })();
             let _ = reply.send(result);
         }
+        StateCommand::PutJournal { journal, reply } => {
+            let result = (|| -> Result<(), String> {
+                let write_txn = db.begin_write().map_err(|error| error.to_string())?;
+                {
+                    let mut table = write_txn.open_table(OPERATION_JOURNALS).map_err(|error| error.to_string())?;
+                    let encoded = journal.to_json();
+                    table.insert(journal.id.as_str(), encoded.as_str()).map_err(|error| error.to_string())?;
+                }
+                write_txn.commit().map_err(|error| error.to_string())?;
+                Ok(())
+            })();
+            let _ = reply.send(result);
+        }
+        StateCommand::GetJournal { id, reply } => {
+            let result = (|| -> Result<Option<crate::operation::OperationJournal>, String> {
+                let read_txn = db.begin_read().map_err(|error| error.to_string())?;
+                let table = read_txn.open_table(OPERATION_JOURNALS).map_err(|error| error.to_string())?;
+                table.get(id.as_str()).map_err(|error| error.to_string())?.map(|value| crate::operation::OperationJournal::from_json(value.value())).transpose()
+            })();
+            let _ = reply.send(result);
+        }
+        StateCommand::ListJournals { reply } => {
+            let result = (|| -> Result<Vec<crate::operation::OperationJournal>, String> {
+                let read_txn = db.begin_read().map_err(|error| error.to_string())?;
+                let table = read_txn.open_table(OPERATION_JOURNALS).map_err(|error| error.to_string())?;
+                let mut journals = Vec::new();
+                for entry in table.iter().map_err(|error| error.to_string())? {
+                    let (_, value) = entry.map_err(|error| error.to_string())?;
+                    journals.push(crate::operation::OperationJournal::from_json(value.value())?);
+                }
+                journals.sort_by(|left, right| right.started_at.cmp(&left.started_at).then_with(|| right.id.cmp(&left.id)));
+                Ok(journals)
+            })();
+            let _ = reply.send(result);
+        }
     }
 }
 
@@ -598,6 +665,7 @@ fn handle_memory_command(
     bookmarks: &mut HashMap<String, String>,
     tasks: &mut HashMap<String, crate::task::TaskDefinition>,
     schedules: &mut HashMap<String, crate::schedule::ScheduleDefinition>,
+    journals: &mut HashMap<String, crate::operation::OperationJournal>,
     cmd: StateCommand,
 ) {
     match cmd {
@@ -709,6 +777,18 @@ fn handle_memory_command(
         StateCommand::DeleteSchedule { name, reply } => {
             let _ = reply.send(Ok(schedules.remove(&name).is_some()));
         }
+        StateCommand::PutJournal { journal, reply } => {
+            journals.insert(journal.id.clone(), journal);
+            let _ = reply.send(Ok(()));
+        }
+        StateCommand::GetJournal { id, reply } => {
+            let _ = reply.send(Ok(journals.get(&id).cloned()));
+        }
+        StateCommand::ListJournals { reply } => {
+            let mut values = journals.values().cloned().collect::<Vec<_>>();
+            values.sort_by(|left, right| right.started_at.cmp(&left.started_at).then_with(|| right.id.cmp(&left.id)));
+            let _ = reply.send(Ok(values));
+        }
     }
 }
 
@@ -734,6 +814,26 @@ mod tests {
             true,
         )
         .unwrap()
+    }
+
+    fn journal(id: &str) -> crate::operation::OperationJournal {
+        crate::operation::OperationJournal {
+            id: id.to_string(), plan_id: "plan".to_string(), operation: "compress".to_string(),
+            started_at: 1, finished_at: 2, outputs: Vec::new(), undo_safe: true, undone_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_operation_journals_store_load_list_and_update() {
+        let state = spawn_memory();
+        state.put_journal(journal("operation-b")).await.unwrap();
+        state.put_journal(journal("operation-a")).await.unwrap();
+        assert_eq!(state.get_journal("operation-a").await.unwrap().unwrap().plan_id, "plan");
+        let mut updated = journal("operation-a");
+        updated.undone_at = Some(3);
+        state.put_journal(updated.clone()).await.unwrap();
+        assert_eq!(state.get_journal("operation-a").await.unwrap(), Some(updated));
+        assert_eq!(state.list_journals().await.unwrap().len(), 2);
     }
 
     #[tokio::test]

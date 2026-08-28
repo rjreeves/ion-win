@@ -26,7 +26,7 @@ use crate::err_println;
 use crate::execution;
 use crate::fileset::FileSet;
 use crate::interp::Interpreter;
-use crate::operation::OperationPlan;
+use crate::operation::{OperationJournal, OperationPlan};
 use crate::jobctl;
 use crate::pipeline::{PipeKind, Pipeline, Redirect, Stream};
 use crate::state::StateHandle;
@@ -74,6 +74,8 @@ enum Kind {
     /// are deliberately separate pipeline stages so plans can be stored,
     /// inspected, and validated immediately before the first write.
     Apply(Vec<String>),
+    Undo(Vec<String>),
+    Journal(Vec<String>),
     /// `delete [--recurse] [--permanent --force] [PATH...]`. With
     /// explicit paths it ignores pipeline input; with no paths it consumes
     /// the incoming table's `path` column. Unlike copy/compress, it does
@@ -112,6 +114,7 @@ enum Kind {
     TableSource(Table),
     FileSetSource(FileSet),
     OperationPlanSource(OperationPlan),
+    OperationJournalSource(OperationJournal),
     /// A builtin/function name that isn't yet supported as a pipeline
     /// stage. Empty string means the stage had no command at all (e.g. a
     /// stray `|`).
@@ -139,12 +142,14 @@ enum Carry {
     Table(Table),
     FileSet(FileSet),
     OperationPlan(OperationPlan),
+    OperationJournal(OperationJournal),
 }
 
 pub enum CapturedStructured {
     Table(Table),
     FileSet(FileSet),
     OperationPlan(OperationPlan),
+    OperationJournal(OperationJournal),
 }
 
 enum EitherStructured {
@@ -213,7 +218,7 @@ pub async fn run_capturing_table(
 async fn run_impl(
     pipeline: &Pipeline,
     interp: &mut Interpreter,
-    _state: &StateHandle,
+    state: &StateHandle,
     mut capture: Option<&mut Option<CapturedStructured>>,
 ) -> bool {
     if pipeline.stages.is_empty() || pipeline.stages.iter().all(|s| s.tokens.is_empty()) {
@@ -699,21 +704,92 @@ async fn run_impl(
                         return false;
                     }
                 };
-                let mut text = match plan.apply().await {
-                    Ok(text) => text,
+                let journal = match plan.apply().await {
+                    Ok(journal) => journal,
                     Err(error) => {
                         err_println!("ion-win: {error}");
                         unregister_spawned!();
                         return false;
                     }
                 };
-                text.push('\n');
-                if let Some(mut file) = stdout_file {
-                    let _ = file.write_all(text.as_bytes());
-                    carry = Carry::None;
+                if let Err(error) = state.put_journal(journal.clone()).await {
+                    err_println!("ion-win: apply: operation succeeded but its journal could not be persisted: {error}");
+                }
+                carry = finish_operation_journal_stage(journal, is_last, stdout_file, capture.as_mut().map(|slot| &mut **slot));
+            }
+            Kind::Undo(args) => {
+                if !args.is_empty() {
+                    drop(incoming);
+                    err_println!("ion-win: undo: usage: JOURNAL | undo");
+                    unregister_spawned!();
+                    return false;
+                }
+                let journal = match incoming {
+                    Carry::OperationJournal(journal) => journal,
+                    Carry::None => {
+                        err_println!("ion-win: undo: no OperationJournal piped in");
+                        unregister_spawned!();
+                        return false;
+                    }
+                    _ => {
+                        err_println!("ion-win: undo: expected a typed OperationJournal");
+                        unregister_spawned!();
+                        return false;
+                    }
+                };
+                let undone = match journal.undo() {
+                    Ok(undone) => undone,
+                    Err(error) => {
+                        err_println!("ion-win: {error}");
+                        unregister_spawned!();
+                        return false;
+                    }
+                };
+                if let Err(error) = state.put_journal(undone.clone()).await {
+                    err_println!("ion-win: undo: outputs were removed but the journal update could not be persisted: {error}");
+                }
+                carry = finish_operation_journal_stage(undone, is_last, stdout_file, capture.as_mut().map(|slot| &mut **slot));
+            }
+            Kind::Journal(args) => {
+                drop(incoming);
+                if args.len() > 1 {
+                    err_println!("ion-win: journal: usage: journal [OPERATION_ID]");
+                    unregister_spawned!();
+                    return false;
+                }
+                if let Some(id) = args.first() {
+                    let journal = match state.get_journal(id).await {
+                        Ok(Some(journal)) => journal,
+                        Ok(None) => {
+                            err_println!("ion-win: journal: operation not found: {id}");
+                            unregister_spawned!();
+                            return false;
+                        }
+                        Err(error) => {
+                            err_println!("ion-win: journal: {error}");
+                            unregister_spawned!();
+                            return false;
+                        }
+                    };
+                    carry = finish_operation_journal_stage(journal, is_last, stdout_file, capture.as_mut().map(|slot| &mut **slot));
                 } else {
-                    print!("{text}");
-                    carry = if is_last { Carry::None } else { Carry::OperationPlan(plan) };
+                    let journals = match state.list_journals().await {
+                        Ok(journals) => journals,
+                        Err(error) => {
+                            err_println!("ion-win: journal: {error}");
+                            unregister_spawned!();
+                            return false;
+                        }
+                    };
+                    let table = Table { rows: journals.iter().map(|journal| vec![
+                        ("operation_id".to_string(), journal.id.clone()),
+                        ("plan_id".to_string(), journal.plan_id.clone()),
+                        ("operation".to_string(), journal.operation.clone()),
+                        ("status".to_string(), if journal.undone_at.is_some() { "undone" } else { "applied" }.to_string()),
+                        ("output_count".to_string(), journal.outputs.len().to_string()),
+                        ("started_at".to_string(), journal.started_at.to_string()),
+                    ]).collect() };
+                    carry = finish_table_stage(table, is_last, stdout_file, capture.as_mut().map(|slot| &mut **slot));
                 }
             }
             Kind::Delete(delete_args) => {
@@ -799,6 +875,11 @@ async fn run_impl(
                     }
                     Carry::OperationPlan(_) => {
                         err_println!("ion-win: typed OperationPlan cannot be passed to an external command; inspect it with 'to-json' or 'to-csv'");
+                        unregister_spawned!();
+                        return false;
+                    }
+                    Carry::OperationJournal(_) => {
+                        err_println!("ion-win: typed OperationJournal cannot be passed to an external command; inspect it with 'to-json' or 'to-csv'");
                         unregister_spawned!();
                         return false;
                     }
@@ -922,6 +1003,10 @@ async fn run_impl(
                 drop(incoming);
                 carry = finish_operation_plan_stage(plan.clone(), is_last, stdout_file, capture.as_mut().map(|s| &mut **s));
             }
+            Kind::OperationJournalSource(journal) => {
+                drop(incoming);
+                carry = finish_operation_journal_stage(journal.clone(), is_last, stdout_file, capture.as_mut().map(|slot| &mut **slot));
+            }
             Kind::FromJson => {
                 let bytes = match incoming {
                     Carry::Bytes(b) => b,
@@ -942,6 +1027,11 @@ async fn run_impl(
                     }
                     Carry::OperationPlan(_) => {
                         err_println!("ion-win: from-json: input is already an OperationPlan");
+                        unregister_spawned!();
+                        return false;
+                    }
+                    Carry::OperationJournal(_) => {
+                        err_println!("ion-win: from-json: input is already an OperationJournal");
                         unregister_spawned!();
                         return false;
                     }
@@ -990,6 +1080,11 @@ async fn run_impl(
                     }
                     Carry::OperationPlan(_) => {
                         err_println!("ion-win: from-csv: input is already an OperationPlan");
+                        unregister_spawned!();
+                        return false;
+                    }
+                    Carry::OperationJournal(_) => {
+                        err_println!("ion-win: from-csv: input is already an OperationJournal");
                         unregister_spawned!();
                         return false;
                     }
@@ -1176,6 +1271,7 @@ async fn run_impl(
                     Carry::Table(t) => t,
                     Carry::FileSet(f) => f.to_table(),
                     Carry::OperationPlan(plan) => plan.to_table(),
+                    Carry::OperationJournal(journal) => journal.to_table(),
                     Carry::None => {
                         err_println!(
                             "ion-win: to-json: no table piped in (pipe through 'from-json' first)"
@@ -1206,6 +1302,7 @@ async fn run_impl(
                     Carry::Table(t) => t,
                     Carry::FileSet(f) => f.to_table(),
                     Carry::OperationPlan(plan) => plan.to_table(),
+                    Carry::OperationJournal(journal) => journal.to_table(),
                     Carry::None => {
                         err_println!(
                             "ion-win: to-csv: no table piped in (pipe through 'from-json'/'from-csv' first)"
@@ -1319,6 +1416,10 @@ fn classify_stages(pipeline: &Pipeline, interp: &Interpreter) -> Vec<Kind> {
                 Kind::Compress(args[1..].to_vec())
             } else if cmd == "apply" {
                 Kind::Apply(args[1..].to_vec())
+            } else if cmd == "undo" {
+                Kind::Undo(args[1..].to_vec())
+            } else if cmd == "journal" {
+                Kind::Journal(args[1..].to_vec())
             } else if cmd == "delete" {
                 Kind::Delete(args[1..].to_vec())
             } else if cmd == "from-json" {
@@ -1341,6 +1442,8 @@ fn classify_stages(pipeline: &Pipeline, interp: &Interpreter) -> Vec<Kind> {
                 Kind::FileSetSource(fileset.clone())
             } else if let Some(plan) = interp.get_plan(&cmd) {
                 Kind::OperationPlanSource(plan.clone())
+            } else if let Some(journal) = interp.get_journal(&cmd) {
+                Kind::OperationJournalSource(journal.clone())
             } else if let Some(table) = interp.get_table(&cmd) {
                 Kind::TableSource(table.clone())
             } else if interp.get_function(&cmd).is_some()
@@ -1441,6 +1544,28 @@ fn finish_operation_plan_stage(
         Carry::None
     } else {
         Carry::OperationPlan(plan)
+    }
+}
+
+fn finish_operation_journal_stage(
+    journal: OperationJournal,
+    is_last: bool,
+    stdout_file: Option<std::fs::File>,
+    capture: Option<&mut Option<CapturedStructured>>,
+) -> Carry {
+    if let Some(mut file) = stdout_file {
+        let mut text = journal.to_table().to_json();
+        text.push('\n');
+        let _ = file.write_all(text.as_bytes());
+        Carry::None
+    } else if is_last {
+        match capture {
+            Some(slot) => *slot = Some(CapturedStructured::OperationJournal(journal)),
+            None => println!("{}", journal.to_table().to_json()),
+        }
+        Carry::None
+    } else {
+        Carry::OperationJournal(journal)
     }
 }
 
