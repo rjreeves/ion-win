@@ -124,7 +124,7 @@ pub struct ArchivePlanItem {
     pub root: PathBuf,
     pub archive: PathBuf,
     pub backup: Option<PathBuf>,
-    entries: Vec<ArchivePlanEntry>,
+    pub(crate) entries: Vec<ArchivePlanEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

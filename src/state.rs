@@ -819,7 +819,7 @@ mod tests {
     fn journal(id: &str) -> crate::operation::OperationJournal {
         crate::operation::OperationJournal {
             id: id.to_string(), plan_id: "plan".to_string(), operation: "compress".to_string(),
-            started_at: 1, finished_at: 2, outputs: Vec::new(), staging_paths: Vec::new(), undo_safe: true, status: "applied".to_string(), error: None, undone_at: None,
+            started_at: 1, finished_at: 2, outputs: Vec::new(), staging_paths: Vec::new(), remaining_steps: Vec::new(), remaining_archives: Vec::new(), resume_supported: false, undo_safe: true, status: "applied".to_string(), error: None, undone_at: None,
         }
     }
 

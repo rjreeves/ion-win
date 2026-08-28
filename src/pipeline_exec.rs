@@ -833,14 +833,15 @@ async fn run_impl(
             Kind::Recover(args) => {
                 drop(incoming);
                 let rollback = args.iter().any(|arg| arg == "--rollback");
-                let positional = args.iter().filter(|arg| arg.as_str() != "--rollback").collect::<Vec<_>>();
-                if positional.len() > 1 || args.iter().any(|arg| arg.starts_with("--") && arg != "--rollback") {
-                    err_println!("ion-win: recover: usage: recover [OPERATION_ID] [--rollback]");
+                let resume = args.iter().any(|arg| arg == "--resume");
+                let positional = args.iter().filter(|arg| !matches!(arg.as_str(), "--rollback" | "--resume")).collect::<Vec<_>>();
+                if rollback && resume || positional.len() > 1 || args.iter().any(|arg| arg.starts_with("--") && !matches!(arg.as_str(), "--rollback" | "--resume")) {
+                    err_println!("ion-win: recover: usage: recover [OPERATION_ID] [--rollback|--resume]");
                     unregister_spawned!();
                     return false;
                 }
-                if rollback && positional.is_empty() {
-                    err_println!("ion-win: recover: --rollback requires an operation ID");
+                if (rollback || resume) && positional.is_empty() {
+                    err_println!("ion-win: recover: --rollback/--resume requires an operation ID");
                     unregister_spawned!();
                     return false;
                 }
@@ -876,6 +877,16 @@ async fn run_impl(
                             err_println!("ion-win: recover: rollback completed but journal persistence failed: {error}");
                         }
                         carry = finish_operation_journal_stage(recovered, is_last, stdout_file, capture.as_mut().map(|slot| &mut **slot));
+                    } else if resume {
+                        let recovered = match journal.recover_resume(state).await {
+                            Ok(journal) => journal,
+                            Err(error) => {
+                                err_println!("ion-win: {error}");
+                                unregister_spawned!();
+                                return false;
+                            }
+                        };
+                        carry = finish_operation_journal_stage(recovered, is_last, stdout_file, capture.as_mut().map(|slot| &mut **slot));
                     } else {
                         carry = finish_operation_journal_stage(journal, is_last, stdout_file, capture.as_mut().map(|slot| &mut **slot));
                     }
@@ -890,11 +901,11 @@ async fn run_impl(
                     };
                     let table = Table { rows: journals.into_iter().filter(OperationJournal::needs_recovery).map(|journal| vec![
                         ("operation_id".to_string(), journal.id),
-                        ("operation".to_string(), journal.operation),
+                        ("operation".to_string(), journal.operation.clone()),
                         ("status".to_string(), journal.status),
                         ("checkpoint_count".to_string(), journal.outputs.len().to_string()),
                         ("rollback_safe".to_string(), journal.undo_safe.to_string()),
-                        ("action".to_string(), if journal.undo_safe { "recover <id> --rollback" } else { "manual inspection required" }.to_string()),
+                        ("action".to_string(), if matches!(journal.operation.as_str(), "copy" | "compress") && journal.undo_safe && journal.resume_supported { "recover <id> --resume or --rollback" } else if journal.undo_safe { "recover <id> --rollback" } else { "manual inspection required" }.to_string()),
                     ]).collect() };
                     carry = finish_table_stage(table, is_last, stdout_file, capture.as_mut().map(|slot| &mut **slot));
                 }

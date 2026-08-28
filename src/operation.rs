@@ -50,6 +50,15 @@ pub struct OperationPlan { pub id: String, pub operation: PlannedOperation, pub 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalOutput { pub role: String, pub record: FileRecord, pub original_path: Option<PathBuf> }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryStep { pub operation: String, pub source: FileRecord, pub destination: PathBuf }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveRecoveryEntry { pub archive_name: String, pub source: FileRecord }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveRecoveryStep { pub root: PathBuf, pub archive: PathBuf, pub backup: Option<PathBuf>, pub entries: Vec<ArchiveRecoveryEntry> }
+
 /// Durable evidence of what an operation actually created. Undo trusts these
 /// post-write identities, never just the paths from the original plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +72,9 @@ pub struct OperationJournal {
     /// Exact temporary paths created by a transactional operation. These
     /// intents are persisted before creation so crash recovery never guesses.
     pub staging_paths: Vec<PathBuf>,
+    pub remaining_steps: Vec<RecoveryStep>,
+    pub remaining_archives: Vec<ArchiveRecoveryStep>,
+    pub resume_supported: bool,
     pub undo_safe: bool,
     pub status: String,
     pub error: Option<String>,
@@ -117,7 +129,17 @@ impl OperationPlan {
             PlannedOperation::Copy(plan) | PlannedOperation::Move(plan) => plan.items.iter().all(|item| item.destination_before.is_none()),
             PlannedOperation::Delete(_) => false,
         };
-        let mut journal = OperationJournal { id: unique_id("operation"), plan_id: self.id.clone(), operation: operation.to_string(), started_at, finished_at: 0, outputs: Vec::new(), staging_paths: Vec::new(), undo_safe: initially_undo_safe, status: "in_progress".to_string(), error: None, undone_at: None };
+        let remaining_steps = match &self.operation {
+            PlannedOperation::Copy(plan) => plan.items.iter().map(|item| RecoveryStep { operation: "copy".to_string(), source: item.source.clone(), destination: item.destination.clone() }).collect(),
+            PlannedOperation::Move(plan) => plan.items.iter().map(|item| RecoveryStep { operation: "move".to_string(), source: item.source.clone(), destination: item.destination.clone() }).collect(),
+            _ => Vec::new(),
+        };
+        let remaining_archives = match &self.operation {
+            PlannedOperation::Archive(plan) => plan.items.iter().map(|item| ArchiveRecoveryStep { root: item.root.clone(), archive: item.archive.clone(), backup: item.backup.clone(), entries: item.entries.iter().map(|entry| ArchiveRecoveryEntry { archive_name: entry.archive_name.clone(), source: entry.source.clone() }).collect() }).collect(),
+            _ => Vec::new(),
+        };
+        let resume_supported = matches!(self.operation, PlannedOperation::Copy(_) | PlannedOperation::Move(_) | PlannedOperation::Archive(_));
+        let mut journal = OperationJournal { id: unique_id("operation"), plan_id: self.id.clone(), operation: operation.to_string(), started_at, finished_at: 0, outputs: Vec::new(), staging_paths: Vec::new(), remaining_steps, remaining_archives, resume_supported, undo_safe: initially_undo_safe, status: "in_progress".to_string(), error: None, undone_at: None };
         state.put_journal(journal.clone()).await?;
         injected_crash(crash, CrashPoint::InitialJournal)?;
         let result: Result<(), String> = match &self.operation {
@@ -255,6 +277,8 @@ async fn apply_archive_transaction(
                 return Err(error);
             }
         }
+        journal.remaining_archives.retain(|remaining| remaining.archive != item.archive);
+        state.put_journal(journal.clone()).await?;
     }
     Ok(())
 }
@@ -426,6 +450,7 @@ async fn apply_transfer(plan: &FileTransferPlan, force: bool, moving: bool, jour
         }
         let record = FileRecord::from_path(item.destination.clone(), None).map_err(|error| format!("apply: could not journal {}: {error}", item.destination.display()))?;
         journal.outputs.push(JournalOutput { role: if moving { "moved" } else { "copy" }.to_string(), record, original_path: moving.then(|| item.source.path.clone()) });
+        journal.remaining_steps.retain(|step| step.destination != item.destination);
         state.put_journal(journal.clone()).await?;
         injected_crash(crash, CrashPoint::TransferCheckpoint)?;
         if index + 1 < plan.items.len() { injected_crash(crash, CrashPoint::BetweenTransferRecords)?; }
@@ -506,6 +531,135 @@ impl OperationJournal {
         Ok(recovered)
     }
 
+    pub async fn recover_resume(&self, state: &crate::state::StateHandle) -> Result<Self, String> {
+        if !self.needs_recovery() { return Err(format!("recover: operation {} has status '{}' and does not need recovery", self.id, self.status)); }
+        if self.operation == "compress" { return self.recover_resume_archive(state).await; }
+        if self.operation != "copy" { return Err(format!("recover: --resume currently supports copy and compress operations only, not {}", self.operation)); }
+        if !self.resume_supported { return Err(format!("recover: operation {} predates persisted resume intent; use --rollback", self.id)); }
+        if !self.undo_safe { return Err(format!("recover: operation {} replaced existing destinations and cannot be safely resumed", self.id)); }
+        let mut resumed = self.clone();
+        for output in resumed.outputs.iter().filter(|output| output.role == "copy") {
+            validate_record(&output.record, "recover: completed copy drift")?;
+        }
+        let steps = resumed.remaining_steps.clone();
+        for step in steps {
+            if step.operation != "copy" { return Err(format!("recover: journal {} contains a non-copy remaining step", self.id)); }
+            let pending_index = resumed.outputs.iter().position(|output| output.role == "pending_copy" && output.record.path == step.destination);
+            if let Some(index) = pending_index {
+                let pending = resumed.outputs[index].record.clone();
+                let matching_staging = resumed.staging_paths.iter().find(|path| {
+                    if !path.exists() { return false; }
+                    let mut expected = pending.clone(); expected.path = (*path).clone();
+                    validate_record(&expected, "recover: staged copy drift").is_ok()
+                }).cloned();
+                if matching_staging.is_none() && resumed.staging_paths.iter().any(|path| path.exists()) {
+                    return Err(format!("recover: staged copy identity changed for {}", step.destination.display()));
+                }
+                if step.destination.exists() && matching_staging.is_some() {
+                    return Err(format!("recover: both staged and published copies exist for {}", step.destination.display()));
+                }
+                if step.destination.exists() {
+                    validate_record(&pending, "recover: published copy drift")?;
+                    resumed.staging_paths.retain(|path| path.exists());
+                } else if let Some(staging) = matching_staging {
+                    publish_staged(&staging, &step.destination, false)?;
+                    resumed.staging_paths.retain(|path| path != &staging);
+                } else {
+                    return Err(format!("recover: neither staged nor published copy exists for {}", step.destination.display()));
+                }
+                resumed.outputs.remove(index);
+            } else {
+                if step.destination.exists() { return Err(format!("recover: unaccounted destination exists: {}", step.destination.display())); }
+                validate_record(&step.source, "recover: copy source drift")?;
+                let staging = staging_path(&step.destination, &resumed.id, "copy")?;
+                if !resumed.staging_paths.contains(&staging) { resumed.staging_paths.push(staging.clone()); }
+                state.put_journal(resumed.clone()).await?;
+                crate::copy::copy_one(&step.source.path, &staging, false).map_err(|error| format!("recover: {error}"))?;
+                let mut pending = FileRecord::from_path(staging.clone(), None).map_err(|error| format!("recover: could not identify staged copy: {error}"))?;
+                pending.path = step.destination.clone();
+                resumed.outputs.push(JournalOutput { role: "pending_copy".to_string(), record: pending, original_path: None });
+                state.put_journal(resumed.clone()).await?;
+                publish_staged(&staging, &step.destination, false)?;
+                resumed.outputs.retain(|output| !(output.role == "pending_copy" && output.record.path == step.destination));
+                resumed.staging_paths.retain(|path| path != &staging);
+            }
+            let record = FileRecord::from_path(step.destination.clone(), None).map_err(|error| format!("recover: could not checkpoint resumed copy: {error}"))?;
+            resumed.outputs.push(JournalOutput { role: "copy".to_string(), record, original_path: None });
+            resumed.remaining_steps.retain(|remaining| remaining.destination != step.destination);
+            state.put_journal(resumed.clone()).await?;
+        }
+        if !resumed.remaining_steps.is_empty() { return Err(format!("recover: operation {} still has unsupported remaining steps", self.id)); }
+        if resumed.staging_paths.iter().any(|path| path.exists()) { return Err(format!("recover: operation {} still has staged files", self.id)); }
+        resumed.staging_paths.clear();
+        resumed.status = "applied".to_string();
+        resumed.error = None;
+        resumed.finished_at = now_seconds();
+        state.put_journal(resumed.clone()).await?;
+        Ok(resumed)
+    }
+
+    async fn recover_resume_archive(&self, state: &crate::state::StateHandle) -> Result<Self, String> {
+        if !self.resume_supported { return Err(format!("recover: operation {} predates persisted archive intent; use --rollback", self.id)); }
+        if !self.undo_safe { return Err(format!("recover: operation {} replaced existing destinations and cannot be safely resumed", self.id)); }
+        let mut resumed = self.clone();
+        for output in resumed.outputs.iter().filter(|output| matches!(output.role.as_str(), "archive" | "backup")) {
+            validate_record(&output.record, "recover: completed archive output drift")?;
+        }
+        for step in resumed.remaining_archives.clone() {
+            let archive_done = resumed.outputs.iter().any(|output| output.role == "archive" && output.record.path == step.archive);
+            if !archive_done {
+                if !resume_pending_publication(&mut resumed, "pending_archive", &step.archive)? {
+                    for entry in &step.entries { validate_record(&entry.source, "recover: archive source drift")?; }
+                    let staging = staging_path(&step.archive, &resumed.id, "archive")?;
+                    if !resumed.staging_paths.contains(&staging) { resumed.staging_paths.push(staging.clone()); }
+                    state.put_journal(resumed.clone()).await?;
+                    let item = crate::compress::ArchivePlanItem { root: step.root.clone(), archive: step.archive.clone(), backup: step.backup.clone(), entries: step.entries.iter().map(|entry| crate::compress::ArchivePlanEntry { archive_name: entry.archive_name.clone(), source: entry.source.clone() }).collect() };
+                    crate::compress::build_planned_archive(&item, &staging).await?;
+                    let mut pending = FileRecord::from_path(staging.clone(), None).map_err(|error| format!("recover: could not identify staged archive: {error}"))?;
+                    pending.path = step.archive.clone();
+                    resumed.outputs.push(JournalOutput { role: "pending_archive".to_string(), record: pending, original_path: None });
+                    state.put_journal(resumed.clone()).await?;
+                    publish_staged(&staging, &step.archive, false)?;
+                    resumed.outputs.retain(|output| !(output.role == "pending_archive" && output.record.path == step.archive));
+                    resumed.staging_paths.retain(|path| path != &staging);
+                }
+                let record = FileRecord::from_path(step.archive.clone(), None).map_err(|error| format!("recover: could not checkpoint archive: {error}"))?;
+                resumed.outputs.push(JournalOutput { role: "archive".to_string(), record, original_path: None });
+                state.put_journal(resumed.clone()).await?;
+            }
+
+            if let Some(backup) = &step.backup {
+                let backup_done = resumed.outputs.iter().any(|output| output.role == "backup" && output.record.path == *backup);
+                if !backup_done {
+                    if !resume_pending_publication(&mut resumed, "pending_backup", backup)? {
+                        let staging = staging_path(backup, &resumed.id, "backup")?;
+                        if !resumed.staging_paths.contains(&staging) { resumed.staging_paths.push(staging.clone()); }
+                        state.put_journal(resumed.clone()).await?;
+                        std::fs::copy(&step.archive, &staging).map_err(|error| format!("recover: could not stage archive backup: {error}"))?;
+                        let mut pending = FileRecord::from_path(staging.clone(), None).map_err(|error| format!("recover: could not identify staged backup: {error}"))?;
+                        pending.path = backup.clone();
+                        resumed.outputs.push(JournalOutput { role: "pending_backup".to_string(), record: pending, original_path: None });
+                        state.put_journal(resumed.clone()).await?;
+                        publish_staged(&staging, backup, false)?;
+                        resumed.outputs.retain(|output| !(output.role == "pending_backup" && output.record.path == *backup));
+                        resumed.staging_paths.retain(|path| path != &staging);
+                    }
+                    let record = FileRecord::from_path(backup.clone(), None).map_err(|error| format!("recover: could not checkpoint archive backup: {error}"))?;
+                    resumed.outputs.push(JournalOutput { role: "backup".to_string(), record, original_path: None });
+                    state.put_journal(resumed.clone()).await?;
+                }
+            }
+            resumed.remaining_archives.retain(|remaining| remaining.archive != step.archive);
+            state.put_journal(resumed.clone()).await?;
+        }
+        if !resumed.remaining_archives.is_empty() { return Err(format!("recover: operation {} still has unsupported archive steps", self.id)); }
+        if resumed.staging_paths.iter().any(|path| path.exists()) { return Err(format!("recover: operation {} still has staged files", self.id)); }
+        resumed.staging_paths.clear();
+        resumed.status = "applied".to_string(); resumed.error = None; resumed.finished_at = now_seconds();
+        state.put_journal(resumed.clone()).await?;
+        Ok(resumed)
+    }
+
     pub fn to_table(&self) -> Table {
         Table { rows: self.outputs.iter().map(|output| vec![
             ("operation_id".to_string(), self.id.clone()),
@@ -577,7 +731,21 @@ impl OperationJournal {
             "modified": output.record.modified,
             "original_path": output.original_path.as_ref().map(|path| path.to_string_lossy())
         })).collect::<Vec<_>>();
-        serde_json::json!({"version":3,"id":self.id,"plan_id":self.plan_id,"operation":self.operation,"started_at":self.started_at,"finished_at":self.finished_at,"undo_safe":self.undo_safe,"status":self.status,"error":self.error,"undone_at":self.undone_at,"staging_paths":self.staging_paths.iter().map(|path| path.to_string_lossy()).collect::<Vec<_>>(),"outputs":outputs}).to_string()
+        let remaining_steps = self.remaining_steps.iter().map(|step| serde_json::json!({
+            "operation": step.operation, "destination": step.destination.to_string_lossy(),
+            "source": { "path": step.source.path.to_string_lossy(), "volume_id": step.source.identity.volume_id,
+                "file_id": step.source.identity.file_id.map(hex_file_id), "kind": kind_name(&step.source.kind),
+                "size": step.source.size, "modified": step.source.modified }
+        })).collect::<Vec<_>>();
+        let remaining_archives = self.remaining_archives.iter().map(|step| serde_json::json!({
+            "root": step.root.to_string_lossy(), "archive": step.archive.to_string_lossy(),
+            "backup": step.backup.as_ref().map(|path| path.to_string_lossy()),
+            "entries": step.entries.iter().map(|entry| serde_json::json!({"archive_name":entry.archive_name,
+                "source":{"path":entry.source.path.to_string_lossy(),"volume_id":entry.source.identity.volume_id,
+                "file_id":entry.source.identity.file_id.map(hex_file_id),"kind":kind_name(&entry.source.kind),
+                "size":entry.source.size,"modified":entry.source.modified}})).collect::<Vec<_>>()
+        })).collect::<Vec<_>>();
+        serde_json::json!({"version":5,"id":self.id,"plan_id":self.plan_id,"operation":self.operation,"started_at":self.started_at,"finished_at":self.finished_at,"undo_safe":self.undo_safe,"resume_supported":self.resume_supported,"status":self.status,"error":self.error,"undone_at":self.undone_at,"staging_paths":self.staging_paths.iter().map(|path| path.to_string_lossy()).collect::<Vec<_>>(),"remaining_steps":remaining_steps,"remaining_archives":remaining_archives,"outputs":outputs}).to_string()
     }
 
     pub fn from_json(text: &str) -> Result<Self, String> {
@@ -597,13 +765,65 @@ impl OperationJournal {
         let undone_at = value.get("undone_at").and_then(|v| v.as_u64());
         let status = value.get("status").and_then(|v| v.as_str()).map(str::to_string).unwrap_or_else(|| if undone_at.is_some() { "undone" } else { "applied" }.to_string());
         let staging_paths = value.get("staging_paths").and_then(|v| v.as_array()).map(|values| values.iter().filter_map(|value| value.as_str().map(PathBuf::from)).collect()).unwrap_or_default();
-        Ok(Self { id: required_string("id")?, plan_id: required_string("plan_id")?, operation: required_string("operation")?, started_at: required_number("started_at")?, finished_at: required_number("finished_at")?, outputs, staging_paths, undo_safe: value.get("undo_safe").and_then(|v| v.as_bool()).unwrap_or(false), status, error: value.get("error").and_then(|v| v.as_str()).map(str::to_string), undone_at })
+        let mut remaining_steps = Vec::new();
+        for step in value.get("remaining_steps").and_then(|v| v.as_array()).into_iter().flatten() {
+            let source = step.get("source").ok_or_else(|| "journal: recovery step missing source".to_string())?;
+            remaining_steps.push(RecoveryStep {
+                operation: step.get("operation").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                destination: PathBuf::from(step.get("destination").and_then(|v| v.as_str()).ok_or_else(|| "journal: recovery step missing destination".to_string())?),
+                source: FileRecord { path: PathBuf::from(source.get("path").and_then(|v| v.as_str()).ok_or_else(|| "journal: recovery source missing path".to_string())?),
+                    identity: FileIdentity { volume_id: source.get("volume_id").and_then(|v| v.as_u64()), file_id: source.get("file_id").and_then(|v| v.as_str()).map(parse_file_id).transpose()? },
+                    kind: parse_kind(source.get("kind").and_then(|v| v.as_str()).unwrap_or("other")), size: source.get("size").and_then(|v| v.as_u64()).unwrap_or(0),
+                    modified: source.get("modified").and_then(|v| v.as_u64()), sha256: None }
+            });
+        }
+        let mut remaining_archives = Vec::new();
+        for step in value.get("remaining_archives").and_then(|v| v.as_array()).into_iter().flatten() {
+            let mut entries = Vec::new();
+            for entry in step.get("entries").and_then(|v| v.as_array()).into_iter().flatten() {
+                let source = entry.get("source").ok_or_else(|| "journal: archive recovery entry missing source".to_string())?;
+                entries.push(ArchiveRecoveryEntry { archive_name: entry.get("archive_name").and_then(|v| v.as_str()).unwrap_or("").to_string(), source: file_record_from_json(source, "archive recovery source")? });
+            }
+            remaining_archives.push(ArchiveRecoveryStep { root: PathBuf::from(step.get("root").and_then(|v| v.as_str()).unwrap_or("")), archive: PathBuf::from(step.get("archive").and_then(|v| v.as_str()).ok_or_else(|| "journal: archive recovery step missing destination".to_string())?), backup: step.get("backup").and_then(|v| v.as_str()).map(PathBuf::from), entries });
+        }
+        Ok(Self { id: required_string("id")?, plan_id: required_string("plan_id")?, operation: required_string("operation")?, started_at: required_number("started_at")?, finished_at: required_number("finished_at")?, outputs, staging_paths, remaining_steps, remaining_archives, resume_supported: value.get("resume_supported").and_then(|v| v.as_bool()).unwrap_or(false), undo_safe: value.get("undo_safe").and_then(|v| v.as_bool()).unwrap_or(false), status, error: value.get("error").and_then(|v| v.as_str()).map(str::to_string), undone_at })
     }
+}
+
+fn resume_pending_publication(journal: &mut OperationJournal, role: &str, destination: &std::path::Path) -> Result<bool, String> {
+    let Some(index) = journal.outputs.iter().position(|output| output.role == role && output.record.path == destination) else { return Ok(false); };
+    let pending = journal.outputs[index].record.clone();
+    let matching_staging = journal.staging_paths.iter().find(|path| {
+        if !path.exists() { return false; }
+        let mut expected = pending.clone(); expected.path = (*path).clone();
+        validate_record(&expected, "recover: staged archive drift").is_ok()
+    }).cloned();
+    if matching_staging.is_none() && journal.staging_paths.iter().any(|path| path.exists()) {
+        return Err(format!("recover: staged output identity changed for {}", destination.display()));
+    }
+    if destination.exists() && matching_staging.is_some() { return Err(format!("recover: both staged and published outputs exist for {}", destination.display())); }
+    if destination.exists() {
+        validate_record(&pending, "recover: published archive drift")?;
+        journal.staging_paths.retain(|path| path.exists());
+    } else if let Some(staging) = matching_staging {
+        publish_staged(&staging, destination, false)?;
+        journal.staging_paths.retain(|path| path != &staging);
+    } else {
+        return Err(format!("recover: neither staged nor published output exists for {}", destination.display()));
+    }
+    journal.outputs.remove(index);
+    Ok(true)
 }
 
 fn hex_file_id(bytes: [u8; 16]) -> String { bytes.iter().map(|byte| format!("{byte:02x}")).collect() }
 fn kind_name(kind: &FileKind) -> &'static str { match kind { FileKind::File => "file", FileKind::Directory => "directory", FileKind::Symlink => "symlink", FileKind::Other => "other" } }
 fn parse_kind(value: &str) -> FileKind { match value { "file" => FileKind::File, "directory" => FileKind::Directory, "symlink" => FileKind::Symlink, _ => FileKind::Other } }
+fn file_record_from_json(value: &serde_json::Value, label: &str) -> Result<FileRecord, String> {
+    Ok(FileRecord { path: PathBuf::from(value.get("path").and_then(|v| v.as_str()).ok_or_else(|| format!("journal: {label} missing path"))?),
+        identity: FileIdentity { volume_id: value.get("volume_id").and_then(|v| v.as_u64()), file_id: value.get("file_id").and_then(|v| v.as_str()).map(parse_file_id).transpose()? },
+        kind: parse_kind(value.get("kind").and_then(|v| v.as_str()).unwrap_or("other")), size: value.get("size").and_then(|v| v.as_u64()).unwrap_or(0),
+        modified: value.get("modified").and_then(|v| v.as_u64()), sha256: None })
+}
 fn parse_file_id(value: &str) -> Result<[u8; 16], String> {
     if value.len() != 32 { return Err("journal: invalid file identity".to_string()); }
     let mut bytes = [0; 16];
@@ -617,7 +837,7 @@ mod tests {
 
     #[test]
     fn journal_round_trips_persistent_json() {
-        let journal = OperationJournal { id: "operation-1".into(), plan_id: "plan-1".into(), operation: "compress".into(), started_at: 1, finished_at: 2, outputs: vec![JournalOutput { role: "archive".into(), record: FileRecord { path: "a.zip".into(), identity: FileIdentity { volume_id: Some(7), file_id: Some([3; 16]) }, kind: FileKind::File, size: 10, modified: Some(9), sha256: None }, original_path: None }], staging_paths: Vec::new(), undo_safe: true, status: "applied".into(), error: None, undone_at: None };
+        let journal = OperationJournal { id: "operation-1".into(), plan_id: "plan-1".into(), operation: "compress".into(), started_at: 1, finished_at: 2, outputs: vec![JournalOutput { role: "archive".into(), record: FileRecord { path: "a.zip".into(), identity: FileIdentity { volume_id: Some(7), file_id: Some([3; 16]) }, kind: FileKind::File, size: 10, modified: Some(9), sha256: None }, original_path: None }], staging_paths: Vec::new(), remaining_steps: Vec::new(), remaining_archives: Vec::new(), resume_supported: false, undo_safe: true, status: "applied".into(), error: None, undone_at: None };
         assert_eq!(OperationJournal::from_json(&journal.to_json()).unwrap(), journal);
     }
 
@@ -632,7 +852,7 @@ mod tests {
     #[test]
     fn undo_removes_unchanged_created_outputs() {
         let (path, record) = temp_output("undo.zip", "archive");
-        let journal = OperationJournal { id: "operation-undo".into(), plan_id: "plan".into(), operation: "compress".into(), started_at: 1, finished_at: 2, outputs: vec![JournalOutput { role: "archive".into(), record, original_path: None }], staging_paths: Vec::new(), undo_safe: true, status: "applied".into(), error: None, undone_at: None };
+        let journal = OperationJournal { id: "operation-undo".into(), plan_id: "plan".into(), operation: "compress".into(), started_at: 1, finished_at: 2, outputs: vec![JournalOutput { role: "archive".into(), record, original_path: None }], staging_paths: Vec::new(), remaining_steps: Vec::new(), remaining_archives: Vec::new(), resume_supported: false, undo_safe: true, status: "applied".into(), error: None, undone_at: None };
         let undone = journal.undo().unwrap();
         assert!(!path.exists());
         assert!(undone.undone_at.is_some());
@@ -642,7 +862,7 @@ mod tests {
     fn undo_validates_all_outputs_before_deleting_any() {
         let (first_path, first) = temp_output("atomic-a.zip", "first");
         let (second_path, second) = temp_output("atomic-b.zip", "second");
-        let journal = OperationJournal { id: "operation-drift".into(), plan_id: "plan".into(), operation: "compress".into(), started_at: 1, finished_at: 2, outputs: vec![JournalOutput { role: "archive".into(), record: first, original_path: None }, JournalOutput { role: "backup".into(), record: second, original_path: None }], staging_paths: Vec::new(), undo_safe: true, status: "applied".into(), error: None, undone_at: None };
+        let journal = OperationJournal { id: "operation-drift".into(), plan_id: "plan".into(), operation: "compress".into(), started_at: 1, finished_at: 2, outputs: vec![JournalOutput { role: "archive".into(), record: first, original_path: None }, JournalOutput { role: "backup".into(), record: second, original_path: None }], staging_paths: Vec::new(), remaining_steps: Vec::new(), remaining_archives: Vec::new(), resume_supported: false, undo_safe: true, status: "applied".into(), error: None, undone_at: None };
         std::fs::write(&second_path, "changed-size").unwrap();
         let error = journal.undo().unwrap_err();
         assert!(error.contains("output drift"), "{error}");
@@ -723,7 +943,7 @@ mod tests {
     #[test]
     fn transactional_rollback_removes_completed_safe_copy_outputs() {
         let (path, record) = temp_output("transaction-copy.tmp", "completed copy");
-        let mut journal = OperationJournal { id: "operation-transaction".into(), plan_id: "plan".into(), operation: "copy".into(), started_at: 1, finished_at: 0, outputs: vec![JournalOutput { role: "copy".into(), record, original_path: None }], staging_paths: Vec::new(), undo_safe: true, status: "in_progress".into(), error: None, undone_at: None };
+        let mut journal = OperationJournal { id: "operation-transaction".into(), plan_id: "plan".into(), operation: "copy".into(), started_at: 1, finished_at: 0, outputs: vec![JournalOutput { role: "copy".into(), record, original_path: None }], staging_paths: Vec::new(), remaining_steps: Vec::new(), remaining_archives: Vec::new(), resume_supported: false, undo_safe: true, status: "in_progress".into(), error: None, undone_at: None };
         transactional_rollback(&mut journal);
         assert_eq!(journal.status, "rolled_back");
         assert!(!path.exists());
@@ -732,7 +952,7 @@ mod tests {
     #[test]
     fn recovery_rolls_back_a_crash_checkpoint_after_identity_validation() {
         let (path, record) = temp_output("recover-copy.tmp", "checkpointed copy");
-        let journal = OperationJournal { id: "operation-recover".into(), plan_id: "plan".into(), operation: "copy".into(), started_at: 1, finished_at: 0, outputs: vec![JournalOutput { role: "copy".into(), record, original_path: None }], staging_paths: Vec::new(), undo_safe: true, status: "in_progress".into(), error: None, undone_at: None };
+        let journal = OperationJournal { id: "operation-recover".into(), plan_id: "plan".into(), operation: "copy".into(), started_at: 1, finished_at: 0, outputs: vec![JournalOutput { role: "copy".into(), record, original_path: None }], staging_paths: Vec::new(), remaining_steps: Vec::new(), remaining_archives: Vec::new(), resume_supported: false, undo_safe: true, status: "in_progress".into(), error: None, undone_at: None };
         assert!(journal.needs_recovery());
         let recovered = journal.recover_rollback().unwrap();
         assert_eq!(recovered.status, "rolled_back");
@@ -743,7 +963,7 @@ mod tests {
     #[test]
     fn recovery_fails_closed_when_a_checkpointed_output_drifted() {
         let (path, record) = temp_output("recover-drift.tmp", "before");
-        let journal = OperationJournal { id: "operation-recover-drift".into(), plan_id: "plan".into(), operation: "compress".into(), started_at: 1, finished_at: 0, outputs: vec![JournalOutput { role: "archive".into(), record, original_path: None }], staging_paths: Vec::new(), undo_safe: true, status: "partially_applied".into(), error: None, undone_at: None };
+        let journal = OperationJournal { id: "operation-recover-drift".into(), plan_id: "plan".into(), operation: "compress".into(), started_at: 1, finished_at: 0, outputs: vec![JournalOutput { role: "archive".into(), record, original_path: None }], staging_paths: Vec::new(), remaining_steps: Vec::new(), remaining_archives: Vec::new(), resume_supported: false, undo_safe: true, status: "partially_applied".into(), error: None, undone_at: None };
         std::fs::write(&path, "changed and now a different size").unwrap();
         let error = journal.recover_rollback().unwrap_err();
         assert!(error.contains("output drift"), "{error}");
@@ -757,7 +977,7 @@ mod tests {
         let unrelated = std::env::temp_dir().join(format!("ion-win-recover-unrelated-{}.tmp", std::process::id()));
         std::fs::write(&staged, "partial zip").unwrap();
         std::fs::write(&unrelated, "must survive").unwrap();
-        let journal = OperationJournal { id: "operation-stage".into(), plan_id: "plan".into(), operation: "compress".into(), started_at: 1, finished_at: 0, outputs: Vec::new(), staging_paths: vec![staged.clone()], undo_safe: true, status: "in_progress".into(), error: None, undone_at: None };
+        let journal = OperationJournal { id: "operation-stage".into(), plan_id: "plan".into(), operation: "compress".into(), started_at: 1, finished_at: 0, outputs: Vec::new(), staging_paths: vec![staged.clone()], remaining_steps: Vec::new(), remaining_archives: Vec::new(), resume_supported: false, undo_safe: true, status: "in_progress".into(), error: None, undone_at: None };
 
         let recovered = journal.recover_rollback().unwrap();
 
@@ -953,5 +1173,124 @@ mod tests {
                 let _ = std::fs::remove_dir_all(root);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn copy_resume_completes_every_persisted_crash_state_idempotently() {
+        let points = [
+            CrashPoint::InitialJournal,
+            CrashPoint::BeforeTransferMutation,
+            CrashPoint::TransferMutated,
+            CrashPoint::TransferCheckpoint,
+            CrashPoint::BetweenTransferRecords,
+            CrashPoint::BeforeApplied,
+        ];
+        for point in points {
+            let (root, first, mut fileset) = transfer_fixture(&format!("resume-{point:?}"));
+            let second = first.parent().unwrap().join("second.txt");
+            std::fs::write(&second, "second resumable copy").unwrap();
+            fileset.files.push(FileRecord::from_path(second.clone(), None).unwrap());
+            let destination_root = root.join("destination");
+            let plan = OperationPlan::copy(&fileset, &destination_root.to_string_lossy(), false).unwrap();
+            let destinations = match &plan.operation { PlannedOperation::Copy(value) => value.items.iter().map(|item| item.destination.clone()).collect::<Vec<_>>(), _ => unreachable!() };
+            let database = root.join("resume-state.redb");
+            let state = crate::state::spawn(database.clone()).unwrap();
+            let error = plan.apply_internal(&state, Some(point)).await.unwrap_err();
+            assert!(error.starts_with("__ion_test_crash__:"), "{point:?}: {error}");
+            let operation_id = state.list_journals().await.unwrap().pop().unwrap().id;
+            drop(state);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+            let restarted = crate::state::spawn(database).unwrap();
+            let journal = restarted.get_journal(operation_id).await.unwrap().unwrap();
+            let resumed = journal.recover_resume(&restarted).await.unwrap_or_else(|error| panic!("{point:?}: {error}"));
+
+            assert_eq!(resumed.status, "applied", "{point:?}");
+            assert!(resumed.remaining_steps.is_empty(), "{point:?}");
+            assert!(resumed.staging_paths.is_empty(), "{point:?}");
+            assert_eq!(resumed.outputs.iter().filter(|output| output.role == "copy").count(), 2, "{point:?}");
+            assert!(first.exists() && second.exists(), "{point:?}");
+            assert_eq!(std::fs::read_to_string(&destinations[0]).unwrap(), "typed transfer", "{point:?}");
+            assert_eq!(std::fs::read_to_string(&destinations[1]).unwrap(), "second resumable copy", "{point:?}");
+            drop(restarted);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[tokio::test]
+    async fn copy_resume_refuses_source_drift_before_rebuilding() {
+        let (root, source, fileset) = transfer_fixture("resume-source-drift");
+        let destination_root = root.join("destination");
+        let plan = OperationPlan::copy(&fileset, &destination_root.to_string_lossy(), false).unwrap();
+        let state = crate::state::spawn_memory();
+        plan.apply_internal(&state, Some(CrashPoint::InitialJournal)).await.unwrap_err();
+        let journal = state.list_journals().await.unwrap().pop().unwrap();
+        std::fs::write(&source, "source changed after crash and has another size").unwrap();
+
+        let error = journal.recover_resume(&state).await.unwrap_err();
+
+        assert!(error.contains("source drift"), "{error}");
+        assert!(!destination_root.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn archive_resume_completes_every_persisted_crash_state() {
+        let points = [CrashPoint::InitialJournal, CrashPoint::StagingIntent, CrashPoint::ZipStaged, CrashPoint::Published, CrashPoint::OutputCheckpoint, CrashPoint::ArchiveBeforeBackup, CrashPoint::BeforeApplied];
+        for point in points {
+            let (root, source, fileset) = transfer_fixture(&format!("archive-resume-{point:?}"));
+            let fileset = fileset.with_roots(vec![source.parent().unwrap().to_path_buf()]);
+            let archives = root.join("archives");
+            let backups = root.join("backups");
+            let archive_plan = crate::compress::plan_fileset_per_root(&fileset, &archives.to_string_lossy(), Some(&backups.to_string_lossy())).unwrap();
+            let archive = archive_plan.items[0].archive.clone();
+            let backup = archive_plan.items[0].backup.clone().unwrap();
+            let plan = OperationPlan::archive(archive_plan, false);
+            let database = root.join("archive-resume.redb");
+            let state = crate::state::spawn(database.clone()).unwrap();
+            let error = plan.apply_internal(&state, Some(point)).await.unwrap_err();
+            assert!(error.starts_with("__ion_test_crash__:"), "{point:?}: {error}");
+            let operation_id = state.list_journals().await.unwrap().pop().unwrap().id;
+            drop(state);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+            let restarted = crate::state::spawn(database).unwrap();
+            let journal = restarted.get_journal(operation_id).await.unwrap().unwrap();
+            let resumed = journal.recover_resume(&restarted).await.unwrap_or_else(|error| panic!("{point:?}: {error}"));
+
+            assert_eq!(resumed.status, "applied", "{point:?}");
+            assert!(resumed.remaining_archives.is_empty(), "{point:?}");
+            assert!(resumed.staging_paths.is_empty(), "{point:?}");
+            assert_eq!(resumed.outputs.iter().filter(|output| matches!(output.role.as_str(), "archive" | "backup")).count(), 2, "{point:?}");
+            assert_eq!(std::fs::read(&archive).unwrap(), std::fs::read(&backup).unwrap(), "{point:?}");
+            let file = std::fs::File::open(&archive).unwrap();
+            let mut zip = zip::ZipArchive::new(file).unwrap();
+            let mut contents = String::new();
+            use std::io::Read as _;
+            zip.by_index(0).unwrap().read_to_string(&mut contents).unwrap();
+            assert_eq!(contents, "typed transfer", "{point:?}");
+            drop(restarted);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[tokio::test]
+    async fn archive_resume_refuses_source_drift_before_rebuild() {
+        let (root, source, fileset) = transfer_fixture("archive-resume-drift");
+        let fileset = fileset.with_roots(vec![source.parent().unwrap().to_path_buf()]);
+        let archive_plan = crate::compress::plan_fileset_per_root(&fileset, &root.join("archives").to_string_lossy(), None).unwrap();
+        let plan = OperationPlan::archive(archive_plan, false);
+        let state = crate::state::spawn_memory();
+        plan.apply_internal(&state, Some(CrashPoint::InitialJournal)).await.unwrap_err();
+        let journal = state.list_journals().await.unwrap().pop().unwrap();
+        std::fs::write(&source, "archive source drifted to a different size").unwrap();
+
+        let error = journal.recover_resume(&state).await.unwrap_err();
+
+        assert!(error.contains("source drift"), "{error}");
+        assert!(!root.join("archives").join("source.zip").exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 }
