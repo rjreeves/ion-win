@@ -7,6 +7,21 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 static OPERATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CrashPoint {
+    InitialJournal,
+    StagingIntent,
+    ZipStaged,
+    Published,
+    OutputCheckpoint,
+    ArchiveBeforeBackup,
+    BeforeApplied,
+}
+
+fn injected_crash(selected: Option<CrashPoint>, point: CrashPoint) -> Result<(), String> {
+    if selected == Some(point) { Err(format!("__ion_test_crash__:{point:?}")) } else { Ok(()) }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlannedOperation { Archive(ArchivePlan), Copy(FileTransferPlan), Move(FileTransferPlan), Delete(DeletePlan) }
 
@@ -87,6 +102,10 @@ impl OperationPlan {
     }
 
     pub async fn apply(&self, state: &crate::state::StateHandle) -> Result<OperationJournal, String> {
+        self.apply_internal(state, None).await
+    }
+
+    async fn apply_internal(&self, state: &crate::state::StateHandle, crash: Option<CrashPoint>) -> Result<OperationJournal, String> {
         let started_at = now_seconds();
         let operation = match &self.operation { PlannedOperation::Archive(_) => "compress", PlannedOperation::Copy(_) => "copy", PlannedOperation::Move(_) => "move", PlannedOperation::Delete(_) => "delete" };
         let initially_undo_safe = match &self.operation {
@@ -96,9 +115,10 @@ impl OperationPlan {
         };
         let mut journal = OperationJournal { id: unique_id("operation"), plan_id: self.id.clone(), operation: operation.to_string(), started_at, finished_at: 0, outputs: Vec::new(), staging_paths: Vec::new(), undo_safe: initially_undo_safe, status: "in_progress".to_string(), error: None, undone_at: None };
         state.put_journal(journal.clone()).await?;
+        injected_crash(crash, CrashPoint::InitialJournal)?;
         let result: Result<(), String> = match &self.operation {
             PlannedOperation::Archive(plan) => {
-                apply_archive_transaction(plan, self.force, &mut journal, state).await
+                apply_archive_transaction(plan, self.force, &mut journal, state, crash).await
             },
             PlannedOperation::Copy(plan) => apply_transfer(plan, self.force, false, &mut journal, state).await,
             PlannedOperation::Move(plan) => apply_transfer(plan, self.force, true, &mut journal, state).await,
@@ -106,12 +126,14 @@ impl OperationPlan {
         };
         match result {
             Ok(()) => {
+                injected_crash(crash, CrashPoint::BeforeApplied)?;
                 journal.status = "applied".to_string();
                 journal.finished_at = now_seconds();
                 state.put_journal(journal.clone()).await?;
                 Ok(journal)
             }
             Err(error) => {
+                if error.starts_with("__ion_test_crash__:") { return Err(error); }
                 if journal.status == "in_progress" { journal.status = "failed".to_string(); }
                 journal.error = Some(error.clone());
                 journal.finished_at = now_seconds();
@@ -127,6 +149,7 @@ async fn apply_archive_transaction(
     force: bool,
     journal: &mut OperationJournal,
     state: &crate::state::StateHandle,
+    crash: Option<CrashPoint>,
 ) -> Result<(), String> {
     crate::compress::validate_archive_plan(plan)?;
     for item in &plan.items {
@@ -146,24 +169,42 @@ async fn apply_archive_transaction(
             rollback_and_checkpoint(journal, state).await;
             return Err(error);
         }
+        injected_crash(crash, CrashPoint::StagingIntent)?;
         let build_result = crate::compress::build_planned_archive(item, &archive_staging).await;
         if let Err(error) = build_result {
             let _ = std::fs::remove_file(&archive_staging);
             rollback_and_checkpoint(journal, state).await;
             return Err(error);
         }
+        injected_crash(crash, CrashPoint::ZipStaged)?;
+        let mut pending_record = FileRecord::from_path(archive_staging.clone(), None)
+            .map_err(|error| format!("compress: could not identify staged archive: {error}"))?;
+        pending_record.path = item.archive.clone();
+        journal.outputs.push(JournalOutput { role: "pending_archive".to_string(), record: pending_record, original_path: None });
+        if let Err(error) = state.put_journal(journal.clone()).await {
+            journal.outputs.retain(|output| output.role != "pending_archive");
+            let _ = std::fs::remove_file(&archive_staging);
+            rollback_and_checkpoint(journal, state).await;
+            return Err(format!("apply: could not persist publication intent: {error}"));
+        }
         if let Err(error) = publish_staged(&archive_staging, &item.archive, force) {
+            journal.outputs.retain(|output| output.role != "pending_archive");
+            journal.staging_paths.retain(|path| path != &archive_staging);
             let _ = std::fs::remove_file(&archive_staging);
             rollback_and_checkpoint(journal, state).await;
             return Err(error);
         }
+        injected_crash(crash, CrashPoint::Published)?;
+        journal.outputs.retain(|output| output.role != "pending_archive");
         journal.staging_paths.retain(|path| path != &archive_staging);
         if let Err(error) = checkpoint_output("archive", item.archive.clone(), journal, state).await {
             rollback_and_checkpoint(journal, state).await;
             return Err(error);
         }
+        injected_crash(crash, CrashPoint::OutputCheckpoint)?;
 
         if let Some(backup) = &item.backup {
+            injected_crash(crash, CrashPoint::ArchiveBeforeBackup)?;
             let backup_staging = match staging_path(backup, &journal.id, "backup") {
                 Ok(path) => path,
                 Err(error) => {
@@ -186,11 +227,24 @@ async fn apply_archive_transaction(
                 rollback_and_checkpoint(journal, state).await;
                 return Err(format!("compress: could not stage backup {}: {error}", backup.display()));
             }
+            let mut pending_record = FileRecord::from_path(backup_staging.clone(), None)
+                .map_err(|error| format!("compress: could not identify staged backup: {error}"))?;
+            pending_record.path = backup.clone();
+            journal.outputs.push(JournalOutput { role: "pending_backup".to_string(), record: pending_record, original_path: None });
+            if let Err(error) = state.put_journal(journal.clone()).await {
+                journal.outputs.retain(|output| output.role != "pending_backup");
+                let _ = std::fs::remove_file(&backup_staging);
+                rollback_and_checkpoint(journal, state).await;
+                return Err(format!("apply: could not persist publication intent: {error}"));
+            }
             if let Err(error) = publish_staged(&backup_staging, backup, force) {
+                journal.outputs.retain(|output| output.role != "pending_backup");
+                journal.staging_paths.retain(|path| path != &backup_staging);
                 let _ = std::fs::remove_file(&backup_staging);
                 rollback_and_checkpoint(journal, state).await;
                 return Err(error);
             }
+            journal.outputs.retain(|output| output.role != "pending_backup");
             journal.staging_paths.retain(|path| path != &backup_staging);
             if let Err(error) = checkpoint_output("backup", backup.clone(), journal, state).await {
                 rollback_and_checkpoint(journal, state).await;
@@ -350,7 +404,25 @@ impl OperationJournal {
             return Err(format!("recover: operation {} has status '{}' and does not need recovery", self.id, self.status));
         }
         if !self.undo_safe { return Err(format!("recover: operation {} is not safely reversible", self.id)); }
-        for output in &self.outputs {
+        let mut recovery = self.clone();
+        let mut unpublished = std::collections::HashSet::new();
+        for (index, output) in self.outputs.iter().enumerate() {
+            if output.role.starts_with("pending_") && !output.record.path.exists() {
+                let mut matched = false;
+                for staging in &self.staging_paths {
+                    if staging.exists() {
+                        let mut expected = output.record.clone();
+                        expected.path = staging.clone();
+                        if validate_record(&expected, "recover: staging drift").is_ok() {
+                            matched = true;
+                            unpublished.insert(index);
+                            break;
+                        }
+                    }
+                }
+                if !matched { return Err(format!("recover: pending output is unaccounted for: {}", output.record.path.display())); }
+                continue;
+            }
             validate_record(&output.record, "recover: output drift")?;
             if let Some(original) = &output.original_path {
                 if original.exists() { return Err(format!("recover: original path is no longer free: {}", original.display())); }
@@ -361,7 +433,9 @@ impl OperationJournal {
                 std::fs::remove_file(path).map_err(|error| format!("recover: could not remove staged file {}: {error}", path.display()))?;
             }
         }
-        let mut recovered = self.rollback().map_err(|error| error.replacen("rollback:", "recover:", 1))?;
+        recovery.outputs = recovery.outputs.into_iter().enumerate().filter_map(|(index, output)| (!unpublished.contains(&index)).then_some(output)).collect();
+        recovery.staging_paths.clear();
+        let mut recovered = recovery.rollback().map_err(|error| error.replacen("rollback:", "recover:", 1))?;
         recovered.staging_paths.clear();
         Ok(recovered)
     }
@@ -693,5 +767,62 @@ mod tests {
         assert_eq!(journals[0].status, "rolled_back");
         assert_eq!(journals[0].outputs.len(), 1, "the completed archive remains as durable rollback evidence");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn every_archive_crash_boundary_recovers_from_persisted_state_without_debris() {
+        let points = [
+            CrashPoint::InitialJournal,
+            CrashPoint::StagingIntent,
+            CrashPoint::ZipStaged,
+            CrashPoint::Published,
+            CrashPoint::OutputCheckpoint,
+            CrashPoint::ArchiveBeforeBackup,
+            CrashPoint::BeforeApplied,
+        ];
+        for point in points {
+            let name = format!("crash-{point:?}");
+            let (root, source, fileset) = transfer_fixture(&name);
+            let fileset = fileset.with_roots(vec![source.parent().unwrap().to_path_buf()]);
+            let archives = root.join("archives");
+            let backups = root.join("backups");
+            let archive_plan = crate::compress::plan_fileset_per_root(
+                &fileset,
+                &archives.to_string_lossy(),
+                Some(&backups.to_string_lossy()),
+            ).unwrap();
+            let final_paths = vec![archive_plan.items[0].archive.clone(), archive_plan.items[0].backup.clone().unwrap()];
+            let plan = OperationPlan::archive(archive_plan, false);
+            let database = root.join("recovery-state.redb");
+            let state = crate::state::spawn(database.clone()).unwrap();
+
+            let error = plan.apply_internal(&state, Some(point)).await.unwrap_err();
+            assert!(error.starts_with("__ion_test_crash__:"), "{point:?}: {error}");
+            let persisted = state.list_journals().await.unwrap();
+            assert_eq!(persisted.len(), 1, "{point:?}");
+            assert_eq!(persisted[0].status, "in_progress", "{point:?}");
+            let operation_id = persisted[0].id.clone();
+            drop(state);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+            let restarted = crate::state::spawn(database).unwrap();
+            let journal = restarted.get_journal(operation_id).await.unwrap().unwrap();
+            let recovered = journal.recover_rollback().unwrap_or_else(|error| panic!("{point:?}: {error}"));
+            restarted.put_journal(recovered.clone()).await.unwrap();
+
+            assert_eq!(recovered.status, "rolled_back", "{point:?}");
+            assert!(recovered.staging_paths.is_empty(), "{point:?}");
+            assert!(final_paths.iter().all(|path| !path.exists()), "{point:?}: a final output survived recovery");
+            assert!(source.exists(), "{point:?}: recovery removed a source");
+            for directory in [&archives, &backups] {
+                if directory.exists() {
+                    let unexplained = std::fs::read_dir(directory).unwrap().filter_map(Result::ok).collect::<Vec<_>>();
+                    assert!(unexplained.is_empty(), "{point:?}: unexplained files remain in {}", directory.display());
+                }
+            }
+            drop(restarted);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 }
