@@ -7,6 +7,7 @@
 //! `@name` sigils) before layering the rest of the language on top.
 
 use crate::functions::FunctionDef;
+use crate::fileset::FileSet;
 use crate::table::Table;
 use crate::{err_eprintln, err_println};
 use std::collections::HashMap;
@@ -54,6 +55,7 @@ pub struct Interpreter {
     /// for this slice) a single tagged-union value type spanning all three
     /// kinds.
     tables: Vec<HashMap<String, Table>>,
+    filesets: Vec<HashMap<String, FileSet>>,
 }
 
 impl Default for Interpreter {
@@ -66,6 +68,7 @@ impl Default for Interpreter {
             command_not_found: false,
             echo_capture: None,
             tables: vec![HashMap::new()],
+            filesets: vec![HashMap::new()],
         }
     }
 }
@@ -573,6 +576,9 @@ impl Interpreter {
         // require a bare table-variable name so quoted text and normal
         // scalar/array method calls retain their existing meaning.
         if name == "len" && tokens.len() == 1 && tokens[0].quoting == Quoting::None {
+            if let Some(fileset) = self.get_fileset(&tokens[0].text) {
+                return Ok(fileset.len().to_string());
+            }
             if let Some(table) = self.get_table(&tokens[0].text) {
                 return Ok(table.rows.len().to_string());
             }
@@ -976,6 +982,10 @@ impl Interpreter {
         self.tables.iter().rev().find_map(|frame| frame.get(name))
     }
 
+    pub fn get_fileset(&self, name: &str) -> Option<&FileSet> {
+        self.filesets.iter().rev().find_map(|frame| frame.get(name))
+    }
+
     /// `let`'s core ownership rule (ion-manual page 20): if `name` already
     /// exists in any visible frame, updates it there in place — the frame
     /// that first defined it keeps "owning" it, so a nested block's `let`
@@ -1011,6 +1021,15 @@ impl Interpreter {
             }
         }
         self.current_table_frame().insert(name, value)
+    }
+
+    pub fn set_fileset(&mut self, name: String, value: FileSet) -> Option<FileSet> {
+        for frame in self.filesets.iter_mut().rev() {
+            if let Some(slot) = frame.get_mut(&name) {
+                return Some(std::mem::replace(slot, value));
+            }
+        }
+        self.filesets.last_mut().expect("global scope frame is never popped").insert(name, value)
     }
 
     /// Defines a *new* binding directly in the current (innermost) frame,
@@ -1109,6 +1128,7 @@ impl Interpreter {
         self.scalars.push(HashMap::new());
         self.arrays.push(HashMap::new());
         self.tables.push(HashMap::new());
+        self.filesets.push(HashMap::new());
     }
 
     /// Pops the innermost scope frame, deleting whatever it newly defined
@@ -1125,6 +1145,9 @@ impl Interpreter {
         if self.tables.len() > 1 {
             self.tables.pop();
         }
+        if self.filesets.len() > 1 {
+            self.filesets.pop();
+        }
     }
 
     /// Hides every scope above the global one, returning them so the
@@ -1139,11 +1162,13 @@ impl Interpreter {
         Vec<HashMap<String, String>>,
         Vec<HashMap<String, Vec<String>>>,
         Vec<HashMap<String, Table>>,
+        Vec<HashMap<String, FileSet>>,
     ) {
         (
             self.scalars.split_off(1),
             self.arrays.split_off(1),
             self.tables.split_off(1),
+            self.filesets.split_off(1),
         )
     }
 
@@ -1155,11 +1180,13 @@ impl Interpreter {
             Vec<HashMap<String, String>>,
             Vec<HashMap<String, Vec<String>>>,
             Vec<HashMap<String, Table>>,
+            Vec<HashMap<String, FileSet>>,
         ),
     ) {
         self.scalars.extend(saved.0);
         self.arrays.extend(saved.1);
         self.tables.extend(saved.2);
+        self.filesets.extend(saved.3);
     }
 
     /// Expands a single raw token as a scalar value: `$var`/`@var`
@@ -1219,6 +1246,9 @@ impl Interpreter {
                 if frame.remove(&token.text).is_some() {
                     break;
                 }
+            }
+            for frame in self.filesets.iter_mut().rev() {
+                if frame.remove(&token.text).is_some() { break; }
             }
         }
     }

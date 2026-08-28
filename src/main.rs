@@ -9,6 +9,7 @@ mod copy;
 mod delete;
 mod editor;
 mod execution;
+mod fileset;
 mod fs_builtins;
 mod fs_ops;
 mod functions;

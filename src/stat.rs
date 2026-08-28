@@ -4,10 +4,9 @@
 //! hashing many files is the one part of this that's genuinely CPU/IO-bound
 //! and embarrassingly parallel, unlike everything else built so far.
 
-use crate::table::{Row, Table};
+use crate::fileset::{FileRecord, FileSet};
 use sha2::{Digest, Sha256};
 use std::io::Read;
-use std::time::UNIX_EPOCH;
 
 /// Parses `stat`'s arguments into (file paths, optional hash algorithm).
 /// Only `--hash sha256` is recognized — any other `--hash VALUE` or
@@ -41,22 +40,7 @@ pub fn parse_args(args: &[String]) -> Result<(Vec<String>, Option<String>), Stri
 /// blocking thread (see `build_table`), not the async runtime's own
 /// worker threads. Returns an error string rather than bubbling up
 /// through `?`, since a single file's failure shouldn't stop the others.
-fn stat_one(path: &str, hash_algo: Option<&str>) -> Result<Row, String> {
-    let metadata = std::fs::metadata(path).map_err(|e| e.to_string())?;
-    let modified = metadata
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs().to_string())
-        .unwrap_or_default();
-
-    let mut row: Row = vec![
-        ("path".to_string(), path.to_string()),
-        ("size".to_string(), metadata.len().to_string()),
-        ("modified".to_string(), modified),
-        ("is_dir".to_string(), metadata.is_dir().to_string()),
-    ];
-
+fn stat_one(path: &str, hash_algo: Option<&str>) -> Result<FileRecord, String> {
     if let Some(algo) = hash_algo {
         let digest = match algo {
             "sha256" => {
@@ -77,10 +61,9 @@ fn stat_one(path: &str, hash_algo: Option<&str>) -> Result<Row, String> {
             }
             other => return Err(format!("unsupported hash algorithm '{other}'")),
         };
-        row.push((algo.to_string(), digest));
+        return FileRecord::from_path(path.into(), Some(digest));
     }
-
-    Ok(row)
+    FileRecord::from_path(path.into(), None)
 }
 
 /// Builds a `Table` describing each file in `files`. Hashing (when
@@ -97,7 +80,7 @@ fn stat_one(path: &str, hash_algo: Option<&str>) -> Result<Row, String> {
 /// fail-fast policy, `stat` is describing a batch, and one file vanishing
 /// mid-scan (a real race during a directory walk) shouldn't discard
 /// results for every other file.
-pub async fn build_table(files: &[String], hash_algo: Option<&str>) -> Table {
+pub async fn build_fileset(files: &[String], hash_algo: Option<&str>) -> FileSet {
     let algo_owned = hash_algo.map(str::to_string);
     let concurrency = if hash_algo.is_some() {
         std::thread::available_parallelism().map_or(1, usize::from)
@@ -108,7 +91,7 @@ pub async fn build_table(files: &[String], hash_algo: Option<&str>) -> Table {
     };
     let mut pending = files.iter().cloned().enumerate();
     let mut active = tokio::task::JoinSet::new();
-    let mut ordered: Vec<Option<Row>> = vec![None; files.len()];
+    let mut ordered: Vec<Option<FileRecord>> = vec![None; files.len()];
     let mut interrupted = false;
 
     loop {
@@ -141,14 +124,17 @@ pub async fn build_table(files: &[String], hash_algo: Option<&str>) -> Table {
     if interrupted {
         let _ = crate::jobctl::take_interrupt();
     }
-    Table {
-        rows: ordered.into_iter().flatten().collect(),
-    }
+    FileSet::new(ordered.into_iter().flatten().collect(), "stat")
+}
+
+pub async fn build_table(files: &[String], hash_algo: Option<&str>) -> crate::table::Table {
+    build_fileset(files, hash_algo).await.to_table()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::table::Row;
 
     fn field(row: &Row, key: &str) -> Option<String> {
         row.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())

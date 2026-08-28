@@ -24,6 +24,7 @@
 
 use crate::err_println;
 use crate::execution;
+use crate::fileset::FileSet;
 use crate::interp::Interpreter;
 use crate::jobctl;
 use crate::pipeline::{PipeKind, Pipeline, Redirect, Stream};
@@ -101,6 +102,7 @@ enum Kind {
     /// at classification time (the table is cloned in), not re-looked-up
     /// at execution time.
     TableSource(Table),
+    FileSetSource(FileSet),
     /// A builtin/function name that isn't yet supported as a pipeline
     /// stage. Empty string means the stage had no command at all (e.g. a
     /// stray `|`).
@@ -126,6 +128,17 @@ enum Carry {
     Merge(ChildStdout, ChildStderr),
     /// A structured table from a previous `from-json`/`select` stage.
     Table(Table),
+    FileSet(FileSet),
+}
+
+pub enum CapturedStructured {
+    Table(Table),
+    FileSet(FileSet),
+}
+
+enum EitherStructured {
+    Table(Table),
+    FileSet(FileSet),
 }
 
 /// Whether `kind` needs to read its input in-process (a `Table`, or raw
@@ -180,7 +193,7 @@ pub async fn run_capturing_table(
     pipeline: &Pipeline,
     interp: &mut Interpreter,
     state: &StateHandle,
-) -> (bool, Option<Table>) {
+) -> (bool, Option<CapturedStructured>) {
     let mut captured = None;
     let ok = run_impl(pipeline, interp, state, Some(&mut captured)).await;
     (ok, captured)
@@ -190,7 +203,7 @@ async fn run_impl(
     pipeline: &Pipeline,
     interp: &mut Interpreter,
     _state: &StateHandle,
-    mut capture: Option<&mut Option<Table>>,
+    mut capture: Option<&mut Option<CapturedStructured>>,
 ) -> bool {
     if pipeline.stages.is_empty() || pipeline.stages.iter().all(|s| s.tokens.is_empty()) {
         return true;
@@ -350,6 +363,7 @@ async fn run_impl(
                 // statement. The explicit-files form never had a table to
                 // begin with, so there's nothing to forward in that case.
                 let mut forwarded_table: Option<Table> = None;
+                let mut forwarded_fileset: Option<FileSet> = None;
 
                 let mut text = if positional.len() >= 2 {
                     // Explicit files: SRC... DEST. Ignores whatever was
@@ -366,6 +380,11 @@ async fn run_impl(
                         Carry::Table(t) => {
                             let result = crate::copy::copy_table(&t, dest, force).await;
                             forwarded_table = Some(t);
+                            result
+                        }
+                        Carry::FileSet(fileset) => {
+                            let result = crate::copy::copy_table(&fileset.to_table(), dest, force).await;
+                            forwarded_fileset = Some(fileset);
                             result
                         }
                         Carry::None => {
@@ -405,10 +424,9 @@ async fn run_impl(
                 } else {
                     print!("{text}");
                 }
-                carry = match forwarded_table {
-                    Some(t) => Carry::Table(t),
-                    None => Carry::None,
-                };
+                carry = if let Some(fileset) = forwarded_fileset { Carry::FileSet(fileset) }
+                    else if let Some(table) = forwarded_table { Carry::Table(table) }
+                    else { Carry::None };
             }
             Kind::Move(move_args) => {
                 let (force, mut positional) = match crate::fs_ops::parse_move_flags(move_args) {
@@ -429,6 +447,7 @@ async fn run_impl(
                         Carry::Table(table) => {
                             crate::fs_ops::move_table(&table, &positional[0], force).await
                         }
+                        Carry::FileSet(fileset) => crate::fs_ops::move_table(&fileset.to_table(), &positional[0], force).await,
                         Carry::None => {
                             err_println!(
                                 "ion-win: move: no table piped in and no source paths given"
@@ -474,6 +493,7 @@ async fn run_impl(
                 // pipe (`manifest | compress out.zip | copy backup`); the
                 // explicit-files form has no table to forward.
                 let mut forwarded_table: Option<Table> = None;
+                let mut forwarded_fileset: Option<FileSet> = None;
 
                 let mut text = if positional.len() >= 2 {
                     // Explicit files: SRC... DEST.zip. Ignores whatever
@@ -490,6 +510,11 @@ async fn run_impl(
                         Carry::Table(t) => {
                             let result = crate::compress::compress_table(&t, dest, force).await;
                             forwarded_table = Some(t);
+                            result
+                        }
+                        Carry::FileSet(fileset) => {
+                            let result = crate::compress::compress_table(&fileset.to_table(), dest, force).await;
+                            forwarded_fileset = Some(fileset);
                             result
                         }
                         Carry::None => {
@@ -526,10 +551,9 @@ async fn run_impl(
                 } else {
                     print!("{text}");
                 }
-                carry = match forwarded_table {
-                    Some(t) => Carry::Table(t),
-                    None => Carry::None,
-                };
+                carry = if let Some(fileset) = forwarded_fileset { Carry::FileSet(fileset) }
+                    else if let Some(table) = forwarded_table { Carry::Table(table) }
+                    else { Carry::None };
             }
             Kind::Delete(delete_args) => {
                 let (options, positional) = match crate::delete::parse_flags(delete_args) {
@@ -548,6 +572,7 @@ async fn run_impl(
                 } else {
                     match incoming {
                         Carry::Table(t) => crate::delete::delete_table(&t, options).await,
+                        Carry::FileSet(f) => crate::delete::delete_table(&f.to_table(), options).await,
                         Carry::None => {
                             err_println!("ion-win: delete: no paths given and no table piped in");
                             unregister_spawned!();
@@ -605,6 +630,11 @@ async fn run_impl(
                         // never a `Table` value directly.
                         command.stdin(Stdio::piped());
                         post_spawn_bytes = Some(table.to_json().into_bytes());
+                    }
+                    Carry::FileSet(_) => {
+                        err_println!("ion-win: typed FileSet cannot be passed to an external command; convert it with 'to-json' or 'to-csv'");
+                        unregister_spawned!();
+                        return false;
                     }
                 }
 
@@ -718,6 +748,10 @@ async fn run_impl(
                     capture.as_mut().map(|s| &mut **s),
                 );
             }
+            Kind::FileSetSource(fileset) => {
+                drop(incoming);
+                carry = finish_fileset_stage(fileset.clone(), is_last, stdout_file, capture.as_mut().map(|s| &mut **s));
+            }
             Kind::FromJson => {
                 let bytes = match incoming {
                     Carry::Bytes(b) => b,
@@ -728,6 +762,11 @@ async fn run_impl(
                     }
                     Carry::Table(_) => {
                         err_println!("ion-win: from-json: input is already a table");
+                        unregister_spawned!();
+                        return false;
+                    }
+                    Carry::FileSet(_) => {
+                        err_println!("ion-win: from-json: input is already a FileSet");
                         unregister_spawned!();
                         return false;
                     }
@@ -769,6 +808,11 @@ async fn run_impl(
                         unregister_spawned!();
                         return false;
                     }
+                    Carry::FileSet(_) => {
+                        err_println!("ion-win: from-csv: input is already a FileSet");
+                        unregister_spawned!();
+                        return false;
+                    }
                     Carry::Stdio(_) | Carry::Merge(_, _) => {
                         err_println!(
                             "ion-win: from-csv: only supported right after 'echo'/'cat' or a \
@@ -795,8 +839,15 @@ async fn run_impl(
                 }
             }
             Kind::Select(columns) => {
-                let table = match incoming {
-                    Carry::Table(t) => t,
+                match incoming {
+                    Carry::FileSet(fileset) => {
+                        carry = finish_fileset_stage(fileset.select(columns), is_last, stdout_file, capture.as_mut().map(|s| &mut **s));
+                        continue;
+                    }
+                    Carry::Table(table) => {
+                        carry = finish_table_stage(table.select(columns), is_last, stdout_file, capture.as_mut().map(|s| &mut **s));
+                        continue;
+                    }
                     Carry::None => {
                         err_println!(
                             "ion-win: select: no table piped in (pipe through 'from-json' first)"
@@ -811,17 +862,12 @@ async fn run_impl(
                         unregister_spawned!();
                         return false;
                     }
-                };
-                carry = finish_table_stage(
-                    table.select(columns),
-                    is_last,
-                    stdout_file,
-                    capture.as_mut().map(|s| &mut **s),
-                );
+                }
             }
             Kind::Where(where_args) => {
-                let table = match incoming {
-                    Carry::Table(t) => t,
+                let incoming = match incoming {
+                    Carry::Table(t) => EitherStructured::Table(t),
+                    Carry::FileSet(f) => EitherStructured::FileSet(f),
                     Carry::None => {
                         err_println!(
                             "ion-win: where: no table piped in (pipe through 'from-json' first)"
@@ -852,12 +898,10 @@ async fn run_impl(
                     unregister_spawned!();
                     return false;
                 }
-                carry = finish_table_stage(
-                    table.filter(column, op, value),
-                    is_last,
-                    stdout_file,
-                    capture.as_mut().map(|s| &mut **s),
-                );
+                carry = match incoming {
+                    EitherStructured::Table(table) => finish_table_stage(table.filter(column, op, value), is_last, stdout_file, capture.as_mut().map(|s| &mut **s)),
+                    EitherStructured::FileSet(fileset) => finish_fileset_stage(fileset.filter(column, op, value), is_last, stdout_file, capture.as_mut().map(|s| &mut **s)),
+                };
             }
             Kind::DateColumn(args) => {
                 let table = match incoming {
@@ -918,9 +962,9 @@ async fn run_impl(
                         _ => Vec::new(),
                     }
                 };
-                let table = crate::stat::build_table(&files, hash_algo.as_deref()).await;
-                carry = finish_table_stage(
-                    table,
+                let fileset = crate::stat::build_fileset(&files, hash_algo.as_deref()).await;
+                carry = finish_fileset_stage(
+                    fileset,
                     is_last,
                     stdout_file,
                     capture.as_mut().map(|s| &mut **s),
@@ -929,6 +973,7 @@ async fn run_impl(
             Kind::ToJson => {
                 let table = match incoming {
                     Carry::Table(t) => t,
+                    Carry::FileSet(f) => f.to_table(),
                     Carry::None => {
                         err_println!(
                             "ion-win: to-json: no table piped in (pipe through 'from-json' first)"
@@ -957,6 +1002,7 @@ async fn run_impl(
             Kind::ToCsv => {
                 let table = match incoming {
                     Carry::Table(t) => t,
+                    Carry::FileSet(f) => f.to_table(),
                     Carry::None => {
                         err_println!(
                             "ion-win: to-csv: no table piped in (pipe through 'from-json'/'from-csv' first)"
@@ -1084,6 +1130,8 @@ fn classify_stages(pipeline: &Pipeline, interp: &Interpreter) -> Vec<Kind> {
                 Kind::DateColumn(args[1..].to_vec())
             } else if cmd == "stat" {
                 Kind::Stat(args[1..].to_vec())
+            } else if let Some(fileset) = interp.get_fileset(&cmd) {
+                Kind::FileSetSource(fileset.clone())
             } else if let Some(table) = interp.get_table(&cmd) {
                 Kind::TableSource(table.clone())
             } else if interp.get_function(&cmd).is_some()
@@ -1123,7 +1171,7 @@ fn finish_table_stage(
     table: Table,
     is_last: bool,
     stdout_file: Option<std::fs::File>,
-    capture: Option<&mut Option<Table>>,
+    capture: Option<&mut Option<CapturedStructured>>,
 ) -> Carry {
     if let Some(mut f) = stdout_file {
         let mut text = table.to_json();
@@ -1134,12 +1182,34 @@ fn finish_table_stage(
         match capture {
             // `let NAME = ...` (ARCHITECTURE.md §18): store the table
             // instead of printing it.
-            Some(slot) => *slot = Some(table),
+            Some(slot) => *slot = Some(CapturedStructured::Table(table)),
             None => println!("{}", table.to_json()),
         }
         Carry::None
     } else {
         Carry::Table(table)
+    }
+}
+
+fn finish_fileset_stage(
+    fileset: FileSet,
+    is_last: bool,
+    stdout_file: Option<std::fs::File>,
+    capture: Option<&mut Option<CapturedStructured>>,
+) -> Carry {
+    if let Some(mut file) = stdout_file {
+        let mut text = fileset.to_table().to_json();
+        text.push('\n');
+        let _ = file.write_all(text.as_bytes());
+        Carry::None
+    } else if is_last {
+        match capture {
+            Some(slot) => *slot = Some(CapturedStructured::FileSet(fileset)),
+            None => println!("{}", fileset.to_table().to_json()),
+        }
+        Carry::None
+    } else {
+        Carry::FileSet(fileset)
     }
 }
 
