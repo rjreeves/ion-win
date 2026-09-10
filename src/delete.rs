@@ -60,13 +60,6 @@ pub(crate) fn validate_planned(path: &Path, options: DeleteOptions) -> Result<()
     Ok(())
 }
 
-pub(crate) fn delete_planned(path: &Path, options: DeleteOptions) -> Result<(), String> {
-    match validate_then_delete(path, options) {
-        DeleteResult::Deleted => Ok(()),
-        DeleteResult::Skipped(error) | DeleteResult::Failed(error) => Err(error),
-    }
-}
-
 pub async fn parse_and_delete_files(args: &[String]) -> Result<String, String> {
     let (options, paths) = parse_flags(args)?;
     if paths.is_empty() {

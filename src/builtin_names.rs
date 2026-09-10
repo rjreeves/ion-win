@@ -716,12 +716,12 @@ pub fn help_text(topic: Option<&str>) -> Result<String, String> {
         ),
         "delete" => page(
             "delete [--recurse] PATH...\n        FILESET | delete [--recurse] --plan",
-            "Moves files to the Windows Recycle Bin by default. --plan creates a typed, identity-validated and transaction-journaled delete plan.",
+            "Moves direct deletes to the Windows Recycle Bin. --plan creates a typed transaction that moves items into Ion-managed quarantine for reliable undo.",
             &["delete old.txt", "let plan = manifest | delete --plan", "let result = plan | apply"],
             &[
                 "Permanent deletion requires both --permanent and --force.",
                 "Directories require --recurse, including Recycle Bin deletion.",
-                "Delete journals are not yet undoable because the Windows Shell API does not return a stable recycled-item restoration identity.",
+                "Planned deletes are undoable because Ion retains stable identity in same-volume quarantine. Unplanned deletes continue to use the Windows Recycle Bin.",
                 "Filesystem roots, the current directory, and its ancestors are refused.",
             ],
         ),

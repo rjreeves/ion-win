@@ -111,7 +111,7 @@ impl OperationPlan {
             PlannedOperation::Archive(plan) => plan.to_table(),
             PlannedOperation::Copy(plan) => transfer_table(plan, "copy"),
             PlannedOperation::Move(plan) => transfer_table(plan, "move"),
-            PlannedOperation::Delete(plan) => Table { rows: plan.items.iter().map(|item| vec![("operation".to_string(), "delete".to_string()), ("path".to_string(), item.path.to_string_lossy().into_owned()), ("kind".to_string(), kind_name(&item.kind).to_string()), ("recurse".to_string(), plan.options.recurse.to_string()), ("mode".to_string(), "recycle".to_string()), ("undo_safe".to_string(), "false".to_string())]).collect() },
+            PlannedOperation::Delete(plan) => Table { rows: plan.items.iter().map(|item| vec![("operation".to_string(), "delete".to_string()), ("path".to_string(), item.path.to_string_lossy().into_owned()), ("kind".to_string(), kind_name(&item.kind).to_string()), ("recurse".to_string(), plan.options.recurse.to_string()), ("mode".to_string(), "ion-quarantine".to_string()), ("undo_safe".to_string(), "true".to_string())]).collect() },
         };
         for row in &mut table.rows { row.insert(0, ("plan_id".to_string(), self.id.clone())); }
         table
@@ -127,11 +127,13 @@ impl OperationPlan {
         let initially_undo_safe = match &self.operation {
             PlannedOperation::Archive(plan) => plan.items.iter().all(|item| !item.archive.exists() && item.backup.as_ref().is_none_or(|path| !path.exists())),
             PlannedOperation::Copy(plan) | PlannedOperation::Move(plan) => plan.items.iter().all(|item| item.destination_before.is_none()),
-            PlannedOperation::Delete(_) => false,
+            PlannedOperation::Delete(_) => true,
         };
+        let journal_id = unique_id("operation");
         let remaining_steps = match &self.operation {
             PlannedOperation::Copy(plan) => plan.items.iter().map(|item| RecoveryStep { operation: "copy".to_string(), source: item.source.clone(), destination: item.destination.clone() }).collect(),
             PlannedOperation::Move(plan) => plan.items.iter().map(|item| RecoveryStep { operation: "move".to_string(), source: item.source.clone(), destination: item.destination.clone() }).collect(),
+            PlannedOperation::Delete(plan) => plan.items.iter().enumerate().map(|(index, item)| RecoveryStep { operation: "delete".to_string(), source: item.clone(), destination: delete_quarantine_path(&item.path, &journal_id, index) }).collect(),
             _ => Vec::new(),
         };
         let remaining_archives = match &self.operation {
@@ -139,7 +141,7 @@ impl OperationPlan {
             _ => Vec::new(),
         };
         let resume_supported = matches!(self.operation, PlannedOperation::Copy(_) | PlannedOperation::Move(_) | PlannedOperation::Archive(_));
-        let mut journal = OperationJournal { id: unique_id("operation"), plan_id: self.id.clone(), operation: operation.to_string(), started_at, finished_at: 0, outputs: Vec::new(), staging_paths: Vec::new(), remaining_steps, remaining_archives, resume_supported, undo_safe: initially_undo_safe, status: "in_progress".to_string(), error: None, undone_at: None };
+        let mut journal = OperationJournal { id: journal_id, plan_id: self.id.clone(), operation: operation.to_string(), started_at, finished_at: 0, outputs: Vec::new(), staging_paths: Vec::new(), remaining_steps, remaining_archives, resume_supported, undo_safe: initially_undo_safe, status: "in_progress".to_string(), error: None, undone_at: None };
         state.put_journal(journal.clone()).await?;
         injected_crash(crash, CrashPoint::InitialJournal)?;
         let result: Result<(), String> = match &self.operation {
@@ -148,7 +150,7 @@ impl OperationPlan {
             },
             PlannedOperation::Copy(plan) => apply_transfer(plan, self.force, false, &mut journal, state, crash).await,
             PlannedOperation::Move(plan) => apply_transfer(plan, self.force, true, &mut journal, state, crash).await,
-            PlannedOperation::Delete(plan) => apply_delete(plan, &mut journal, state).await,
+            PlannedOperation::Delete(plan) => apply_delete(plan, &mut journal, state, crash).await,
         };
         match result {
             Ok(()) => {
@@ -324,24 +326,42 @@ async fn rollback_and_checkpoint(journal: &mut OperationJournal, state: &crate::
     let _ = state.put_journal(journal.clone()).await;
 }
 
-async fn apply_delete(plan: &DeletePlan, journal: &mut OperationJournal, state: &crate::state::StateHandle) -> Result<(), String> {
+async fn apply_delete(plan: &DeletePlan, journal: &mut OperationJournal, state: &crate::state::StateHandle, crash: Option<CrashPoint>) -> Result<(), String> {
     for item in &plan.items {
         validate_record(item, "apply: source drift")?;
         crate::delete::validate_planned(&item.path, plan.options)?;
     }
-    for item in &plan.items {
-        let path = item.path.clone();
-        let options = plan.options;
-        let result = tokio::task::spawn_blocking(move || crate::delete::delete_planned(&path, options)).await.map_err(|error| format!("apply: delete worker failed: {error}"))?;
+    for (index, item) in plan.items.iter().enumerate() {
+        injected_crash(crash, CrashPoint::BeforeTransferMutation)?;
+        let quarantine = journal.remaining_steps.iter().find(|step| step.operation == "delete" && step.source.path == item.path).map(|step| step.destination.clone()).ok_or_else(|| format!("apply: missing delete quarantine intent for {}", item.path.display()))?;
+        let mut pending = item.clone(); pending.path = quarantine.clone();
+        journal.outputs.push(JournalOutput { role: "pending_delete".to_string(), record: pending, original_path: Some(item.path.clone()) });
+        state.put_journal(journal.clone()).await?;
+        let source = item.path.clone();
+        let target = quarantine.clone();
+        let result = tokio::task::spawn_blocking(move || crate::fs_ops::move_one(&source, &target, false)).await.map_err(|error| format!("apply: delete quarantine worker failed: {error}"))?;
         if let Err(error) = result {
-            journal.status = if journal.outputs.is_empty() { "failed" } else { "partially_applied" }.to_string();
+            journal.outputs.retain(|output| !(output.role == "pending_delete" && output.original_path.as_ref() == Some(&item.path)));
+            transactional_rollback(journal);
             let _ = state.put_journal(journal.clone()).await;
             return Err(format!("apply: delete: {error}"));
         }
-        journal.outputs.push(JournalOutput { role: "recycled".to_string(), record: item.clone(), original_path: Some(item.path.clone()) });
+        injected_crash(crash, CrashPoint::TransferMutated)?;
+        journal.outputs.retain(|output| !(output.role == "pending_delete" && output.original_path.as_ref() == Some(&item.path)));
+        let record = FileRecord::from_path(quarantine, None).map_err(|error| format!("apply: could not journal quarantined delete: {error}"))?;
+        journal.outputs.push(JournalOutput { role: "quarantined".to_string(), record, original_path: Some(item.path.clone()) });
+        journal.remaining_steps.retain(|step| !(step.operation == "delete" && step.source.path == item.path));
         state.put_journal(journal.clone()).await?;
+        injected_crash(crash, CrashPoint::TransferCheckpoint)?;
+        if index + 1 < plan.items.len() { injected_crash(crash, CrashPoint::BetweenTransferRecords)?; }
     }
     Ok(())
+}
+
+fn delete_quarantine_path(source: &std::path::Path, journal_id: &str, index: usize) -> PathBuf {
+    let parent = source.parent().filter(|path| !path.as_os_str().is_empty()).unwrap_or_else(|| std::path::Path::new("."));
+    let name = source.file_name().map(|value| value.to_string_lossy().into_owned()).unwrap_or_else(|| "item".to_string());
+    parent.join(".ion-win-quarantine").join(journal_id).join(format!("{index}-{name}"))
 }
 
 fn journal_output(role: &str, path: PathBuf) -> Result<JournalOutput, String> {
@@ -490,7 +510,7 @@ impl OperationJournal {
         let mut unpublished = std::collections::HashSet::new();
         for (index, output) in self.outputs.iter().enumerate() {
             if output.role.starts_with("pending_") && !output.record.path.exists() {
-                if output.role == "pending_move" {
+                if matches!(output.role.as_str(), "pending_move" | "pending_delete") {
                     if let Some(original) = &output.original_path {
                         let mut expected = output.record.clone();
                         expected.path = original.clone();
@@ -1387,5 +1407,90 @@ mod tests {
         assert!(error.contains("both source and destination"), "{error}");
         assert!(source.exists() && destination.exists());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn planned_delete_quarantines_files_and_directories_then_undo_restores_them() {
+        let root = std::env::temp_dir().join(format!("ion-win-delete-undo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let file = root.join("file.txt");
+        let directory = root.join("folder");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(&file, "delete undo file").unwrap();
+        std::fs::write(directory.join("nested.txt"), "delete undo directory").unwrap();
+        let file_record = FileRecord::from_path(file.clone(), None).unwrap();
+        let directory_record = FileRecord::from_path(directory.clone(), None).unwrap();
+        let fileset = crate::fileset::FileSet::new(vec![file_record.clone(), directory_record.clone()], "test");
+        let plan = OperationPlan::delete(&fileset, crate::delete::DeleteOptions { recurse: true, ..Default::default() }).unwrap();
+
+        let journal = plan.apply(&crate::state::spawn_memory()).await.unwrap();
+
+        assert!(journal.undo_safe);
+        assert!(!file.exists() && !directory.exists());
+        assert_eq!(journal.outputs.iter().map(|output| output.role.as_str()).collect::<Vec<_>>(), vec!["quarantined", "quarantined"]);
+        assert_eq!(journal.outputs[0].record.identity, file_record.identity);
+        assert_eq!(journal.outputs[1].record.identity, directory_record.identity);
+        let undone = journal.undo().unwrap();
+        assert_eq!(undone.status, "undone");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "delete undo file");
+        assert_eq!(std::fs::read_to_string(directory.join("nested.txt")).unwrap(), "delete undo directory");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn planned_delete_undo_refuses_quarantine_identity_drift() {
+        let (root, source, fileset) = transfer_fixture("delete-undo-drift");
+        let plan = OperationPlan::delete(&fileset, crate::delete::DeleteOptions::default()).unwrap();
+        let journal = plan.apply(&crate::state::spawn_memory()).await.unwrap();
+        let quarantine = journal.outputs[0].record.path.clone();
+        std::fs::write(&quarantine, "quarantined content changed after delete").unwrap();
+
+        let error = journal.undo().unwrap_err();
+
+        assert!(error.contains("output drift"), "{error}");
+        assert!(!source.exists());
+        assert!(quarantine.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn planned_delete_recovers_every_persisted_crash_state() {
+        let points = [CrashPoint::InitialJournal, CrashPoint::BeforeTransferMutation, CrashPoint::TransferMutated, CrashPoint::TransferCheckpoint, CrashPoint::BetweenTransferRecords, CrashPoint::BeforeApplied];
+        for point in points {
+            let (root, first, mut fileset) = transfer_fixture(&format!("delete-recover-{point:?}"));
+            let second = first.parent().unwrap().join("second.txt");
+            std::fs::write(&second, "second recoverable delete").unwrap();
+            fileset.files.push(FileRecord::from_path(second.clone(), None).unwrap());
+            let plan = OperationPlan::delete(&fileset, crate::delete::DeleteOptions::default()).unwrap();
+            let database = root.join("delete-recovery.redb");
+            let state = crate::state::spawn(database.clone()).unwrap();
+            let error = plan.apply_internal(&state, Some(point)).await.unwrap_err();
+            assert!(error.starts_with("__ion_test_crash__:"), "{point:?}: {error}");
+            let operation_id = state.list_journals().await.unwrap().pop().unwrap().id;
+            drop(state);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+            let restarted = crate::state::spawn(database).unwrap();
+            let journal = restarted.get_journal(operation_id).await.unwrap().unwrap();
+            let recovered = journal.recover_rollback().unwrap_or_else(|error| panic!("{point:?}: {error}"));
+            restarted.put_journal(recovered.clone()).await.unwrap();
+
+            assert_eq!(recovered.status, "rolled_back", "{point:?}");
+            assert_eq!(std::fs::read_to_string(&first).unwrap(), "typed transfer", "{point:?}");
+            assert_eq!(std::fs::read_to_string(&second).unwrap(), "second recoverable delete", "{point:?}");
+            let quarantine = first.parent().unwrap().join(".ion-win-quarantine");
+            let mut files = Vec::new();
+            let mut directories = vec![quarantine];
+            while let Some(directory) = directories.pop() {
+                if !directory.exists() { continue; }
+                for entry in std::fs::read_dir(directory).unwrap().filter_map(Result::ok) {
+                    if entry.path().is_dir() { directories.push(entry.path()); } else { files.push(entry.path()); }
+                }
+            }
+            assert!(files.is_empty(), "{point:?}: quarantine debris remains: {files:?}");
+            drop(restarted);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 }
