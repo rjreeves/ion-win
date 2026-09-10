@@ -1,0 +1,3 @@
+# Wait for the local PostgreSQL server, then leave an interactive psql
+# session attached until the user exits it.
+pg-connect

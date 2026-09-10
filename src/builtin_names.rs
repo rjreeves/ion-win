@@ -398,6 +398,11 @@ pub const BUILTINS: &[Builtin] = &[
         help_display: Some("history"),
     },
     Builtin {
+        name: "pg-connect",
+        is_keyword: false,
+        help_display: Some("pg-connect [--host HOST] [--port PORT] [--database DATABASE] [--user USER]"),
+    },
+    Builtin {
         name: "cls",
         is_keyword: false,
         help_display: Some("cls"),
@@ -477,6 +482,7 @@ Commands by category
                    to-json  to-csv
   State & jobs     pvar  task  schedule  exec  history  jobs  wait  disown
                    which/type
+  Database         pg-connect
   Editor           highlight  cls
 
 Examples
@@ -627,6 +633,12 @@ pub fn help_text(topic: Option<&str>) -> Result<String, String> {
                 "HISTORY_SIZE limits in-memory recall; HISTFILE_SIZE limits persisted command entries.",
                 "HISTFILE and both size limits take effect live.",
             ],
+        ),
+        "pg-connect" => page(
+            "pg-connect [--host HOST] [--port PORT] [--database DATABASE] [--user USER]",
+            "Waits for PostgreSQL to accept connections, then opens an interactive psql session and leaves it attached to the terminal until you exit it.",
+            &["pg-connect", "pg-connect --host db --port 5432 --database app --user app_user"],
+            &["Authentication follows normal libpq behavior: PGPASSWORD, pgpass.conf, or an interactive psql prompt.", "Requires pg_isready and psql on PATH.", "Press Ctrl+C while waiting to cancel."],
         ),
         "exit" | "quit" => page("exit", "Exits the current ion-win shell.", &[], &["`quit` is an alias."]),
         "let" => page(

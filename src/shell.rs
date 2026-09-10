@@ -1020,6 +1020,11 @@ async fn dispatch(line: &str, interp: &mut Interpreter, state: &StateHandle) -> 
                 }
             }
         }
+        "pg-connect" => {
+            let args = interp.expand_all(raw_args);
+            let ok = crate::postgres::connect(&args);
+            interp.set_previous_status(ok);
+        }
         "journal" => {
             let ok = pipeline_exec::run(&parsed, interp, state).await;
             interp.set_previous_status(ok);

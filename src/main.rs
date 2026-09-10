@@ -23,6 +23,7 @@ mod methods;
 mod operation;
 mod pipeline;
 mod pipeline_exec;
+mod postgres;
 mod procexpand;
 mod ranges;
 mod schedule;
