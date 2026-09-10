@@ -1036,6 +1036,22 @@ async fn dispatch(line: &str, interp: &mut Interpreter, state: &StateHandle) -> 
             };
             interp.set_previous_status(ok);
         }
+        "is-elevated" => {
+            let args = interp.expand_all(raw_args);
+            let ok = if !args.is_empty() {
+                err_println!("ion-win: is-elevated: usage: is-elevated");
+                false
+            } else {
+                match crate::elevate::is_elevated() {
+                    Ok(elevated) => elevated,
+                    Err(error) => {
+                        err_println!("ion-win: is-elevated: {error}");
+                        false
+                    }
+                }
+            };
+            interp.set_previous_status(ok);
+        }
         "journal" => {
             let ok = pipeline_exec::run(&parsed, interp, state).await;
             interp.set_previous_status(ok);

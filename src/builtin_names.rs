@@ -408,6 +408,11 @@ pub const BUILTINS: &[Builtin] = &[
         help_display: Some("elevate [--wait] [--cwd DIRECTORY] PROGRAM [ARGS...]"),
     },
     Builtin {
+        name: "is-elevated",
+        is_keyword: false,
+        help_display: Some("is-elevated"),
+    },
+    Builtin {
         name: "cls",
         is_keyword: false,
         help_display: Some("cls"),
@@ -487,7 +492,7 @@ Commands by category
                    to-json  to-csv
   State & jobs     pvar  task  schedule  exec  history  jobs  wait  disown
                    which/type
-  Windows          elevate
+  Windows          elevate  is-elevated
   Database         pg-connect
   Editor           highlight  cls
 
@@ -651,6 +656,12 @@ pub fn help_text(topic: Option<&str>) -> Result<String, String> {
             "Starts one program with Windows administrator privileges through the standard UAC consent prompt.",
             &["elevate notepad.exe C:\\Windows\\System32\\drivers\\etc\\hosts", "elevate --wait --cwd C:\\Work installer.exe /quiet"],
             &["--wait waits for completion and succeeds only for exit code 0.", "A cancelled UAC prompt is reported distinctly.", "Pipeline input is not supported; elevate an Ion script when several commands need administrator rights."],
+        ),
+        "is-elevated" => page(
+            "is-elevated",
+            "Succeeds when the current ion-win process has an enabled Windows Administrators-group token; otherwise it fails without printing output.",
+            &["if is-elevated; echo administrator; else; echo standard user; end", "is-elevated && echo elevated"],
+            &["This command checks status only; it never displays UAC or changes privileges.", "Pipeline input and arguments are not supported."],
         ),
         "exit" | "quit" => page("exit", "Exits the current ion-win shell.", &[], &["`quit` is an alias."]),
         "let" => page(

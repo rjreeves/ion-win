@@ -26,6 +26,62 @@ impl Outcome {
     }
 }
 
+#[cfg(windows)]
+pub fn is_elevated() -> Result<bool, String> {
+    use windows_sys::Win32::Foundation::PSID;
+    use windows_sys::Win32::Security::{
+        AllocateAndInitializeSid, CheckTokenMembership, FreeSid, SECURITY_NT_AUTHORITY,
+    };
+    use windows_sys::Win32::System::SystemServices::{
+        DOMAIN_ALIAS_RID_ADMINS, SECURITY_BUILTIN_DOMAIN_RID,
+    };
+
+    let mut administrators_sid: PSID = std::ptr::null_mut();
+    let allocated = unsafe {
+        AllocateAndInitializeSid(
+            &SECURITY_NT_AUTHORITY,
+            2,
+            SECURITY_BUILTIN_DOMAIN_RID as u32,
+            DOMAIN_ALIAS_RID_ADMINS as u32,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            &mut administrators_sid,
+        )
+    };
+    if allocated == 0 {
+        return Err(format!(
+            "could not create the Administrators group SID: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let mut member = 0;
+    let checked = unsafe { CheckTokenMembership(0, administrators_sid, &mut member) };
+    let error = if checked == 0 {
+        Some(std::io::Error::last_os_error())
+    } else {
+        None
+    };
+    unsafe {
+        FreeSid(administrators_sid);
+    }
+    match error {
+        Some(error) => Err(format!(
+            "could not inspect the current process token: {error}"
+        )),
+        None => Ok(member != 0),
+    }
+}
+
+#[cfg(not(windows))]
+pub fn is_elevated() -> Result<bool, String> {
+    Err("elevation status is only available on Windows".to_string())
+}
+
 fn parse_options(args: &[String]) -> Result<Options, String> {
     let mut wait = false;
     let mut cwd = None;
@@ -237,5 +293,11 @@ mod tests {
         assert!(Outcome::Launched.success());
         assert!(Outcome::Exited(0).success());
         assert!(!Outcome::Exited(5).success());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn current_token_elevation_can_be_inspected_without_prompting() {
+        assert!(is_elevated().is_ok());
     }
 }

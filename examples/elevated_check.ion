@@ -1,0 +1,9 @@
+# Demonstrate elevation-aware Ion scripting without performing a privileged
+# operation. Install the current ion-win.exe on PATH before running this file.
+
+if is-elevated
+    echo "This Ion script is running with administrator privileges."
+else
+    echo "Requesting administrator privileges through Windows UAC ..."
+    elevate --wait ion-win.exe @args[0]
+end

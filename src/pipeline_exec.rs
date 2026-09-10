@@ -1641,6 +1641,7 @@ fn classify_stages(pipeline: &Pipeline, interp: &Interpreter) -> Vec<Kind> {
                     cmd.as_str(),
                     "pvar"
                         | "elevate"
+                        | "is-elevated"
                         | "dmark"
                         | "test"
                         | "matches"

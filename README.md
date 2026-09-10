@@ -109,7 +109,21 @@ ion-win process:
 elevate --wait ion-win.exe admin-maintenance.ion
 ```
 
-Use `help elevate` for the focused command reference.
+Scripts can test the current token without displaying UAC:
+
+```ion
+if is-elevated
+    echo "Running as administrator"
+else
+    elevate --wait ion-win.exe admin-maintenance.ion
+end
+```
+
+`is-elevated` communicates through command status, so it composes naturally
+with `if`, `&&`, and `||` without producing text that must be parsed. See
+`examples/elevated_check.ion` for a harmless self-elevation example.
+
+Use `help elevate` and `help is-elevated` for focused command references.
 
 ## Docs
 
