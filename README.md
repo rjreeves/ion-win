@@ -55,9 +55,36 @@ end
 - **Structured data**: table variables, JSON/CSV pipelines, `$len(table)` row counts, `$field(row column)` scalar access, and `date-column` transformations for parsing, formatting, timezone conversion, and calendar arithmetic across whole columns
 - **Native date/time**: validated `date`, `time`, `datetime`, and `duration`/`interval` types; ISO constructors, extraction/truncation, instant-aware comparison/difference, formatting, true month/year intervals with end-of-month clamping, and IANA timezone/DST policies
 - **Manifest operations**: `copy`, ZIP `compress`, and safe `delete` (Recycle Bin by default; permanent only with `--permanent --force`)
+- **PostgreSQL console**: `pg-connect` waits for a PostgreSQL server to become ready, then opens an interactive `psql` session on the same connection
 - **Conditionals/builtins**: `test`, `matches`, `contains`/`starts-with`/`ends-with`, `eq`/`is`, `exists`, `which`/`type`, `eval`, and more
 
 See [HANDOVER.md](HANDOVER.md) for the full, current list of what's implemented and verified, and what's deliberately not (e.g. `fg`/`bg` and Vi keybindings have no clean fit on Windows / are out of scope by choice, not oversight).
+
+## PostgreSQL console
+
+`pg-connect` waits until PostgreSQL accepts connections and then leaves an
+interactive `psql` session attached to the ion-win terminal. Both `pg_isready`
+and `psql` must be available on `PATH`.
+
+```ion
+pg-connect
+pg-connect --host localhost --port 5432 --database postgres --user postgres
+```
+
+The defaults are `localhost`, port `5432`, database `postgres`, and user
+`postgres`. Authentication follows normal PostgreSQL/libpq behavior: use the
+`PGPASSWORD` environment variable, `%APPDATA%\postgresql\pgpass.conf`, or the
+interactive `psql` password prompt. ion-win does not embed or persist a
+PostgreSQL password.
+
+From the repository root, register and run a reusable console task with:
+
+```ion
+ion-win.exe scripts/register_postgres_console_task.ion
+task run postgres-console
+```
+
+Use `help pg-connect` inside ion-win for the focused command reference.
 
 ## Docs
 
