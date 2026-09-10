@@ -1640,6 +1640,7 @@ fn classify_stages(pipeline: &Pipeline, interp: &Interpreter) -> Vec<Kind> {
                 || matches!(
                     cmd.as_str(),
                     "pvar"
+                        | "elevate"
                         | "dmark"
                         | "test"
                         | "matches"

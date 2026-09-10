@@ -51,7 +51,7 @@ end
 - **Process execution**: pipelines (`|` `^|` `&|`), redirection (`>` `>>` `^>` `&>`), background/disown (`&` `&!`), `jobs`/`wait`/`disown`
 - **Shell UX**: a real Unicode/grapheme-safe interactive line editor (live history shared safely across windows, Tab-completion, multiline/bracketed paste, word editing, Shift-selection, Windows clipboard copy/cut/paste, syntax highlighting), enhanced `read -p`/`-s`/`-n`, implicit `cd`, persistent `pvar`/`dmark` state, a custom `PROMPT` function, and `Ctrl+C` that interrupts the running command without killing the shell
 - **Discoverable help**: categorized `help`, focused `help COMMAND` pages for every builtin, and concept guides such as `help tables`, `help methods`, and `help history`
-- **Windows conveniences**: recursive `mkdir`/`md`, safe `move`/`mv` (including table manifests), in-place `rename`/`ren`, `pushd`/`popd`, and `cls`
+- **Windows conveniences**: recursive `mkdir`/`md`, safe `move`/`mv` (including table manifests), in-place `rename`/`ren`, `pushd`/`popd`, `elevate` through Windows UAC, and `cls`
 - **Structured data**: table variables, JSON/CSV pipelines, `$len(table)` row counts, `$field(row column)` scalar access, and `date-column` transformations for parsing, formatting, timezone conversion, and calendar arithmetic across whole columns
 - **Native date/time**: validated `date`, `time`, `datetime`, and `duration`/`interval` types; ISO constructors, extraction/truncation, instant-aware comparison/difference, formatting, true month/year intervals with end-of-month clamping, and IANA timezone/DST policies
 - **Manifest operations**: `copy`, ZIP `compress`, and safe `delete` (Recycle Bin by default; permanent only with `--permanent --force`)
@@ -85,6 +85,31 @@ task run postgres-console
 ```
 
 Use `help pg-connect` inside ion-win for the focused command reference.
+
+## Elevating a Windows program
+
+`elevate` starts one external program through the standard Windows UAC consent
+prompt. It never stores credentials or bypasses UAC.
+
+```ion
+elevate notepad.exe C:\Windows\System32\drivers\etc\hosts
+elevate --wait --cwd C:\Work installer.exe /quiet
+```
+
+Without `--wait`, ion-win returns after Windows launches the elevated process.
+With `--wait`, ion-win waits for it to finish and reports success only when the
+program exits with code `0`. Cancelling the UAC prompt is reported as a command
+failure.
+
+The first version intentionally accepts no pipeline input. To run several Ion
+commands with administrator privileges, put them in a script and elevate a new
+ion-win process:
+
+```ion
+elevate --wait ion-win.exe admin-maintenance.ion
+```
+
+Use `help elevate` for the focused command reference.
 
 ## Docs
 

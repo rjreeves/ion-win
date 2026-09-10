@@ -8,6 +8,7 @@ mod compress;
 mod copy;
 mod delete;
 mod editor;
+mod elevate;
 mod execution;
 mod fileset;
 mod fs_builtins;

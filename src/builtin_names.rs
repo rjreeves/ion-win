@@ -403,6 +403,11 @@ pub const BUILTINS: &[Builtin] = &[
         help_display: Some("pg-connect [--host HOST] [--port PORT] [--database DATABASE] [--user USER]"),
     },
     Builtin {
+        name: "elevate",
+        is_keyword: false,
+        help_display: Some("elevate [--wait] [--cwd DIRECTORY] PROGRAM [ARGS...]"),
+    },
+    Builtin {
         name: "cls",
         is_keyword: false,
         help_display: Some("cls"),
@@ -482,6 +487,7 @@ Commands by category
                    to-json  to-csv
   State & jobs     pvar  task  schedule  exec  history  jobs  wait  disown
                    which/type
+  Windows          elevate
   Database         pg-connect
   Editor           highlight  cls
 
@@ -639,6 +645,12 @@ pub fn help_text(topic: Option<&str>) -> Result<String, String> {
             "Waits for PostgreSQL to accept connections, then opens an interactive psql session and leaves it attached to the terminal until you exit it.",
             &["pg-connect", "pg-connect --host db --port 5432 --database app --user app_user"],
             &["Authentication follows normal libpq behavior: PGPASSWORD, pgpass.conf, or an interactive psql prompt.", "Requires pg_isready and psql on PATH.", "Press Ctrl+C while waiting to cancel."],
+        ),
+        "elevate" => page(
+            "elevate [--wait] [--cwd DIRECTORY] PROGRAM [ARGS...]",
+            "Starts one program with Windows administrator privileges through the standard UAC consent prompt.",
+            &["elevate notepad.exe C:\\Windows\\System32\\drivers\\etc\\hosts", "elevate --wait --cwd C:\\Work installer.exe /quiet"],
+            &["--wait waits for completion and succeeds only for exit code 0.", "A cancelled UAC prompt is reported distinctly.", "Pipeline input is not supported; elevate an Ion script when several commands need administrator rights."],
         ),
         "exit" | "quit" => page("exit", "Exits the current ion-win shell.", &[], &["`quit` is an alias."]),
         "let" => page(
