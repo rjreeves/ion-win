@@ -3,3 +3,7 @@
 # Upstream Ion source, fetched for research/reference only — not part of
 # this project.
 /Linux
+
+# Separate local projects and machine-specific launcher artifacts.
+/website/
+/openme.exe

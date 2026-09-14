@@ -1,0 +1,159 @@
+# Folder Sentinel
+#
+# A zero-service integrity monitor for important Windows folders. Seal a folder
+# into a SHA-256 baseline, then verify it later to expose added, removed, or
+# modified files. Verification is read-only and preserves the fresh scan as a
+# machine-readable CSV for incident follow-up.
+#
+# Seal:
+#   ion-win.exe examples/folder_sentinel.ion seal FOLDER SENTINEL_DIRECTORY
+#
+# Verify:
+#   ion-win.exe examples/folder_sentinel.ion verify FOLDER SENTINEL_DIRECTORY
+#
+# SENTINEL_DIRECTORY must not exist when sealing. Keep it outside FOLDER so the
+# baseline never inventories itself.
+
+if test $len(args) -ne 4
+    echo "Folder Sentinel — know exactly what changed"
+    echo ""
+    echo "Usage:"
+    echo "  ion-win.exe examples/folder_sentinel.ion seal FOLDER SENTINEL_DIRECTORY"
+    echo "  ion-win.exe examples/folder_sentinel.ion verify FOLDER SENTINEL_DIRECTORY"
+    exit 2
+end
+
+let mode = @args[1]
+let root = @args[2]
+let sentinel = @args[3]
+
+if not test -e $root
+    echo "folder-sentinel: folder does not exist: $root"
+    exit 2
+end
+
+match $mode
+    case seal
+        if test -e $sentinel
+            echo "folder-sentinel: sentinel directory already exists: $sentinel"
+            echo "Refusing to overwrite an integrity baseline. Choose a new directory."
+            exit 2
+        end
+
+        echo "Scanning and hashing $root ..."
+        let snapshot = find --all --recurse $root | stat --hash sha256 | where is_dir = false
+        let count = $len(snapshot)
+
+        if test $count -eq 0
+            echo "folder-sentinel: no files found under $root"
+            exit 1
+        end
+
+        echo ""
+        echo "Seal plan"
+        echo "  Folder:   $root"
+        echo "  Files:    $count"
+        echo "  Sentinel: $sentinel"
+        echo ""
+        read -p "Create immutable baseline? Type seal to continue: " answer
+
+        if not eq $answer seal
+            echo "Cancelled. No baseline was created."
+            exit 1
+        end
+
+        mkdir $sentinel
+        pushd $sentinel
+        snapshot | select path size modified sha256 | to-csv > baseline.csv
+        stat baseline.csv --hash sha256 | select path size modified sha256 | to-csv > baseline_sha256.csv
+        popd
+
+        echo ""
+        echo "SENTINEL ARMED"
+        echo "  Baseline files: $count"
+        echo "  Manifest:       $sentinel/baseline.csv"
+        echo "  Seal checksum:  $sentinel/baseline_sha256.csv"
+        echo ""
+        echo "Keep the sentinel directory somewhere trusted, then run verify at any time."
+    case verify
+        if not test -e $sentinel/baseline.csv
+            echo "folder-sentinel: baseline not found: $sentinel/baseline.csv"
+            exit 2
+        end
+
+        echo "Loading trusted baseline ..."
+        let baseline = cat $sentinel/baseline.csv | from-csv
+        echo "Scanning and hashing $root ..."
+        let current = find --all --recurse $root | stat --hash sha256 | where is_dir = false
+
+        let added = 0
+        let removed = 0
+        let modified = 0
+
+        echo ""
+        echo "Integrity changes"
+        echo "-----------------"
+
+        for now in current
+            let found = false
+            for before in baseline
+                if eq $field(now path) $field(before path)
+                    let found = true
+                    if not eq $field(now sha256) $field(before sha256)
+                        echo "MODIFIED  $field(now path)"
+                        echo "          was $field(before sha256)"
+                        echo "          now $field(now sha256)"
+                        let modified += 1
+                    end
+                end
+            end
+
+            if eq $found false
+                echo "ADDED     $field(now path)"
+                let added += 1
+            end
+        end
+
+        for before in baseline
+            let found = false
+            for now in current
+                if eq $field(before path) $field(now path)
+                    let found = true
+                end
+            end
+
+            if eq $found false
+                echo "REMOVED   $field(before path)"
+                let removed += 1
+            end
+        end
+
+        # Preserve the most recent observation without mutating the protected
+        # folder. This is overwritten intentionally: baseline.csv never is.
+        pushd $sentinel
+        current | select path size modified sha256 | to-csv > latest_scan.csv
+        stat latest_scan.csv --hash sha256 | select path size modified sha256 | to-csv > latest_scan_sha256.csv
+        popd
+
+        let changes = $((added + removed + modified))
+        echo ""
+        echo "SENTINEL REPORT"
+        echo "  Baseline: $len(baseline) files"
+        echo "  Current:  $len(current) files"
+        echo "  Added:    $added"
+        echo "  Removed:  $removed"
+        echo "  Modified: $modified"
+        echo "  Evidence: $sentinel/latest_scan.csv"
+
+        if test $changes -eq 0
+            echo ""
+            echo "VERIFIED — folder matches the trusted baseline."
+        else
+            echo ""
+            echo "DRIFT DETECTED — $changes integrity change(s) require review."
+            exit 1
+        end
+    case _
+        echo "folder-sentinel: mode must be 'seal' or 'verify'"
+        exit 2
+end

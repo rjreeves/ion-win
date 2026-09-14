@@ -1,0 +1,58 @@
+# Duplicate Finder
+#
+# Finds files with identical SHA-256 content without deleting anything.
+# Each duplicate pair is printed once. Paths, sizes, and hashes come from one
+# structured manifest, so filenames are never parsed out of formatted text.
+#
+# Usage:
+#   ion-win.exe examples/duplicate_finder.ion DIRECTORY
+
+if test $len(args) -ne 2
+    echo "Usage: ion-win.exe examples/duplicate_finder.ion DIRECTORY"
+    exit 2
+end
+
+let root = @args[1]
+
+if not test -e $root
+    echo "duplicate-finder: path does not exist: $root"
+    exit 2
+end
+
+echo "Scanning $root ..."
+let files = find --recurse $root | stat --hash sha256 | where is_dir = false
+let file_count = $len(files)
+
+echo "Hashed $file_count files."
+
+let left_index = 0
+let duplicate_pairs = 0
+
+for left in files
+    let right_index = 0
+
+    for right in files
+        # Comparing only later rows avoids reporting A/B and then B/A.
+        if test $right_index -gt $left_index
+            if eq $field(left sha256) $field(right sha256)
+                echo ""
+                echo "DUPLICATE ($field(left size) bytes)"
+                echo "  $field(left path)"
+                echo "  $field(right path)"
+                echo "  sha256: $field(left sha256)"
+                let duplicate_pairs += 1
+            end
+        end
+
+        let right_index += 1
+    end
+
+    let left_index += 1
+end
+
+echo ""
+if test $duplicate_pairs -eq 0
+    echo "No duplicate files found."
+else
+    echo "Found $duplicate_pairs duplicate pair(s). No files were changed."
+end

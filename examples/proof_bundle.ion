@@ -1,0 +1,77 @@
+# Proof Bundle
+#
+# Freezes a directory into a portable ZIP accompanied by CSV and JSON
+# SHA-256 manifests plus a checksum for the ZIP itself. The manifest and the
+# archive are produced from the same in-memory file snapshot.
+#
+# Nothing is changed in SOURCE. OUTPUT_DIRECTORY must not already exist.
+# Keep OUTPUT_DIRECTORY outside SOURCE so the evidence cannot include itself.
+#
+# Usage:
+#   ion-win.exe examples/proof_bundle.ion SOURCE OUTPUT_DIRECTORY
+
+if test $len(args) -ne 3
+    echo "Usage: ion-win.exe examples/proof_bundle.ion SOURCE OUTPUT_DIRECTORY"
+    exit 2
+end
+
+let source = @args[1]
+let output = @args[2]
+
+if not test -e $source
+    echo "proof-bundle: source does not exist: $source"
+    exit 2
+end
+
+if test -e $output
+    echo "proof-bundle: output already exists: $output"
+    echo "Choose a new directory so an earlier bundle is never overwritten."
+    exit 2
+end
+
+echo "Inventorying and hashing $source ..."
+let manifest = find --all --recurse $source | stat --hash sha256 | where is_dir = false
+let file_count = $len(manifest)
+
+if test $file_count -eq 0
+    echo "proof-bundle: no files found under $source"
+    exit 1
+end
+
+echo ""
+echo "Proof bundle plan"
+echo "  Source: $source"
+echo "  Files:  $file_count"
+echo "  Output: $output"
+echo ""
+manifest | select path size modified sha256 | to-csv
+
+read -p "Create this proof bundle? Type yes to continue: " answer
+if not eq $answer yes
+    echo "Cancelled. No output was created."
+    exit 1
+end
+
+mkdir $output
+
+# The archive and both manifests consume the same in-memory table, so they
+# describe one snapshot rather than three separate directory scans.
+manifest | compress "$output/bundle.zip"
+
+# Redirection targets are literal in ion-win 1.2.1, so enter the new output
+# directory before writing fixed filenames. The source manifest remains valid.
+pushd $output
+manifest | select path size modified sha256 | to-csv > manifest.csv
+manifest | select path size modified sha256 | to-json > manifest.json
+
+# This lets the recipient verify that bundle.zip itself survived transfer.
+stat bundle.zip --hash sha256 | select path size modified sha256 | to-csv > bundle_sha256.csv
+popd
+
+echo ""
+echo "Proof bundle created:"
+echo "  $output/bundle.zip"
+echo "  $output/manifest.csv"
+echo "  $output/manifest.json"
+echo "  $output/bundle_sha256.csv"
+echo "Files in bundle: $file_count"

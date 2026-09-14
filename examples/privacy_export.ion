@@ -1,0 +1,81 @@
+# Privacy Export
+#
+# Converts a private customer CSV into a deliberately allowlisted public
+# dataset. Email addresses, internal notes, and every other unlisted column are
+# dropped; timestamps are normalized into the requested IANA timezone. The app
+# emits CSV and JSON, packages both, and records the package checksum.
+#
+# Required input columns:
+#   customer_id, display_name, signup_at, last_seen_at, plan
+#
+# Timestamp values must be unambiguous ISO datetimes with an offset or `Z`.
+# OUTPUT_DIRECTORY must not already exist.
+#
+# Usage:
+#   ion-win.exe examples/privacy_export.ion INPUT.csv OUTPUT_DIRECTORY TIMEZONE
+#
+# Example:
+#   ion-win.exe examples/privacy_export.ion customers.csv public Australia/Sydney
+
+if test $len(args) -ne 4
+    echo "Usage: ion-win.exe examples/privacy_export.ion INPUT.csv OUTPUT_DIRECTORY TIMEZONE"
+    exit 2
+end
+
+let input = @args[1]
+let output = @args[2]
+let zone = @args[3]
+
+if not test -e $input
+    echo "privacy-export: input does not exist: $input"
+    exit 2
+end
+
+if test -e $output
+    echo "privacy-export: output already exists: $output"
+    echo "Choose a new directory so an earlier export is never overwritten."
+    exit 2
+end
+
+echo "Reading private dataset ..."
+
+# Column transforms are atomic: one absent column, invalid timestamp, or bad
+# timezone rejects the whole table instead of emitting a partly sanitized file.
+let public = cat $input | from-csv | date-column signup_at signup_local timezone $zone | date-column last_seen_at last_seen_local timezone $zone | select customer_id display_name plan signup_local last_seen_local
+
+let row_count = $len(public)
+if test $row_count -eq 0
+    echo "privacy-export: input contains no data rows"
+    exit 1
+end
+
+echo "Prepared $row_count public row(s)."
+echo "Only these columns will leave the private dataset:"
+echo "  customer_id, display_name, plan, signup_local, last_seen_local"
+echo ""
+public | to-csv
+
+read -p "Create the sanitized export? Type yes to continue: " answer
+if not eq $answer yes
+    echo "Cancelled. No output was created."
+    exit 1
+end
+
+mkdir $output
+pushd $output
+
+# Fixed filenames avoid ion-win 1.2.1's intentionally literal redirect paths.
+public | to-csv > public_customers.csv
+public | to-json > public_customers.json
+compress public_customers.csv public_customers.json sanitized_export.zip
+stat sanitized_export.zip --hash sha256 | select path size modified sha256 | to-csv > sanitized_export_sha256.csv
+
+popd
+
+echo ""
+echo "Privacy export created:"
+echo "  $output/public_customers.csv"
+echo "  $output/public_customers.json"
+echo "  $output/sanitized_export.zip"
+echo "  $output/sanitized_export_sha256.csv"
+echo "Public rows: $row_count"
