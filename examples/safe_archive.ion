@@ -1,0 +1,48 @@
+# Safe Archive
+#
+# Creates one ZIP for every immediate subfolder of ROOT and a second copy of
+# every ZIP in BACKUP_DIRECTORY. The complete operation is previewed before a
+# transactional apply; cancellation and planning perform no writes.
+#
+# Keep ARCHIVE_DIRECTORY and BACKUP_DIRECTORY outside ROOT.
+#
+# Usage:
+#   ion-win.exe examples/safe_archive.ion ROOT ARCHIVE_DIRECTORY BACKUP_DIRECTORY
+
+if test $len(args) -ne 4
+    echo "Usage: ion-win.exe examples/safe_archive.ion ROOT ARCHIVE_DIRECTORY BACKUP_DIRECTORY"
+    exit 2
+end
+
+let root = @args[1]
+let archive_directory = @args[2]
+let backup_directory = @args[3]
+
+if not test -e $root
+    echo "safe-archive: root does not exist: $root"
+    exit 2
+end
+
+# Each immediate directory record becomes distinct root provenance. find keeps
+# that provenance while expanding nested files, so compress derives one stable
+# <folder-name>.zip destination per root without converting through Table.
+let roots = folders --all $root
+let archive_files = roots | find --all --recurse
+
+if test $len(archive_files) -eq 0
+    echo "safe-archive: no files found beneath the immediate subfolders of $root"
+    exit 1
+end
+
+let plan = archive_files | compress --per-root --plan $archive_directory --backup $backup_directory
+
+echo "Archive and backup plan:"
+plan | to-json
+
+read -p "Apply this plan? Type yes to continue: " answer
+if eq $answer yes
+    plan | apply
+    echo "Safe archive completed."
+else
+    echo "Cancelled. No archives or backup copies were written."
+end

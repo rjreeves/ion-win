@@ -131,6 +131,8 @@ Use `help elevate` and `help is-elevated` for focused command references.
 - [`examples/folder_sentinel.ion`](examples/folder_sentinel.ion) seals and later verifies a SHA-256 folder baseline; see [`FOLDER_SENTINEL.md`](FOLDER_SENTINEL.md).
 - [`examples/privacy_export.ion`](examples/privacy_export.ion) turns a private CSV into an allowlisted, timezone-normalized export.
 - [`examples/proof_bundle.ion`](examples/proof_bundle.ion) creates a ZIP with CSV and JSON manifests plus archive verification metadata.
+- [`examples/safe_archive.ion`](examples/safe_archive.ion) previews and transactionally applies one archive and backup copy per immediate subfolder.
+- [`examples/postgres_recovery_capsule.ion`](examples/postgres_recovery_capsule.ion) combines optional external `pg.toolkit` recovery proof with an ion-win evidence bundle.
 
 These examples are deliberately local, inspectable Ion programs. They exercise
 structured tables and filesystem operations without requiring a workflow

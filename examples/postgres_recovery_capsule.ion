@@ -1,0 +1,98 @@
+# PostgreSQL Recovery Capsule — pg.toolkit + ion-win
+#
+# Creates evidence that a PostgreSQL database is recoverable, not merely that a
+# backup command returned success:
+#
+#   1. pg.toolkit checks connectivity and database health.
+#   2. pg.toolkit creates a custom-format backup with its own manifest.
+#   3. pg.toolkit verifies the archive catalog and checksum.
+#   4. pg.toolkit restores it into a guarded disposable database and validates
+#      the restored structure before cleaning that database up.
+#   5. ion-win hashes every resulting artifact, writes a capsule inventory,
+#      and packages the complete evidence set into one ZIP.
+#
+# pg.toolkit is an optional external dependency, not part of ion-win. Put
+# pgtool.exe on PATH and configure its profiles and credentials using
+# pg.toolkit's normal environment/configuration mechanism. This script never
+# accepts, prints, or persists a password.
+#
+# Usage:
+#   ion-win.exe examples/postgres_recovery_capsule.ion PROFILE OUTPUT_DIRECTORY
+#
+# Example:
+#   ion-win.exe examples/postgres_recovery_capsule.ion local recovery-2026-08-24
+
+if test $len(args) -ne 3
+    echo "Usage: ion-win.exe examples/postgres_recovery_capsule.ion PROFILE OUTPUT_DIRECTORY"
+    exit 64
+end
+
+let profile = @args[1]
+let output = @args[2]
+
+if test -e $output
+    echo "recovery-capsule: output already exists: $output"
+    echo "Choose a new directory so previous recovery evidence is never overwritten."
+    exit 2
+end
+
+echo "Checking PostgreSQL profile '$profile' ..."
+pgtool.exe ping --profile $profile
+or exit 2
+
+echo ""
+echo "Recovery capsule plan"
+echo "  Profile: $profile"
+echo "  Output:  $output"
+echo "  Proof:   backup + checksum verification + disposable restore"
+echo ""
+read -p "Create and restore-test this database backup? Type yes to continue: " answer
+
+if not eq $answer yes
+    echo "Cancelled. No output was created."
+    exit 1
+end
+
+mkdir $output
+pushd $output
+
+# A doctor warning or critical finding belongs in the evidence capsule. It does
+# not suppress the backup; pg.toolkit's JSON preserves the evaluated severity.
+pgtool.exe doctor --profile $profile --format json --output doctor.json
+or echo "Database health findings recorded; continuing with recovery proof."
+
+pgtool.exe report --profile $profile --format json --output operational_report.json
+or echo "Operational report contains health findings; continuing with recovery proof."
+
+# Backup, verification, and restore-test are hard gates. Any failure stops the
+# script before ion-win labels the capsule complete.
+pgtool.exe backup create --profile $profile --output database.dump --manifest database.dump.json
+or exit 3
+
+pgtool.exe backup verify database.dump --manifest database.dump.json --format json --output backup_verify.json
+or exit 3
+
+pgtool.exe backup restore-test database.dump --profile $profile --format json --output restore_test.json
+or exit 3
+
+# ion-win now takes ownership of the cross-tool evidence bundle. The first scan
+# records pg.toolkit's artifacts in the independent manifest. After writing
+# that manifest, a second snapshot includes it in capsule.zip; the ZIP itself
+# is created only after this input FileSet is fixed, so it cannot include itself.
+let evidence = find --all --recurse . | stat --hash sha256 | where is_dir = false
+evidence | select path size modified sha256 | to-json > capsule_manifest.json
+
+let capsule_files = find --all --recurse . | stat --hash sha256 | where is_dir = false
+capsule_files | compress capsule.zip
+stat capsule.zip --hash sha256 | select path size modified sha256 | to-csv > capsule_sha256.csv
+
+let artifact_count = $len(capsule_files)
+popd
+
+echo ""
+echo "PostgreSQL recovery capsule complete:"
+echo "  $output/capsule.zip"
+echo "  $output/capsule_manifest.json"
+echo "  $output/capsule_sha256.csv"
+echo "Evidence artifacts packaged: $artifact_count"
+echo "The disposable restore succeeded and was cleaned up by pg.toolkit."
