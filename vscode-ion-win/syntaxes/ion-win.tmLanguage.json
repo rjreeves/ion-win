@@ -84,7 +84,7 @@
             "patterns": [
                 {
                     "name": "keyword.control.ion-win",
-                    "match": "\\b(?:let|export|drop|if|else|while|for|in|fn|match|case|end|break|continue|not|and|or)\\b"
+                    "match": "\\b(?:let|export|drop|if|else|while|for|parallel|in|fn|match|case|end|break|continue|not|and|or)\\b"
                 }
             ]
         },

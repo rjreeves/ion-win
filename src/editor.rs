@@ -205,15 +205,6 @@ impl LineEditor {
         }
     }
 
-    /// Removes the most recently recorded entry when it is the input that
-    /// just ran. Used by `HISTORY_IGNORE=no_such_command` after execution
-    /// reveals that a command could not be resolved.
-    pub fn remove_last_history_if(&mut self, line: &str) {
-        if self.history.last().map(String::as_str) == Some(line) {
-            self.history.pop();
-        }
-    }
-
     fn read_line_interactive(&mut self, prompt: &str, allow_abort: bool) -> EditorOutcome {
         if enable_raw_mode().is_err() {
             return match read_line_plain(prompt) {
@@ -1033,14 +1024,11 @@ mod tests {
     }
 
     #[test]
-    fn remove_last_history_if_only_removes_the_matching_latest_entry() {
+    fn submitted_invalid_line_remains_available_for_recall() {
         let mut editor = LineEditor::default();
         editor.add_history("echo kept");
-        editor.add_history("missing-command");
-        editor.remove_last_history_if("different-command");
-        assert_eq!(editor.history, vec!["echo kept", "missing-command"]);
-        editor.remove_last_history_if("missing-command");
-        assert_eq!(editor.history, vec!["echo kept"]);
+        editor.add_history("misspelled-command");
+        assert_eq!(editor.history.last().unwrap(), "misspelled-command");
     }
 
     #[test]

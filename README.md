@@ -47,7 +47,7 @@ end
 
 - **Core language**: `let` (scalar/array, arithmetic compound assignment), `drop`, scoping rules, `fn` with typed/array parameters and docstrings
 - **Expansion**: `$name`/`@name`/`${name}`/`@{name}`, `$((arithmetic))`, `$(cmd)`/`@(cmd)` process expansion, string/array methods, grapheme-aware length/slicing, brace ranges and permutation lists (`{1..10}`, `{ext1,ext2}`, nesting)
-- **Control flow**: `if`/`else if`/`else`, `while`, `for`/`in`, `match`/`case` with guards, `break`/`continue`, `and`/`or`/`&&`/`||`
+- **Control flow**: `if`/`else if`/`else`, `while`, `for`/`in`, bounded `parallel --workers N`, `match`/`case` with guards, `break`/`continue`, `and`/`or`/`&&`/`||`
 - **Process execution**: pipelines (`|` `^|` `&|`), redirection (`>` `>>` `^>` `&>`), background/disown (`&` `&!`), `jobs`/`wait`/`disown`
 - **Shell UX**: a real Unicode/grapheme-safe interactive line editor (live history shared safely across windows, Tab-completion, multiline/bracketed paste, word editing, Shift-selection, Windows clipboard copy/cut/paste, syntax highlighting), enhanced `read -p`/`-s`/`-n`, implicit `cd`, persistent `pvar`/`dmark` state, a custom `PROMPT` function, and `Ctrl+C` that interrupts the running command without killing the shell
 - **Discoverable help**: categorized `help`, focused `help COMMAND` pages for every builtin, and concept guides such as `help tables`, `help methods`, and `help history`
@@ -59,6 +59,28 @@ end
 - **Conditionals/builtins**: `test`, `matches`, `contains`/`starts-with`/`ends-with`, `eq`/`is`, `exists`, `which`/`type`, `eval`, and more
 
 See [HANDOVER.md](HANDOVER.md) for the full, current list of what's implemented and verified, and what's deliberately not (e.g. `fg`/`bg` and Vi keybindings have no clean fit on Windows / are out of scope by choice, not oversight).
+
+## Bounded parallel blocks
+
+`parallel` evaluates its input once and keeps up to `N` block instances active.
+As soon as any instance completes, the next input starts; there are no fixed
+batches. The statement waits for every launched worker and succeeds only when
+all workers succeed. Failures are printed in deterministic input order.
+
+```ion
+parallel --workers 3 folder in @folders
+    vicki.exe backup --folder $folder --zip "$folder.zip"
+end
+```
+
+Each worker receives a cloned interpreter and a fresh local binding for the
+iteration variable, so neither sibling workers nor the parent scope can be
+mutated. Foreground commands, pipelines, and redirection use the normal
+ExecutionManager and Windows Job Objects. Ctrl+C cancels all active foreground
+executions and prevents queued inputs from launching. `break`, `continue`,
+`return`, nested `parallel`, background `&`/`&!`, and commands that mutate
+process-wide shell state (`cd`, `pushd`, `popd`, `dmark`, `export`, `source`,
+and `eval`) are rejected inside a worker.
 
 ## PostgreSQL console
 

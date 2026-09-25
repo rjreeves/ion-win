@@ -69,7 +69,7 @@
         ]
     ],
     "indentationRules": {
-        "increaseIndentPattern": "^\\s*(if|else\\s+if|else|while|for|fn|match|case)\\b.*(?:;\\s*)?$",
+        "increaseIndentPattern": "^\\s*(if|else\\s+if|else|while|for|parallel|fn|match|case)\\b.*(?:;\\s*)?$",
         "decreaseIndentPattern": "^\\s*(end|else(?:\\s+if)?|case)\\b"
     },
     "wordPattern": "(-?\\d*\\.\\d\\w*)|([^\\s`~!@#$%^&*()=+\\[\\]{}\\\\|;:'\",.<>/?]+)"

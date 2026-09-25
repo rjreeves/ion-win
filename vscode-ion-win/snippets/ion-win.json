@@ -49,6 +49,15 @@
         ],
         "description": "Ion for loop"
     },
+    "Parallel block": {
+        "prefix": "parallel",
+        "body": [
+            "parallel --workers ${1:4} ${2:item} in ${3:@items}",
+            "\t${4:command \\$${2:item}}",
+            "end"
+        ],
+        "description": "Ion bounded-concurrency block"
+    },
     "Function": {
         "prefix": "fn",
         "body": [

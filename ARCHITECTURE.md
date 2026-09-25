@@ -1049,3 +1049,34 @@ policies without scheduler-specific fields or launch logic.
 Verified through serialization/parser compatibility tests and a compiled
 real-binary script that created and displayed a persisted 100 ms / 256 MiB /
 two-process task, ran it, and observed a retained `TimedOut` execution.
+
+## 47. Native bounded concurrency (`parallel`)
+
+`parallel --workers N VARIABLE in EXPRESSION ... end` is a shell block, with
+`N` restricted to 1 through 64. The expression is expanded once on the parent
+interpreter before workers launch. Each item receives a full interpreter clone
+plus a fresh innermost scalar binding for `VARIABLE`; worker writes therefore
+cannot reach another worker or the parent interpreter.
+
+The coordinator initially launches `min(N, item_count)` workers, then consumes
+individual completion messages. Each completion immediately opens one slot for
+the next queued item, so scheduling has no batch barrier. The statement does
+not continue past `end` until every launched worker has joined. Results retain
+their input indices and failures are rendered by index after collection, making
+diagnostics deterministic even when completion order is not.
+
+Workers do not create a parallel-specific process abstraction. A command uses
+`run_foreground_external`; a pipeline uses `begin_foreground_pipeline`; every
+PID is consequently owned by its ordinary `Execution` and private Windows Job
+Object in the sole `ExecutionManager`. Ctrl+C's existing foreground snapshot
+therefore targets every active worker execution. The coordinator observes the
+shared interrupt flag without consuming it, stops replenishing the queue, waits
+for active workers to unwind, then consumes the flag and returns `Interrupted`.
+
+Foreground pipelines (including redirection) are supported. Background `&`
+and disowned `&!` are rejected because a parallel statement must own and await
+all work. `break`, `continue`, and `return` are rejected rather than escaping
+across worker threads; nested `parallel` is rejected to keep cancellation and
+capacity semantics single-level. Process-global mutations (`cd`, directory
+stack/bookmark changes, `export`, `source`, and `eval`) are also rejected;
+allowing them would violate worker isolation even with cloned variable frames.

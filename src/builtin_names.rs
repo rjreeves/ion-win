@@ -188,6 +188,11 @@ pub const BUILTINS: &[Builtin] = &[
         help_display: Some("for/in"),
     },
     Builtin {
+        name: "parallel",
+        is_keyword: true,
+        help_display: Some("parallel"),
+    },
+    Builtin {
         name: "in",
         is_keyword: true,
         help_display: None,
@@ -485,7 +490,7 @@ Commands by category
   Navigation       cd  pushd  popd  pwd  dirs  folders  files  find  dmark
   Files            mkdir  cat  stat  copy  move  rename  compress  delete
   Language         let  export  drop  read  echo  eval  source  fn
-  Control flow     if  while  for  match  and  or  break  continue
+  Control flow     if  while  for  parallel  match  and  or  break  continue
   Conditions       test  matches  bool  contains  starts-with  ends-with
                    eq/is  exists  intersects  isatty  true  false  not
   Tables           from-json  from-csv  select  where/filter  date-column
@@ -763,6 +768,7 @@ pub fn help_text(topic: Option<&str>) -> Result<String, String> {
         "if" | "else" => page("if CONDITION; ...; [else if CONDITION; ...;] [else; ...;] end", "Runs the first matching branch.", &["if test $count -gt 0; echo positive; else; echo empty; end"], &[]),
         "while" => page("while CONDITION; ...; end", "Repeats a block while its condition succeeds.", &["while test $n -lt 10; let n += 1; end"], &[]),
         "for" | "in" => page("for NAME in VALUES...; ...; end", "Iterates arrays, expanded values, or rows of a table.", &["for item in @items; echo $item; end", "for row in manifest; echo $field(row path); end"], &[]),
+        "parallel" => page("parallel --workers N NAME in VALUES...; ...; end", "Runs one isolated block per input value with up to N (1-64) active workers.", &["parallel --workers 4 item in @items; command $item; end"], &["The input expression is evaluated once; the statement waits for every worker.", "Queued items start as soon as any worker finishes; failures are reported in input order.", "Pipelines and redirection are supported. break, continue, return, nested parallel, background &, and shell-global mutations are rejected."]),
         "fn" | "end" => page("fn NAME [PARAM[: TYPE]...]; ...; end", "Defines a function. Bare `fn` lists definitions.", &["fn greet name: str; echo \"Hello $name\"; end"], &[]),
         "match" | "case" => page("match VALUE; case PATTERN [if CONDITION]; ...; case _; ...; end", "Selects a branch by scalar/array pattern intersection, with optional guards.", &["match $name; case Robert; echo owner; case _; echo guest; end"], &[]),
         "break" | "continue" => page(topic.as_str(), "Controls the nearest enclosing while/for loop.", &[], &["`break` exits the loop; `continue` starts its next iteration."]),

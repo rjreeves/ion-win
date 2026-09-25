@@ -21,6 +21,7 @@ use std::collections::HashMap;
 /// in an outer frame updates it there in place instead of shadowing it —
 /// "the first invocation of `let` gets to own the variable" — which is why
 /// reads/writes always walk the whole stack rather than just the top frame.
+#[derive(Clone)]
 pub struct Interpreter {
     scalars: Vec<HashMap<String, String>>,
     arrays: Vec<HashMap<String, Vec<String>>>,

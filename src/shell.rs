@@ -60,7 +60,7 @@ use std::future::Future;
 use std::io;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{mpsc, Mutex, OnceLock};
 
 /// Whether `line` opens a multi-line block. `fn` only opens a block when
 /// it's a definition (`fn NAME ...`) — bare `fn`/`fn -h`/`fn --help` is the
@@ -68,7 +68,7 @@ use std::sync::{Mutex, OnceLock};
 fn is_block_opener(line: &str) -> bool {
     let tokens = Interpreter::tokenize(line);
     match tokens.first().map(|t| t.text.as_str()) {
-        Some("if") | Some("while") | Some("for") | Some("match") => true,
+        Some("if") | Some("while") | Some("for") | Some("parallel") | Some("match") => true,
         Some("fn") => tokens.len() > 1 && !matches!(tokens[1].text.as_str(), "-h" | "--help"),
         _ => false,
     }
@@ -166,12 +166,11 @@ pub async fn run(state: StateHandle) {
             )
         };
 
-        // A block records several separate input lines, so there is no
-        // single latest entry that safely represents the failed command.
-        // Simple inputs are exact: remove only the line just executed.
-        if !is_block && interp.command_not_found() && history::ignores_no_such_command(&interp) {
-            editor.remove_last_history_if(&line);
-        } else {
+        // `no_such_command` is a persistence filter, not an editor-recall
+        // filter. The line was already added to the editor above and stays
+        // there so Up Arrow can recover it for correction; only the append
+        // to HISTFILE is skipped.
+        if should_persist_input(is_block, &interp) {
             history::append(&interp, &accepted_lines);
         }
 
@@ -183,6 +182,12 @@ pub async fn run(state: StateHandle) {
             Flow::Normal => {}
         }
     }
+}
+
+fn should_persist_input(is_block: bool, interp: &Interpreter) -> bool {
+    is_block
+        || !interp.command_not_found()
+        || !history::ignores_no_such_command(interp)
 }
 
 /// Runs a script file non-interactively (ion-manual "Script Executions"):
@@ -363,6 +368,12 @@ fn exec_block_statements<'a>(
                 "for" => {
                     let (body, next_i) = extract_block(lines, i);
                     let flow = exec_for(line, body, interp, state).await;
+                    i = next_i;
+                    flow
+                }
+                "parallel" => {
+                    let (body, next_i) = extract_block(lines, i);
+                    let flow = exec_parallel(line, body, interp, state).await;
                     i = next_i;
                     flow
                 }
@@ -709,6 +720,231 @@ async fn exec_for(
         }
     }
     Flow::Normal
+}
+
+const MAX_PARALLEL_WORKERS: usize = 64;
+
+#[derive(Debug, PartialEq)]
+struct ParallelHeader {
+    workers: usize,
+    variable: String,
+    expression: Vec<Token>,
+}
+
+fn parse_parallel_header(header: &str) -> Result<ParallelHeader, String> {
+    let tokens = Interpreter::tokenize(header);
+    if tokens.len() < 6
+        || tokens[0].text != "parallel"
+        || tokens[1].text != "--workers"
+        || tokens[4].text != "in"
+    {
+        return Err("usage: parallel --workers N VARIABLE in EXPRESSION".into());
+    }
+    let workers = tokens[2]
+        .text
+        .parse::<usize>()
+        .map_err(|_| "--workers must be an integer from 1 through 64".to_string())?;
+    if !(1..=MAX_PARALLEL_WORKERS).contains(&workers) {
+        return Err("--workers must be an integer from 1 through 64".into());
+    }
+    let variable = tokens[3].text.clone();
+    if variable.is_empty()
+        || !variable
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        || variable
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_digit())
+    {
+        return Err("VARIABLE must be a valid identifier".into());
+    }
+    Ok(ParallelHeader {
+        workers,
+        variable,
+        expression: tokens[5..].to_vec(),
+    })
+}
+
+/// Validates constructs whose semantics cannot be isolated per worker. External
+/// commands, foreground pipelines, and redirection are deliberately allowed:
+/// they continue through the ordinary pipeline/execution-manager path.
+fn validate_parallel_body(lines: &[String]) -> Result<(), String> {
+    for line in lines {
+        let tokens = Interpreter::tokenize(line);
+        let Some(first) = tokens.first().map(|token| token.text.as_str()) else {
+            continue;
+        };
+        if matches!(first, "break" | "continue" | "return") {
+            return Err(format!("'{first}' is not supported inside parallel workers"));
+        }
+        if first == "parallel" {
+            return Err("nested parallel blocks are not supported".into());
+        }
+        if matches!(first, "cd" | "pushd" | "popd" | "dmark" | "export" | "source" | "eval") {
+            return Err(format!(
+                "'{first}' is not supported inside parallel workers because it mutates shared shell state"
+            ));
+        }
+        let parsed = pipeline::parse(&tokens);
+        if parsed.background || parsed.disown {
+            return Err("background '&' and disowned '&!' commands are not supported inside parallel workers".into());
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ParallelWorkerResult {
+    index: usize,
+    item: String,
+    success: bool,
+    exit_code: i32,
+    error: Option<String>,
+    interrupted: bool,
+}
+
+struct ParallelSchedule {
+    next: usize,
+    active: usize,
+    total: usize,
+    limit: usize,
+    cancelled: bool,
+}
+
+impl ParallelSchedule {
+    fn new(total: usize, limit: usize) -> Self {
+        Self { next: 0, active: 0, total, limit, cancelled: false }
+    }
+
+    fn next_launch(&mut self) -> Option<usize> {
+        if self.cancelled || self.active >= self.limit || self.next >= self.total {
+            return None;
+        }
+        let index = self.next;
+        self.next += 1;
+        self.active += 1;
+        Some(index)
+    }
+
+    fn complete(&mut self, cancelled: bool) {
+        self.active = self.active.saturating_sub(1);
+        self.cancelled |= cancelled;
+    }
+}
+
+async fn exec_parallel(
+    header: &str,
+    body: &[String],
+    interp: &mut Interpreter,
+    state: &StateHandle,
+) -> Flow {
+    let parsed = match parse_parallel_header(header) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            err_println!("ion: parallel: {error}");
+            interp.set_previous_status(false);
+            return Flow::Normal;
+        }
+    };
+    if let Err(error) = validate_parallel_body(body) {
+        err_println!("ion: parallel: {error}");
+        interp.set_previous_status(false);
+        return Flow::Normal;
+    }
+
+    // Expansion happens exactly once, before any worker exists.
+    let items = interp.expand_all(&parsed.expression);
+    if items.is_empty() {
+        interp.set_previous_status(true);
+        return Flow::Normal;
+    }
+
+    let (sender, receiver) = mpsc::channel();
+    let mut schedule = ParallelSchedule::new(items.len(), parsed.workers);
+    let mut results: Vec<Option<ParallelWorkerResult>> =
+        std::iter::repeat_with(|| None).take(items.len()).collect();
+
+    let launch = |index: usize, sender: mpsc::Sender<ParallelWorkerResult>| {
+        let item = items[index].clone();
+        let variable = parsed.variable.clone();
+        let body = body.to_vec();
+        let mut worker_interp = interp.clone();
+        let worker_state = state.clone();
+        std::thread::spawn(move || {
+            worker_interp.push_scope();
+            worker_interp.define_local_scalar(variable, item.clone());
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            let (flow, error) = match runtime {
+                Ok(runtime) => {
+                    let flow = runtime.block_on(exec_block_statements(
+                        &body,
+                        &mut worker_interp,
+                        &worker_state,
+                    ));
+                    (flow, None)
+                }
+                Err(error) => (Flow::Normal, Some(format!("could not start worker runtime: {error}"))),
+            };
+            worker_interp.pop_scope();
+            let interrupted = flow == Flow::Interrupted || jobctl::interrupt_requested();
+            let success = error.is_none() && flow == Flow::Normal && worker_interp.previous_status();
+            let result = ParallelWorkerResult {
+                index,
+                item,
+                success,
+                exit_code: if success { 0 } else if interrupted { 130 } else { 1 },
+                error: error.or_else(|| (!success).then(|| {
+                    if interrupted { "cancelled".into() } else { "worker block failed".into() }
+                })),
+                interrupted,
+            };
+            let _ = sender.send(result);
+        });
+    };
+
+    while let Some(index) = schedule.next_launch() {
+        launch(index, sender.clone());
+    }
+
+    while schedule.active > 0 {
+        let Ok(result) = receiver.recv() else {
+            break;
+        };
+        schedule.complete(result.interrupted || jobctl::interrupt_requested());
+        let result_index = result.index;
+        results[result_index] = Some(result);
+        // Completion-driven refill: never waits for the rest of a batch.
+        if let Some(index) = schedule.next_launch() {
+            launch(index, sender.clone());
+        }
+    }
+
+    let interrupted = schedule.cancelled
+        || jobctl::interrupt_requested()
+        || results.iter().flatten().any(|result| result.interrupted);
+    let mut all_succeeded = schedule.next == items.len();
+    for result in results.into_iter().flatten() {
+        if !result.success {
+            all_succeeded = false;
+            err_println!(
+                "ion: parallel: item[{}]={:?}: exit code {}: {}",
+                result.index,
+                result.item,
+                result.exit_code,
+                result.error.as_deref().unwrap_or("worker block failed")
+            );
+        }
+    }
+    interp.set_previous_status(all_succeeded);
+    if interrupted {
+        let _ = jobctl::take_interrupt();
+        Flow::Interrupted
+    } else {
+        Flow::Normal
+    }
 }
 
 /// Finds the first unquoted `&&`/`||` token in `tokens`, splitting into
@@ -1799,6 +2035,98 @@ mod read_tests {
 
     fn tokens(line: &str) -> Vec<Token> {
         Interpreter::tokenize(line)
+    }
+
+    #[test]
+    fn parses_parallel_header() {
+        let parsed = parse_parallel_header("parallel --workers 4 item in @items").unwrap();
+        assert_eq!(parsed.workers, 4);
+        assert_eq!(parsed.variable, "item");
+        assert_eq!(parsed.expression, vec![Token::from("@items")]);
+        assert!(is_block_opener("parallel --workers 2 x in one two"));
+    }
+
+    #[test]
+    fn rejects_invalid_parallel_worker_counts() {
+        for count in ["0", "65", "many", "-1"] {
+            let error = parse_parallel_header(&format!(
+                "parallel --workers {count} item in @items"
+            ))
+            .unwrap_err();
+            assert!(error.contains("1 through 64"));
+        }
+    }
+
+    #[test]
+    fn rejects_unsafe_parallel_constructs_but_allows_pipelines() {
+        assert!(validate_parallel_body(&["tool | other > out.txt".into()]).is_ok());
+        for line in [
+            "break",
+            "continue",
+            "return",
+            "parallel --workers 2 x in @xs",
+            "tool &",
+            "tool &!",
+            "cd elsewhere",
+            "export X = y",
+        ] {
+            assert!(validate_parallel_body(&[line.into()]).is_err(), "{line}");
+        }
+    }
+
+    #[test]
+    fn cloned_interpreters_isolate_parallel_worker_scopes() {
+        let mut parent = Interpreter::new();
+        parent.set_scalar("shared".into(), "parent".into());
+        let mut left = parent.clone();
+        let mut right = parent.clone();
+        left.push_scope();
+        right.push_scope();
+        left.define_local_scalar("item".into(), "left".into());
+        right.define_local_scalar("item".into(), "right".into());
+        left.set_scalar("shared".into(), "changed".into());
+        assert_eq!(right.get_scalar("shared").unwrap(), "parent");
+        assert_eq!(parent.get_scalar("shared").unwrap(), "parent");
+        assert_eq!(left.get_scalar("item").unwrap(), "left");
+        assert_eq!(right.get_scalar("item").unwrap(), "right");
+    }
+
+    #[test]
+    fn parallel_schedule_is_bounded_and_refills_on_each_completion() {
+        let mut schedule = ParallelSchedule::new(5, 2);
+        assert_eq!(schedule.next_launch(), Some(0));
+        assert_eq!(schedule.next_launch(), Some(1));
+        assert_eq!(schedule.next_launch(), None);
+        assert_eq!(schedule.active, 2);
+
+        // Item 1 completes while item 0 is still active. Item 2 launches
+        // immediately, which distinguishes this from fixed batches.
+        schedule.complete(false);
+        assert_eq!(schedule.next_launch(), Some(2));
+        assert_eq!(schedule.active, 2);
+        assert_eq!(schedule.next_launch(), None);
+    }
+
+    #[test]
+    fn parallel_schedule_never_refills_after_cancellation() {
+        let mut schedule = ParallelSchedule::new(10, 3);
+        assert_eq!(schedule.next_launch(), Some(0));
+        assert_eq!(schedule.next_launch(), Some(1));
+        assert_eq!(schedule.next_launch(), Some(2));
+        schedule.complete(true);
+        assert_eq!(schedule.next_launch(), None);
+        schedule.complete(false);
+        schedule.complete(false);
+        assert_eq!(schedule.active, 0);
+        assert_eq!(schedule.next, 3);
+    }
+
+    #[test]
+    fn missing_command_is_recallable_but_not_persisted() {
+        let mut interp = Interpreter::new();
+        history::seed_defaults(&mut interp);
+        interp.mark_command_not_found();
+        assert!(!should_persist_input(false, &interp));
     }
 
     #[test]
