@@ -433,6 +433,11 @@ pub const BUILTINS: &[Builtin] = &[
         help_display: Some("select COL..."),
     },
     Builtin {
+        name: "merge",
+        is_keyword: false,
+        help_display: Some("merge TABLE_VARIABLE"),
+    },
+    Builtin {
         name: "where",
         is_keyword: false,
         help_display: Some("where/filter COL OP VAL"),
@@ -493,7 +498,7 @@ Commands by category
   Control flow     if  while  for  parallel  match  and  or  break  continue
   Conditions       test  matches  bool  contains  starts-with  ends-with
                    eq/is  exists  intersects  isatty  true  false  not
-  Tables           from-json  from-csv  select  where/filter  date-column
+  Tables           from-json  from-csv  select  merge  where/filter  date-column
                    to-json  to-csv
   State & jobs     pvar  task  schedule  exec  history  jobs  wait  disown
                    which/type
@@ -821,6 +826,7 @@ pub fn help_text(topic: Option<&str>) -> Result<String, String> {
         "from-json" => page("BYTES | from-json", "Parses a JSON object or array of objects into a table.", &["cat data.json | from-json | select name"], &["Structured stages are pipeline-only."]),
         "from-csv" => page("BYTES | from-csv", "Parses CSV with a header row into a table.", &["cat data.csv | from-csv | where size -gt 100"], &["Structured stages are pipeline-only."]),
         "select" => page("TABLE | select COLUMN...", "Projects selected columns from each table row.", &["manifest | select path size | to-csv"], &[]),
+        "merge" => page("TABLE | merge TABLE_VARIABLE", "Horizontally combines corresponding rows. Right-hand values replace same-named left-hand columns.", &["details | merge version | to-json"], &["Both tables must contain the same number of rows.", "Use the table variable name without a `$` sigil."]),
         "where" | "filter" => page("TABLE | where COLUMN OP VALUE", "Keeps rows whose column satisfies a test operator.", &["manifest | where size -gt 1000000"], &["`filter` is an alias. Operators match `help test`."]),
         "date-column" => page(
             "TABLE | date-column SOURCE DEST OP [ARGS...]",

@@ -35,6 +35,30 @@ pub struct Table {
 }
 
 impl Table {
+    /// Horizontally combines rows by position. Both tables must have the
+    /// same row count; right-hand values replace same-named left columns,
+    /// while new right-hand columns are appended in their original order.
+    pub fn merge(mut self, right: &Table) -> Result<Table, String> {
+        if self.rows.len() != right.rows.len() {
+            return Err(format!(
+                "merge: row count mismatch (left has {}, right has {})",
+                self.rows.len(),
+                right.rows.len()
+            ));
+        }
+
+        for (left_row, right_row) in self.rows.iter_mut().zip(&right.rows) {
+            for (column, value) in right_row {
+                if let Some((_, existing)) = left_row.iter_mut().find(|(name, _)| name == column) {
+                    *existing = value.clone();
+                } else {
+                    left_row.push((column.clone(), value.clone()));
+                }
+            }
+        }
+        Ok(self)
+    }
+
     /// Parses `text` as JSON into a table. Accepts a JSON array of objects
     /// (one row each) or a single bare JSON object (treated as a one-row
     /// table, matching how many CLI tools emit a bare object for a
@@ -369,6 +393,28 @@ mod tests {
         let table = Table { rows: vec![row(&[("name", "a")])] };
         let selected = table.select(&["name".to_string(), "missing".to_string()]);
         assert_eq!(selected.rows, vec![row(&[("name", "a")])]);
+    }
+
+    #[test]
+    fn merge_combines_rows_and_replaces_conflicting_columns_from_the_right() {
+        let left = Table {
+            rows: vec![row(&[("path", "old.exe"), ("size", "10")])],
+        };
+        let right = Table {
+            rows: vec![row(&[("path", "win.exe"), ("version", "1.2.3")])],
+        };
+        assert_eq!(
+            left.merge(&right).unwrap().rows,
+            vec![row(&[("path", "win.exe"), ("size", "10"), ("version", "1.2.3")])]
+        );
+    }
+
+    #[test]
+    fn merge_rejects_different_row_counts() {
+        let left = Table { rows: vec![row(&[("a", "1")])] };
+        let right = Table { rows: Vec::new() };
+        let error = left.merge(&right).unwrap_err();
+        assert!(error.contains("row count mismatch"), "{error}");
     }
 
     #[test]

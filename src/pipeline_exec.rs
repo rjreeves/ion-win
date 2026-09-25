@@ -95,6 +95,9 @@ enum Kind {
     FromCsv,
     ToCsv,
     Select(Vec<String>),
+    /// `merge TABLE` horizontally combines the incoming table with a stored
+    /// table variable, matching rows by position.
+    Merge(Result<Table, String>),
     /// `where`/`filter COLUMN OP VALUE` — validated at execution time
     /// (arg count and operator), not here, matching how `FromJson`
     /// validates JSON-parseability during execution rather than
@@ -172,6 +175,7 @@ fn next_stage_needs_materialized_input(kind: Option<&Kind>) -> bool {
         kind,
         Some(Kind::FromJson)
             | Some(Kind::Select(_))
+            | Some(Kind::Merge(_))
             | Some(Kind::ToJson)
             | Some(Kind::Where(_))
             | Some(Kind::DateColumn(_))
@@ -1325,6 +1329,38 @@ async fn run_impl(
                     }
                 }
             }
+            Kind::Merge(right) => {
+                let left = match incoming {
+                    Carry::Table(table) => table,
+                    Carry::None => {
+                        err_println!("ion-win: merge: no table piped in");
+                        unregister_spawned!();
+                        return false;
+                    }
+                    _ => {
+                        err_println!("ion-win: merge: expected a table");
+                        unregister_spawned!();
+                        return false;
+                    }
+                };
+                let right = match right {
+                    Ok(table) => table,
+                    Err(error) => {
+                        err_println!("ion-win: {error}");
+                        unregister_spawned!();
+                        return false;
+                    }
+                };
+                let table = match left.merge(&right) {
+                    Ok(table) => table,
+                    Err(error) => {
+                        err_println!("ion-win: {error}");
+                        unregister_spawned!();
+                        return false;
+                    }
+                };
+                carry = finish_table_stage(table, is_last, stdout_file, capture.as_mut().map(|slot| &mut **slot));
+            }
             Kind::Where(where_args) => {
                 let incoming = match incoming {
                     Carry::Table(t) => EitherStructured::Table(t),
@@ -1622,6 +1658,15 @@ fn classify_stages(pipeline: &Pipeline, interp: &Interpreter) -> Vec<Kind> {
                 Kind::ToCsv
             } else if cmd == "select" {
                 Kind::Select(args[1..].to_vec())
+            } else if cmd == "merge" {
+                let table = match &args[1..] {
+                    [name] => interp
+                        .get_table(name)
+                        .cloned()
+                        .ok_or_else(|| format!("merge: table variable does not exist: {name}")),
+                    _ => Err("merge: usage: merge TABLE_VARIABLE".to_string()),
+                };
+                Kind::Merge(table)
             } else if cmd == "where" || cmd == "filter" {
                 Kind::Where(args[1..].to_vec())
             } else if cmd == "date-column" {

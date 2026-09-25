@@ -92,7 +92,7 @@
             "patterns": [
                 {
                     "name": "support.function.builtin.ion-win",
-                    "match": "(?<![A-Za-z0-9_-])(?:exit|quit|help|read|echo|cd|pushd|popd|pwd|dirs|folders|files|find|cat|stat|copy|cp|mkdir|md|move|mv|rename|ren|compress|delete|test|matches|true|false|bool|contains|starts-with|ends-with|eq|is|exists|intersects|isatty|which|type|eval|pvar|dmark|jobs|wait|disown|source|highlight|cls|from-json|select|where|filter|to-json|from-csv|to-csv)(?![A-Za-z0-9_-])"
+                    "match": "(?<![A-Za-z0-9_-])(?:exit|quit|help|read|echo|cd|pushd|popd|pwd|dirs|folders|files|find|cat|stat|copy|cp|mkdir|md|move|mv|rename|ren|compress|delete|test|matches|true|false|bool|contains|starts-with|ends-with|eq|is|exists|intersects|isatty|which|type|eval|pvar|dmark|jobs|wait|disown|source|highlight|cls|from-json|select|merge|where|filter|to-json|from-csv|to-csv)(?![A-Za-z0-9_-])"
                 }
             ]
         },

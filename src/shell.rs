@@ -1097,7 +1097,7 @@ fn split_at_top_level_chain_op(line: &str) -> Option<(&str, ChainOp, &str)> {
 fn is_table_producing_command(cmd: &str, interp: &Interpreter) -> bool {
     matches!(
         cmd,
-        "from-json" | "from-csv" | "files" | "folders" | "dirs" | "find" | "select" | "where" | "filter" | "stat" | "date-column" | "copy" | "cp" | "move" | "mv" | "compress" | "delete" | "apply" | "undo" | "rollback" | "recover" | "journal"
+        "from-json" | "from-csv" | "files" | "folders" | "dirs" | "find" | "select" | "merge" | "where" | "filter" | "stat" | "date-column" | "copy" | "cp" | "move" | "mv" | "compress" | "delete" | "apply" | "undo" | "rollback" | "recover" | "journal"
     ) || interp.get_table(cmd).is_some()
         || interp.get_fileset(cmd).is_some()
         || interp.get_plan(cmd).is_some()
