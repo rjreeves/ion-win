@@ -1,0 +1,84 @@
+# Build and install the Certo toolchain using ion-win only.
+#
+# Run this script from the ion-win repository root:
+#   ion-win.exe scripts/push-certo-dist.ion
+#
+# The source repository is expected beside ion-win at ../Certo. Release
+# binaries are installed into Sym's real package directory. The executable in
+# Sym/bin is a shim and is deliberately left untouched.
+
+if test $len(args) -ne 1
+    echo "Usage: ion-win.exe scripts/push-certo-dist.ion"
+    exit 2
+end
+
+let certo_root = ../Certo
+let manifest = "$certo_root/Cargo.toml"
+let release = "$certo_root/target/release"
+let destination = "${env::LOCALAPPDATA}/Sym/packages/certo/latest"
+let tools = [ certo certo-test certo-fmt certo-lsp certo-llvm certo-wasm certo-ffi certo-ui ]
+
+if not test -e $manifest
+    echo "push-certo-dist: Certo repository not found: $certo_root"
+    exit 1
+end
+
+echo "Building the Certo release toolchain..."
+if not cargo build --release --bins --manifest-path $manifest
+    echo "push-certo-dist: cargo build failed"
+    exit 1
+end
+
+# Check the complete source set before changing the installed package.
+for tool in @tools
+    let source_file = "$release/$tool.exe"
+    if not test -e $source_file
+        echo "push-certo-dist: required release binary is missing: $source_file"
+        exit 1
+    end
+end
+
+mkdir $destination
+
+echo "Installing Certo into $destination..."
+for tool in @tools
+    let source_file = "$release/$tool.exe"
+    let installed_file = "$destination/$tool.exe"
+
+    copy --force $source_file $installed_file
+
+    if not test -e $installed_file
+        echo "push-certo-dist: install failed: $installed_file was not created"
+        exit 1
+    end
+
+    let source_rows = stat $source_file --hash sha256
+    let installed_rows = stat $installed_file --hash sha256
+    let source_hash = ""
+    let installed_hash = ""
+
+    for row in @source_rows
+        let source_hash = $field(row sha256)
+    end
+    for row in @installed_rows
+        let installed_hash = $field(row sha256)
+    end
+
+    if not eq $source_hash $installed_hash
+        echo "push-certo-dist: SHA-256 verification failed for $tool.exe"
+        exit 1
+    end
+
+    echo "  installed $tool.exe"
+end
+
+echo "Verifying the installed compiler..."
+let installed_certo = "$destination/certo.exe"
+if not $installed_certo --version
+    echo "push-certo-dist: installed compiler did not run successfully"
+    exit 1
+end
+
+echo "Certo toolchain installed successfully."
+echo "Sym package: $destination"
+echo "Sym/bin/certo.exe remains the PATH shim."

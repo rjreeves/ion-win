@@ -19,6 +19,19 @@ ion-win.exe                        # interactive REPL
 ion-win.exe script.ion arg1 arg2   # run a script, exposing @args
 ```
 
+## Windows installer
+
+Install [Inno Setup 6](https://jrsoftware.org/isinfo.php), then build the
+release executable and installer from the repository root:
+
+```powershell
+.\scripts\build-installer.ps1
+```
+
+The script reads the version from `Cargo.toml` and writes the installer to
+`Output`. The installer registers `.ion` and `.fg` scripts and can add
+`ion-win` to the system `PATH`.
+
 ## A taste of the language
 
 ```sh
