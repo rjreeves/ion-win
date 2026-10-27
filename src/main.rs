@@ -42,6 +42,12 @@ use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() {
+    let cli_args: Vec<String> = std::env::args().collect();
+    if version_requested(&cli_args) {
+        println!("ion-win {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
     // SIGINT (Ctrl+C) should interrupt whatever's currently running — a
     // foreground external process/pipeline, or a pure-Ion loop with no
     // external process at all — without killing the shell itself. See
@@ -50,7 +56,6 @@ async fn main() {
     // the main thread is blocked in a tight loop or a `Child::wait()`.
     ctrlc::set_handler(jobctl::request_interrupt).expect("failed to install Ctrl+C handler");
 
-    let cli_args: Vec<String> = std::env::args().collect();
     adjust_interactive_startup_dir(&cli_args);
 
     if cli_args.get(1).map(String::as_str) == Some("--run-scheduled-task") {
@@ -88,6 +93,10 @@ async fn main() {
     }
 
     shell::run(state_handle).await;
+}
+
+fn version_requested(cli_args: &[String]) -> bool {
+    cli_args.len() == 2 && matches!(cli_args[1].as_str(), "-version" | "--version" | "-V")
 }
 
 fn run_scheduled_task(snapshot: Option<&String>) -> Result<i32, String> {
@@ -155,4 +164,26 @@ fn state_db_path() -> PathBuf {
         return PathBuf::from(appdata).join("ion-win").join("state.redb");
     }
     PathBuf::from("ion-win-state.redb")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::version_requested;
+
+    #[test]
+    fn recognizes_version_flags_only_as_a_complete_invocation() {
+        for flag in ["-version", "--version", "-V"] {
+            assert!(version_requested(&["ion-win".into(), flag.into()]));
+        }
+        assert!(!version_requested(&["ion-win".into()]));
+        assert!(!version_requested(&[
+            "ion-win".into(),
+            "-version".into(),
+            "extra".into(),
+        ]));
+        assert!(!version_requested(&[
+            "ion-win".into(),
+            "script.ion".into(),
+        ]));
+    }
 }

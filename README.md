@@ -16,6 +16,7 @@ No special setup — it's a standard Cargo binary crate.
 
 ```sh
 ion-win.exe                        # interactive REPL
+ion-win.exe -version               # print the installed version
 ion-win.exe script.ion arg1 arg2   # run a script, exposing @args
 ```
 
